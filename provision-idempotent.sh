@@ -374,18 +374,67 @@ export MIG_NAME="lakefs-mig-regional"
 
 echo ">>> Starting Part 3B: Deploying Runtime Infrastructure..."
 
-DB_IP=$(gcloud sql instances describe "$DB_INSTANCE_NAME" --format="value(ipAddresses[0].ipAddress)")
+DB_IP=$(gcloud sql instances describe "$DB_INSTANCE_NAME" --format="value(ipAddresses[type=PRIVATE].ipAddress)")
 
-# Create Startup Script (Same as before)
+if [[ -z "$DB_IP" ]]; then
+    echo "ERROR: Could not retrieve Cloud SQL Private IP. Ensure Private IP is enabled."
+    exit 1
+fi
+
+# Create Startup Script with DB MIGRATION & RETRIES
 cat <<EOF > runtime-startup.sh
 #!/bin/bash
-set -e
-gcloud secrets versions access latest --secret="lakefs-signer-key" > /etc/lakefs/signer-key.json
+set -x  # Enable debug logging (Check /var/log/syslog)
+
+# Robustly fetch metadata with retries
+fetch_metadata() {
+  local attr=\$1
+  local val=""
+  local count=0
+  while [ -z "\$val" ] && [ \$count -lt 10 ]; do
+    val=\$(curl -s "http://metadata.google.internal/computeMetadata/v1/instance/attributes/\$attr" -H "Metadata-Flavor: Google")
+    if [ -z "\$val" ]; then sleep 2; fi
+    count=\$((count+1))
+  done
+  echo "\$val"
+}
+
+# 1. Fetch Secrets (with Retries)
+echo ">>> Fetching secrets..."
+RETRIES=0
+while [ \$RETRIES -lt 20 ]; do
+    if gcloud secrets versions access latest --secret="lakefs-signer-key" > /etc/lakefs/signer-key.json 2>/dev/null; then
+        if [ -s /etc/lakefs/signer-key.json ]; then break; fi
+    fi
+    echo "Waiting for Secret Manager (Key)..."
+    sleep 3
+    RETRIES=\$((RETRIES+1))
+done
+
+RETRIES=0
+while [ \$RETRIES -lt 20 ]; do
+    DB_PASSWORD=\$(gcloud secrets versions access latest --secret="lakefs-db-password" 2>/dev/null)
+    if [ -n "\$DB_PASSWORD" ]; then break; fi
+    echo "Waiting for Secret Manager (Pass)..."
+    sleep 3
+    RETRIES=\$((RETRIES+1))
+done
+
+if [ -z "\$DB_PASSWORD" ]; then
+    echo "ERROR: Could not fetch DB Password."
+    exit 1
+fi
+
 chown lakefs:lakefs /etc/lakefs/signer-key.json
 chmod 600 /etc/lakefs/signer-key.json
-DB_PASSWORD=\$(gcloud secrets versions access latest --secret="lakefs-db-password")
-DB_HOST=\$(curl -s "http://metadata.google.internal/computeMetadata/v1/instance/attributes/db-ip" -H "Metadata-Flavor: Google")
-BUCKET=\$(curl -s "http://metadata.google.internal/computeMetadata/v1/instance/attributes/bucket-name" -H "Metadata-Flavor: Google")
+
+DB_HOST=\$(fetch_metadata "db-ip")
+BUCKET=\$(fetch_metadata "bucket-name")
+
+if [ -z "\$DB_HOST" ]; then
+    echo "ERROR: Failed to fetch DB_HOST from metadata."
+    exit 1
+fi
 
 cat <<CONFIG > /etc/lakefs/config.yaml
 database:
@@ -412,8 +461,23 @@ CONFIG
 
 chown lakefs:lakefs /etc/lakefs/config.yaml
 
-echo ">>> Running Database Migration..."
-/usr/local/bin/lakefs --config /etc/lakefs/config.yaml migrate up
+echo ">>> Running Database Migration (with retries)..."
+# This handles cases where Cloud SQL is warming up or routing is lagging.
+MIGRATE_RETRIES=0
+while [ \$MIGRATE_RETRIES -lt 30 ]; do
+    if /usr/local/bin/lakefs --config /etc/lakefs/config.yaml migrate up; then
+        echo ">>> Migration successful."
+        break
+    fi
+    echo ">>> Migration failed. DB might be unreachable yet. Retrying in 5s..."
+    sleep 5
+    MIGRATE_RETRIES=\$((MIGRATE_RETRIES+1))
+done
+
+if [ \$MIGRATE_RETRIES -eq 30 ]; then
+    echo "ERROR: Migration failed after 30 attempts."
+    exit 1
+fi
 
 echo ">>> Starting LakeFS..."
 systemctl enable lakefs && systemctl start lakefs
@@ -464,7 +528,7 @@ if ! gcloud compute instance-groups managed describe "$MIG_NAME" --region="$REGI
         --size=2 \
         --zones="${REGION}-a,${REGION}-b,${REGION}-c" \
         --health-check="https://www.googleapis.com/compute/v1/projects/${PROJECT_ID}/regions/${REGION}/healthChecks/lakefs-health-check" \
-        --initial-delay=60
+        --initial-delay=300
 else
     echo ">>> MIG $MIG_NAME already exists."
 fi
@@ -478,7 +542,7 @@ echo ">>> Updating Autohealing Policy..."
 gcloud beta compute instance-groups managed update "$MIG_NAME" \
     --region="$REGION" \
     --health-check="https://www.googleapis.com/compute/v1/projects/${PROJECT_ID}/regions/${REGION}/healthChecks/lakefs-health-check" \
-    --initial-delay=60
+    --initial-delay=300
 
 rm runtime-startup.sh
 echo ">>> Part 3B Complete."
