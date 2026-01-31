@@ -394,7 +394,8 @@ if ! gcloud compute instance-templates describe "$TEMPLATE_NAME" --project="$PRO
         --service-account="$SA_VM_EMAIL" \
         --scopes="https://www.googleapis.com/auth/cloud-platform" \
         --metadata-from-file=startup-script=runtime-startup.sh \
-        --metadata=db-ip="$DB_IP",bucket-name="$BUCKET_NAME",vmDnsSetting=ZonalOnly
+        --metadata=vmDnsSetting=ZonalOnly \
+        --metadata=db-ip="$DB_IP",bucket-name="$BUCKET_NAME"
 else
     echo ">>> Instance Template $TEMPLATE_NAME already exists."
 fi
@@ -402,13 +403,16 @@ fi
 # 5. Create Regional MIG
 if ! gcloud compute instance-groups managed describe "$MIG_NAME" --region="$REGION" --project="$PROJECT_ID" &>/dev/null; then
     echo ">>> Creating Regional MIG ($MIG_NAME)..."
+    # FIX: Using full health check URL to prevent gcloud from malforming it
     gcloud compute instance-groups managed create "$MIG_NAME" \
         --project="$PROJECT_ID" \
         --region="$REGION" \
         --base-instance-name="lakefs" \
         --template="$TEMPLATE_NAME" \
         --size=2 \
-        --zones="${REGION}-a,${REGION}-b,${REGION}-c"
+        --zones="${REGION}-a,${REGION}-b,${REGION}-c" \
+        --health-check="https://www.googleapis.com/compute/v1/projects/${PROJECT_ID}/regions/${REGION}/healthChecks/lakefs-health-check" \
+        --initial-delay=60
 else
     echo ">>> MIG $MIG_NAME already exists."
 fi
@@ -418,10 +422,11 @@ gcloud compute instance-groups managed set-named-ports "$MIG_NAME" \
     --named-ports="http:8000" \
     --region="$REGION"
 
-echo ">>> Configuring Autohealing..."
-gcloud compute instance-groups managed set-autohealing "$MIG_NAME" \
+# FIX: Added 'beta' and used FULL URL to prevent "double URL" error
+echo ">>> Updating Autohealing Policy..."
+gcloud beta compute instance-groups managed set-autohealing "$MIG_NAME" \
     --region="$REGION" \
-    --health-check="projects/${PROJECT_ID}/regions/${REGION}/healthChecks/lakefs-health-check" \
+    --health-check="https://www.googleapis.com/compute/v1/projects/${PROJECT_ID}/regions/${REGION}/healthChecks/lakefs-health-check" \
     --initial-delay=60
 
 rm runtime-startup.sh
@@ -455,8 +460,7 @@ else
     echo ">>> Backend Service already exists."
 fi
 
-# Add Backend (Check logic: we assume if service exists, backend is likely there, but safe to re-run 'add-backend' usually?
-# Actually 'add-backend' fails if already exists. Let's check backends list.)
+# Add Backend
 BACKENDS=$(gcloud compute backend-services describe "${LB_PREFIX}-backend" --region="$REGION" --format="value(backends)" || true)
 if [[ -z "$BACKENDS" ]]; then
     gcloud compute backend-services add-backend "${LB_PREFIX}-backend" \
