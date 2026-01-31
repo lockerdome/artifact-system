@@ -4,7 +4,6 @@
 export PROJECT_ID="your-project-id"
 export REGION="us-central1"
 export VPC_NAME="lakefs-vpc"
-# Updated Subnet Names to match your latest script
 export SUBNET_NAME="lakefs-subnet-${REGION}"
 export PROXY_SUBNET_NAME="lakefs-proxy-subnet-${REGION}"
 
@@ -13,7 +12,6 @@ export LB_PREFIX="lakefs-lb"
 export TEMPLATE_NAME="lakefs-template-v1"
 export MIG_NAME="lakefs-mig-regional"
 export LAKEFS_VERSION="1.76.0"
-# Image name logic replicated from provision script
 export IMAGE_NAME="lakefs-v${LAKEFS_VERSION//./-}-image"
 export BUCKET_NAME="lakefs-data-${PROJECT_ID}"
 export GC_JOB_NAME="lakefs-gc-daily"
@@ -32,7 +30,8 @@ echo "This will PERMANENTLY DELETE:"
 echo "  - Cloud SQL Instance ($DB_INSTANCE_NAME)"
 echo "  - GCS Bucket (gs://$BUCKET_NAME)"
 echo "  - All LakeFS Compute Resources (MIG, LBs, Images)"
-echo "  - Networking (VPC, NAT, Subnets: $SUBNET_NAME)"
+echo "  - Networking (VPC, NAT, Subnets, Firewall Rules)"
+echo "  - Secrets (DB Password, Signer Key, Admin Creds)"
 echo "========================================================"
 read -p "Are you sure you want to proceed? (y/N): " -n 1 -r
 echo
@@ -63,9 +62,13 @@ delete_resource "gcloud compute target-http-proxies" "${LB_PREFIX}-http-proxy" "
 delete_resource "gcloud compute url-maps" "${LB_PREFIX}-url-map" "--region=$REGION"
 delete_resource "gcloud compute backend-services" "${LB_PREFIX}-backend" "--region=$REGION"
 delete_resource "gcloud compute health-checks" "lakefs-health-check" "--region=$REGION"
-delete_resource "gcloud compute firewall-rules" "allow-proxy-to-mig" ""
 
-# 3. Delete Compute Resources
+# 3. Delete Firewall Rules (CRITICAL: Must delete before VPC)
+# FIX: Added allow-ssh-ingress-from-iap
+delete_resource "gcloud compute firewall-rules" "allow-proxy-to-mig" ""
+delete_resource "gcloud compute firewall-rules" "allow-ssh-ingress-from-iap" ""
+
+# 4. Delete Compute Resources
 # We delete the MIG first to stop instances.
 delete_resource "gcloud compute instance-groups managed" "$MIG_NAME" "--region=$REGION"
 delete_resource "gcloud compute instance-templates" "$TEMPLATE_NAME" "--region=$REGION"
@@ -74,24 +77,26 @@ delete_resource "gcloud compute images" "$IMAGE_NAME" ""
 # Check for any leftover Builder VM
 delete_resource "gcloud compute instances" "lakefs-builder-temp" "--zone=${REGION}-a"
 
-# 4. Delete Data & Storage
+# 5. Delete Data & Storage
 # WARNING: Recursive delete on bucket
 echo ">>> Deleting GCS Bucket: gs://${BUCKET_NAME}..."
 gcloud storage rm -r "gs://${BUCKET_NAME}" --quiet || echo "    (Bucket already gone)"
 
 delete_resource "gcloud sql instances" "$DB_INSTANCE_NAME" ""
 
-# 5. Delete Secrets
+# 6. Delete Secrets
 delete_resource "gcloud secrets" "lakefs-signer-key" ""
 delete_resource "gcloud secrets" "lakefs-db-password" ""
+# FIX: Added deletion of admin-creds
+delete_resource "gcloud secrets" "lakefs-admin-creds" ""
 
-# 6. Delete Identity (Service Accounts)
+# 7. Delete Identity (Service Accounts)
 delete_resource "gcloud iam service-accounts" "${SA_VM_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" ""
 delete_resource "gcloud iam service-accounts" "${SA_SIGNER_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" ""
 delete_resource "gcloud iam service-accounts" "${GC_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" ""
 delete_resource "gcloud iam service-accounts" "${SCHEDULER_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" ""
 
-# 7. Delete Networking
+# 8. Delete Networking
 # A. Cloud NAT & Router
 delete_resource "gcloud compute routers nats" "lakefs-nat" "--router=lakefs-router --region=$REGION"
 delete_resource "gcloud compute routers" "lakefs-router" "--region=$REGION"
@@ -107,9 +112,9 @@ gcloud services vpc-peerings delete \
 delete_resource "gcloud compute addresses" "google-managed-services-$VPC_NAME" "--global"
 
 # D. Subnets
-# Wait briefly for dependencies to detach
-echo ">>> Waiting 10s for resources to detach from subnets..."
-sleep 10
+# Wait briefly for dependencies to detach (Backend Services take a moment to release the Proxy Subnet)
+echo ">>> Waiting 15s for resources to detach from subnets..."
+sleep 15
 delete_resource "gcloud compute networks subnets" "$PROXY_SUBNET_NAME" "--region=$REGION"
 delete_resource "gcloud compute networks subnets" "$SUBNET_NAME" "--region=$REGION"
 
