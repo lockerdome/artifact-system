@@ -182,7 +182,7 @@ else
     echo ">>> SA ${SA_SIGNER_NAME} already exists."
 fi
 
-echo ">>> Waiting 20s for IAM propagation..."
+echo ">>> Waiting 20s for Service Account propagation..."
 sleep 20
 
 # 3. Handle Signer Key
@@ -364,7 +364,37 @@ chown lakefs:lakefs /etc/lakefs/signer-key.json
 chmod 600 /etc/lakefs/signer-key.json
 DB_PASSWORD=\$(gcloud secrets versions access latest --secret="lakefs-db-password")
 DB_HOST=\$(curl -s "http://metadata.google.internal/computeMetadata/v1/instance/attributes/db-ip" -H "Metadata-Flavor: Google")
-# ... (Config generation logic) ...
+BUCKET=\$(curl -s "http://metadata.google.internal/computeMetadata/v1/instance/attributes/bucket-name" -H "Metadata-Flavor: Google")
+
+cat <<CONFIG > /etc/lakefs/config.yaml
+database:
+  type: "postgres"
+  postgres:
+    connection_string: "postgres://lakefs:\${DB_PASSWORD}@\${DB_HOST}:5432/lakefs"
+
+blockstore:
+  type: "gs"
+  gs:
+    credentials_json: "/etc/lakefs/signer-key.json"
+
+storage:
+  type: "gs"
+  
+installation:
+  user_data_dir: "/var/lib/lakefs"
+
+listen_address: "0.0.0.0:8000"
+
+logging:
+  level: "INFO"
+CONFIG
+
+chown lakefs:lakefs /etc/lakefs/config.yaml
+
+echo ">>> Running Database Migration..."
+/usr/local/bin/lakefs --config /etc/lakefs/config.yaml migrate up
+
+echo ">>> Starting LakeFS..."
 systemctl enable lakefs && systemctl start lakefs
 EOF
 
@@ -489,18 +519,19 @@ if ! gcloud compute target-http-proxies describe "${LB_PREFIX}-http-proxy" --reg
         --project="$PROJECT_ID"
 fi
 
-# 4. Firewall Rule
+# 4. Firewall Rule (Updated for Legacy Health Check Ranges)
 if ! gcloud compute firewall-rules describe allow-proxy-to-mig --project="$PROJECT_ID" &>/dev/null; then
+    echo ">>> Creating Firewall Rule for LB & Health Checks..."
     gcloud compute firewall-rules create allow-proxy-to-mig \
         --network="$VPC_NAME" \
         --allow=tcp:8000 \
-        --source-ranges="$LB_RANGE" \
+        --source-ranges="$LB_RANGE,35.191.0.0/16,130.211.0.0/22" \
         --target-tags="lakefs-server" \
-        --description="Allow traffic from Proxy Subnet to LakeFS Backends" \
+        --description="Allow traffic from Proxy Subnet and Health Checks to LakeFS" \
         --project="$PROJECT_ID"
 fi
 
-# 5. Enable IAP SSH Access
+# 5. NEW: Enable IAP SSH Access
 if ! gcloud compute firewall-rules describe allow-ssh-ingress-from-iap --project="$PROJECT_ID" &>/dev/null; then
     echo ">>> Creating Firewall Rule for IAP SSH..."
     gcloud compute firewall-rules create allow-ssh-ingress-from-iap \
@@ -569,6 +600,7 @@ else
     echo ">>> No Admin Credentials found. Attempting to initialize LakeFS..."
 
     echo ">>> Waiting for MIG to be stable..."
+    # The fix to runtime-startup.sh should allow this to pass now
     gcloud compute instance-groups managed wait-until --stable "$MIG_NAME" --region="$REGION" --project="$PROJECT_ID"
 
     # Pick a random instance
@@ -599,6 +631,7 @@ else
 
     if [[ "$SETUP_RESPONSE" != *"access_key_id"* ]]; then
         echo "ERROR: Failed to initialize LakeFS. Response was: $SETUP_RESPONSE"
+        echo "DEBUG: Check /var/log/syslog on the instance for lakefs startup errors."
         exit 1
     fi
 
