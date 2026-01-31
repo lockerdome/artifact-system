@@ -287,7 +287,28 @@ echo ">>> [BUILD] Setting up user..."
 useradd -m -s /bin/bash lakefs
 mkdir -p /etc/lakefs /var/lib/lakefs
 chown -R lakefs:lakefs /etc/lakefs /var/lib/lakefs
-# (Service definition omitted for brevity, assumed same as before)
+
+# D. Setup Systemd Service (Disabled)
+# We create the definition, but do NOT enable/start it.
+# It will be enabled in the deploy phase after config.yaml is written.
+cat <<SERVICE > /etc/systemd/system/lakefs.service
+[Unit]
+Description=LakeFS Data Lake
+After=network.target
+
+[Service]
+User=lakefs
+Group=lakefs
+ExecStart=/usr/local/bin/lakefs run --config /etc/lakefs/config.yaml
+Restart=on-failure
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+echo ">>> [BUILD] Installation complete."
+# CRITICAL: This string triggers the builder loop to finish
 echo "BUILD_COMPLETE"
 EOF
 
@@ -427,8 +448,7 @@ if ! gcloud compute instance-templates describe "$TEMPLATE_NAME" --project="$PRO
         --service-account="$SA_VM_EMAIL" \
         --scopes="https://www.googleapis.com/auth/cloud-platform" \
         --metadata-from-file=startup-script=runtime-startup.sh \
-        --metadata=vmDnsSetting=ZonalOnly \
-        --metadata=db-ip="$DB_IP",bucket-name="$BUCKET_NAME"
+        --metadata=db-ip="$DB_IP",bucket-name="$BUCKET_NAME",vmDnsSetting=ZonalOnly
 else
     echo ">>> Instance Template $TEMPLATE_NAME already exists."
 fi
