@@ -2,7 +2,7 @@
 set -e  # Exit immediately if a command exits with a non-zero status
 
 cleanup() {
-    rm -f lakefs-signer.json build-script.sh runtime-startup.sh batch-request.json
+    rm -f lakefs-signer.json build-script.sh runtime-startup.sh batch-request.json admin-creds.json
     echo ">>> Cleanup complete."
 }
 trap cleanup EXIT
@@ -32,7 +32,8 @@ gcloud services enable \
     sqladmin.googleapis.com \
     servicenetworking.googleapis.com \
     secretmanager.googleapis.com \
-    dataproc.googleapis.com
+    dataproc.googleapis.com \
+    iap.googleapis.com
 
 # 2. Create VPC and Subnet
 if ! gcloud compute networks describe "$VPC_NAME" --project="$PROJECT_ID" &>/dev/null; then
@@ -181,6 +182,9 @@ else
     echo ">>> SA ${SA_SIGNER_NAME} already exists."
 fi
 
+echo ">>> Waiting 20s for IAM propagation..."
+sleep 20
+
 # 3. Handle Signer Key
 echo ">>> Updating Signer Key (Rotating)..."
 # We allow this to run every time to ensure we have a valid key in the secret
@@ -253,7 +257,6 @@ echo ">>> Part 2 Complete. Identities and Secrets ready."
 
 # --- CONFIGURATION (Cont.) ---
 export BUILDER_VM_NAME="lakefs-builder-temp"
-# FIX: Use hyphens for image name
 export IMAGE_NAME="lakefs-v${LAKEFS_VERSION//./-}-image"
 export ZONE="${REGION}-a"
 
@@ -403,7 +406,6 @@ fi
 # 5. Create Regional MIG
 if ! gcloud compute instance-groups managed describe "$MIG_NAME" --region="$REGION" --project="$PROJECT_ID" &>/dev/null; then
     echo ">>> Creating Regional MIG ($MIG_NAME)..."
-    # FIX: Using full health check URL to prevent gcloud from malforming it
     gcloud compute instance-groups managed create "$MIG_NAME" \
         --project="$PROJECT_ID" \
         --region="$REGION" \
@@ -422,9 +424,8 @@ gcloud compute instance-groups managed set-named-ports "$MIG_NAME" \
     --named-ports="http:8000" \
     --region="$REGION"
 
-# FIX: Added 'beta' and used FULL URL to prevent "double URL" error
 echo ">>> Updating Autohealing Policy..."
-gcloud beta compute instance-groups managed set-autohealing "$MIG_NAME" \
+gcloud beta compute instance-groups managed update "$MIG_NAME" \
     --region="$REGION" \
     --health-check="https://www.googleapis.com/compute/v1/projects/${PROJECT_ID}/regions/${REGION}/healthChecks/lakefs-health-check" \
     --initial-delay=60
@@ -499,7 +500,20 @@ if ! gcloud compute firewall-rules describe allow-proxy-to-mig --project="$PROJE
         --project="$PROJECT_ID"
 fi
 
-# 5. Forwarding Rule
+# 5. Enable IAP SSH Access
+if ! gcloud compute firewall-rules describe allow-ssh-ingress-from-iap --project="$PROJECT_ID" &>/dev/null; then
+    echo ">>> Creating Firewall Rule for IAP SSH..."
+    gcloud compute firewall-rules create allow-ssh-ingress-from-iap \
+        --network="$VPC_NAME" \
+        --direction=INGRESS \
+        --action=ALLOW \
+        --rules=tcp:22 \
+        --source-ranges=35.235.240.0/20 \
+        --target-tags="lakefs-server" \
+        --project="$PROJECT_ID"
+fi
+
+# 6. Forwarding Rule
 if ! gcloud compute forwarding-rules describe "${LB_PREFIX}-forwarding-rule" --region="$REGION" --project="$PROJECT_ID" &>/dev/null; then
     gcloud compute forwarding-rules create "${LB_PREFIX}-forwarding-rule" \
         --load-balancing-scheme=INTERNAL_MANAGED \
@@ -507,6 +521,7 @@ if ! gcloud compute forwarding-rules describe "${LB_PREFIX}-forwarding-rule" --r
         --subnet="$SUBNET_NAME" \
         --ports=80 \
         --target-http-proxy="${LB_PREFIX}-http-proxy" \
+        --target-http-proxy-region="$REGION" \
         --region="$REGION" \
         --project="$PROJECT_ID"
 fi
@@ -525,7 +540,7 @@ export SCHEDULER_SA_EMAIL="${SCHEDULER_SA_NAME}@${PROJECT_ID}.iam.gserviceaccoun
 
 echo ">>> Starting Part 5: Maintenance Automation..."
 
-# Service Accounts (GC & Scheduler) - Idempotent Checks
+# Service Accounts
 if ! gcloud iam service-accounts describe "$GC_SA_EMAIL" --project="$PROJECT_ID" &>/dev/null; then
     gcloud iam service-accounts create "$GC_SA_NAME" --display-name="LakeFS GC Runner" --project="$PROJECT_ID"
 fi
@@ -534,13 +549,83 @@ if ! gcloud iam service-accounts describe "$SCHEDULER_SA_EMAIL" --project="$PROJ
     gcloud iam service-accounts create "$SCHEDULER_SA_NAME" --display-name="LakeFS Scheduler Trigger" --project="$PROJECT_ID"
 fi
 
-# IAM Roles (Blindly re-running these is fine/idempotent)
+echo ">>> Waiting 20s for IAM propagation..."
+sleep 20
+
+# IAM Roles
 gcloud storage buckets add-iam-policy-binding "gs://${BUCKET_NAME}" --member="serviceAccount:${GC_SA_EMAIL}" --role="roles/storage.objectAdmin" >/dev/null
 gcloud projects add-iam-policy-binding "$PROJECT_ID" --member="serviceAccount:${GC_SA_EMAIL}" --role="roles/dataproc.worker" --condition=None >/dev/null
 gcloud projects add-iam-policy-binding "$PROJECT_ID" --member="serviceAccount:${SCHEDULER_SA_EMAIL}" --role="roles/dataproc.editor" --condition=None >/dev/null
 gcloud iam service-accounts add-iam-policy-binding "$GC_SA_EMAIL" --member="serviceAccount:${SCHEDULER_SA_EMAIL}" --role="roles/iam.serviceAccountUser" >/dev/null
 
-# Batch JSON
+# --- AUTOMATED SMOKE TEST & SETUP ---
+echo ">>> Starting Automated Setup & Verification..."
+
+# 1. Retrieve or Create Admin Credentials
+if gcloud secrets describe lakefs-admin-creds --project="$PROJECT_ID" &>/dev/null; then
+    echo ">>> Found existing Admin Credentials in Secret Manager."
+    CREDS_JSON=$(gcloud secrets versions access latest --secret="lakefs-admin-creds" --project="$PROJECT_ID")
+else
+    echo ">>> No Admin Credentials found. Attempting to initialize LakeFS..."
+
+    echo ">>> Waiting for MIG to be stable..."
+    gcloud compute instance-groups managed wait-until --stable "$MIG_NAME" --region="$REGION" --project="$PROJECT_ID"
+
+    # Pick a random instance
+    INSTANCE=$(gcloud compute instance-groups managed list-instances "$MIG_NAME" --region="$REGION" --project="$PROJECT_ID" --format="value(instance)" | head -n1)
+
+    echo ">>> Tunnelling to $INSTANCE to perform First-Run Setup..."
+    # We SSH into the instance and run curl against localhost:8000
+    # Retries loop in case the service is still starting up inside the VM
+    MAX_RETRIES=10
+    COUNT=0
+    SETUP_RESPONSE=""
+
+    while [ $COUNT -lt $MAX_RETRIES ]; do
+        # We assume the service is up if we get a response (even an error is a response, but we want 200)
+        # We use a python one-liner to verify if we got JSON back.
+        SETUP_RESPONSE=$(gcloud compute ssh "$INSTANCE" --zone="${REGION}-a" --tunnel-through-iap --quiet \
+            --command "curl -s -X POST http://localhost:8000/api/v1/setup_lakefs -H 'Content-Type: application/json' -d '{\"username\":\"admin\"}'" \
+            -- -o StrictHostKeyChecking=no 2>/dev/null || true)
+
+        if [[ "$SETUP_RESPONSE" == *"access_key_id"* ]]; then
+            break
+        fi
+
+        echo "    Waiting for LakeFS service on instance... ($COUNT/$MAX_RETRIES)"
+        sleep 10
+        COUNT=$((COUNT+1))
+    done
+
+    if [[ "$SETUP_RESPONSE" != *"access_key_id"* ]]; then
+        echo "ERROR: Failed to initialize LakeFS. Response was: $SETUP_RESPONSE"
+        exit 1
+    fi
+
+    echo ">>> Setup Successful. Saving credentials to Secret Manager..."
+    gcloud secrets create lakefs-admin-creds --replication-policy="automatic" --project="$PROJECT_ID"
+    printf "%s" "$SETUP_RESPONSE" | gcloud secrets versions add lakefs-admin-creds --data-file=- --project="$PROJECT_ID"
+    CREDS_JSON="$SETUP_RESPONSE"
+fi
+
+# Extract Keys for Scheduler using Python
+ACCESS_KEY=$(echo "$CREDS_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin)['access_key_id'])")
+SECRET_KEY=$(echo "$CREDS_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin)['secret_access_key'])")
+
+echo ">>> Admin Access Key: $ACCESS_KEY"
+
+# 2. Create Example Repository (Idempotent)
+echo ">>> Ensuring 'example-repo' exists..."
+# We SSH again to run the curl command using the newly acquired credentials
+# Note: Basic Auth uses AccessKey:SecretKey
+gcloud compute ssh "$INSTANCE" --zone="${REGION}-a" --tunnel-through-iap --quiet \
+    --command "curl -s -X POST http://localhost:8000/api/v1/repositories \
+    -u \"$ACCESS_KEY:$SECRET_KEY\" \
+    -H 'Content-Type: application/json' \
+    -d '{\"name\":\"example-repo\",\"storage_namespace\":\"gs://${BUCKET_NAME}/example-repo\",\"default_branch\":\"main\"}'" \
+    -- -o StrictHostKeyChecking=no >/dev/null 2>&1 || echo "    (Repo creation skipped or failed, possibly already exists)"
+
+# 3. Generate Batch JSON with REAL Credentials
 cat <<EOF > batch-request.json
 {
   "sparkBatch": {
@@ -550,8 +635,8 @@ cat <<EOF > batch-request.json
         "containerImage": "treeverse/lakefs-spark-gc:latest",
         "properties": {
             "spark.hadoop.lakefs.api.url": "http://${LB_IP_ADDRESS}/api/v1",
-            "spark.hadoop.lakefs.api.access_key": "REPLACE_WITH_ACCESS_KEY",
-            "spark.hadoop.lakefs.api.secret_key": "REPLACE_WITH_SECRET_KEY"
+            "spark.hadoop.lakefs.api.access_key": "${ACCESS_KEY}",
+            "spark.hadoop.lakefs.api.secret_key": "${SECRET_KEY}"
         }
     }
   },
@@ -577,7 +662,7 @@ if ! gcloud scheduler jobs describe "$GC_JOB_NAME" --location="$REGION" --projec
         --message-body-from-file=batch-request.json \
         --project="$PROJECT_ID"
 else
-    echo ">>> Updating existing Scheduler Job..."
+    echo ">>> Updating existing Scheduler Job with valid credentials..."
     gcloud scheduler jobs update http "$GC_JOB_NAME" \
         --location="$REGION" \
         --schedule="0 3 * * 3" \
@@ -589,5 +674,9 @@ fi
 rm batch-request.json
 
 echo "----------------------------------------------------"
-echo ">>> COMPLETE. LakeFS Infrastructure is deployed."
+echo ">>> COMPLETE. LakeFS Infrastructure is deployed & configured."
+echo "----------------------------------------------------"
+echo ">>> Connect to your instance via IAP Tunnel:"
+echo "    gcloud compute ssh $INSTANCE --zone=${REGION}-a --tunnel-through-iap -- -L 8080:${LB_IP_ADDRESS}:80"
+echo ">>> Then visit: http://localhost:8080"
 echo "----------------------------------------------------"
