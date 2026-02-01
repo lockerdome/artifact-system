@@ -449,6 +449,8 @@ if [ -z "\$DB_HOST" ]; then
     exit 1
 fi
 
+export AUTH_SECRET=\$(openssl rand -hex 32)
+
 cat <<CONFIG > /etc/lakefs/config.yaml
 database:
   type: "postgres"
@@ -459,6 +461,10 @@ blockstore:
   type: "gs"
   gs:
     credentials_json: "/etc/lakefs/signer-key.json"
+
+auth:
+  encrypt:
+    secret_key: "\${AUTH_SECRET}"
 
 listen_address: "0.0.0.0:8000"
 
@@ -471,14 +477,21 @@ CONFIG
 chown lakefs:lakefs /etc/lakefs/config.yaml
 
 echo ">>> Running Database Migration (with retries)..."
-# This handles cases where Cloud SQL is warming up or routing is lagging.
 MIGRATE_RETRIES=0
 while [ \$MIGRATE_RETRIES -lt 30 ]; do
-    if /usr/local/bin/lakefs --config /etc/lakefs/config.yaml migrate up; then
-        echo ">>> Migration successful."
-        break
+    # 1. First, ensure KV store is initialized/migrated
+    # This specifically addresses the "Failed to get KV version" error
+    if /usr/local/bin/lakefs --config /etc/lakefs/config.yaml kv migrate up; then
+        echo ">>> KV Migration successful."
+
+        # 2. Then run standard relational migrations
+        if /usr/local/bin/lakefs --config /etc/lakefs/config.yaml migrate up; then
+            echo ">>> Relational Migration successful."
+            break
+        fi
     fi
-    echo ">>> Migration failed. DB might be unreachable yet. Retrying in 5s..."
+
+    echo ">>> Migration failed. DB might be unreachable or KV not ready. Retrying in 5s..."
     sleep 5
     MIGRATE_RETRIES=\$((MIGRATE_RETRIES+1))
 done
@@ -735,7 +748,7 @@ echo ">>> Admin Access Key: $ACCESS_KEY"
 echo ">>> Ensuring 'example-repo' exists..."
 # We SSH again to run the curl command using the newly acquired credentials
 # Note: Basic Auth uses AccessKey:SecretKey
-gcloud compute ssh "$INSTANCE" --zone="${REGION}-a" --tunnel-through-iap --quiet \
+gcloud compute ssh "$INSTANCE_NAME" --zone="${REGION}-a" --tunnel-through-iap --quiet \
     --command "curl -s -X POST http://localhost:8000/api/v1/repositories \
     -u \"$ACCESS_KEY:$SECRET_KEY\" \
     -H 'Content-Type: application/json' \
@@ -794,6 +807,6 @@ echo "----------------------------------------------------"
 echo ">>> COMPLETE. LakeFS Infrastructure is deployed & configured."
 echo "----------------------------------------------------"
 echo ">>> Connect to your instance via IAP Tunnel:"
-echo "    gcloud compute ssh $INSTANCE --zone=${REGION}-a --tunnel-through-iap -- -L 8080:${LB_IP_ADDRESS}:80"
+echo "    gcloud compute ssh $INSTANCE_NAME --zone=${REGION}-a --tunnel-through-iap -- -L 8080:${LB_IP_ADDRESS}:80"
 echo ">>> Then visit: http://localhost:8080"
 echo "----------------------------------------------------"
