@@ -379,7 +379,7 @@ DB_IP=""
 MAX_RETRIES=10
 COUNT=0
 while [ -z "$DB_IP" ] && [ $COUNT -lt $MAX_RETRIES ]; do
-    DB_IP=$(gcloud sql instances describe "$DB_INSTANCE_NAME" --format="value(ipAddresses[type=PRIVATE].ipAddress)" 2>/dev/null)
+    DB_IP=$(gcloud sql instances describe "$DB_INSTANCE_NAME" --project="$PROJECT_ID" --format="json" 2>/dev/null | python3 -c "import sys, json; print(next((i['ipAddress'] for i in json.load(sys.stdin).get('ipAddresses', []) if i['type'] == 'PRIVATE'), ''))")
     if [ -n "$DB_IP" ]; then
         echo "    Found DB IP: $DB_IP"
         break
@@ -390,7 +390,7 @@ while [ -z "$DB_IP" ] && [ $COUNT -lt $MAX_RETRIES ]; do
 done
 
 if [[ -z "$DB_IP" ]]; then
-    echo "ERROR: Could not retrieve Cloud SQL Private IP after retries."
+    echo "ERROR: Could not retrieve Cloud SQL Private IP. Please verify the instance '$DB_INSTANCE_NAME' has a Private IP."
     exit 1
 fi
 
@@ -460,11 +460,8 @@ blockstore:
   gs:
     credentials_json: "/etc/lakefs/signer-key.json"
 
-storage:
-  type: "gs"
-  
 installation:
-  user_data_dir: "/var/lib/lakefs"
+  user_data_id: "lakefs-setup"
 
 listen_address: "0.0.0.0:8000"
 
