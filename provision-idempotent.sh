@@ -460,13 +460,12 @@ blockstore:
   gs:
     credentials_json: "/etc/lakefs/signer-key.json"
 
-installation:
-  user_data_id: "lakefs-setup"
-
 listen_address: "0.0.0.0:8000"
 
 logging:
-  level: "INFO"
+  format: json
+  level: WARN
+  output: "-"
 CONFIG
 
 chown lakefs:lakefs /etc/lakefs/config.yaml
@@ -697,31 +696,22 @@ else
     # The fix to runtime-startup.sh should allow this to pass now
     gcloud compute instance-groups managed wait-until --stable "$MIG_NAME" --region="$REGION" --project="$PROJECT_ID"
 
-    # Pick a random instance
-    INSTANCE=$(gcloud compute instance-groups managed list-instances "$MIG_NAME" --region="$REGION" --project="$PROJECT_ID" --format="value(instance)" | head -n1)
+    # 1. Fetch the full URL of a random instance
+    INSTANCE_URL=$(gcloud compute instance-groups managed list-instances "$MIG_NAME" \
+        --region="$REGION" --project="$PROJECT_ID" --format="value(instance)" | head -n1)
 
-    echo ">>> Tunnelling to $INSTANCE to perform First-Run Setup..."
-    # We SSH into the instance and run curl against localhost:8000
-    # Retries loop in case the service is still starting up inside the VM
-    MAX_RETRIES=10
-    COUNT=0
-    SETUP_RESPONSE=""
+    # 2. Extract the Instance Name (the part after the last slash)
+    INSTANCE_NAME=${INSTANCE_URL##*/}
 
-    while [ $COUNT -lt $MAX_RETRIES ]; do
-        # We assume the service is up if we get a response (even an error is a response, but we want 200)
-        # We use a python one-liner to verify if we got JSON back.
-        SETUP_RESPONSE=$(gcloud compute ssh "$INSTANCE" --zone="${REGION}-a" --tunnel-through-iap --quiet \
-            --command "curl -s -X POST http://localhost:8000/api/v1/setup_lakefs -H 'Content-Type: application/json' -d '{\"username\":\"admin\"}'" \
-            -- -o StrictHostKeyChecking=no 2>/dev/null || true)
+    # 3. Extract the Zone (the part between 'zones/' and the next slash)
+    INSTANCE_ZONE=$(echo "$INSTANCE_URL" | grep -oP '(?<=zones/)[^/]+')
 
-        if [[ "$SETUP_RESPONSE" == *"access_key_id"* ]]; then
-            break
-        fi
+    echo ">>> Tunnelling to $INSTANCE_NAME in $INSTANCE_ZONE to perform First-Run Setup..."
 
-        echo "    Waiting for LakeFS service on instance... ($COUNT/$MAX_RETRIES)"
-        sleep 10
-        COUNT=$((COUNT+1))
-    done
+    # 4. Use the parsed name and zone in the SSH command
+    SETUP_RESPONSE=$(gcloud compute ssh "$INSTANCE_NAME" --zone="$INSTANCE_ZONE" --tunnel-through-iap --quiet \
+        --command "curl -s -X POST http://localhost:8000/api/v1/setup_lakefs -H 'Content-Type: application/json' -d '{\"username\":\"admin\"}'" \
+        -- -o StrictHostKeyChecking=no 2>/dev/null || true)
 
     if [[ "$SETUP_RESPONSE" != *"access_key_id"* ]]; then
         echo "ERROR: Failed to initialize LakeFS. Response was: $SETUP_RESPONSE"
