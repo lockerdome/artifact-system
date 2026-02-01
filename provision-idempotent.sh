@@ -374,10 +374,23 @@ export MIG_NAME="lakefs-mig-regional"
 
 echo ">>> Starting Part 3B: Deploying Runtime Infrastructure..."
 
-DB_IP=$(gcloud sql instances describe "$DB_INSTANCE_NAME" --format="value(ipAddresses[type=PRIVATE].ipAddress)")
+echo ">>> Fetching Cloud SQL Private IP..."
+DB_IP=""
+MAX_RETRIES=10
+COUNT=0
+while [ -z "$DB_IP" ] && [ $COUNT -lt $MAX_RETRIES ]; do
+    DB_IP=$(gcloud sql instances describe "$DB_INSTANCE_NAME" --format="value(ipAddresses[type=PRIVATE].ipAddress)" 2>/dev/null)
+    if [ -n "$DB_IP" ]; then
+        echo "    Found DB IP: $DB_IP"
+        break
+    fi
+    echo "    Waiting for DB IP to be available... ($COUNT/$MAX_RETRIES)"
+    sleep 10
+    COUNT=$((COUNT+1))
+done
 
 if [[ -z "$DB_IP" ]]; then
-    echo "ERROR: Could not retrieve Cloud SQL Private IP. Ensure Private IP is enabled."
+    echo "ERROR: Could not retrieve Cloud SQL Private IP after retries."
     exit 1
 fi
 
@@ -391,9 +404,9 @@ fetch_metadata() {
   local attr=\$1
   local val=""
   local count=0
-  while [ -z "\$val" ] && [ \$count -lt 10 ]; do
+  while [ -z "\$val" ] && [ \$count -lt 20 ]; do
     val=\$(curl -s "http://metadata.google.internal/computeMetadata/v1/instance/attributes/\$attr" -H "Metadata-Flavor: Google")
-    if [ -z "\$val" ]; then sleep 2; fi
+    if [ -z "\$val" ]; then sleep 3; fi
     count=\$((count+1))
   done
   echo "\$val"
