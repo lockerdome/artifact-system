@@ -19,6 +19,7 @@ export PSA_RANGE="10.100.0.0/16"     # Range for Cloud SQL (Service Peering)
 export LB_RANGE="10.129.0.0/23"
 export DB_INSTANCE_NAME="lakefs-db"
 export LB_PREFIX="lakefs-lb"
+export ACCESS_KEY_ID="e4f3c46f902cce3b13da679b"
 
 # Set the project context
 gcloud config set project "$PROJECT_ID"
@@ -238,6 +239,7 @@ else
         --password="$EXISTING_PW" \
         --project="$PROJECT_ID"
 fi
+
 # 5. Grant IAM Roles (Idempotent by default)
 echo ">>> Ensuring IAM Roles..."
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
@@ -252,6 +254,42 @@ gcloud storage buckets add-iam-policy-binding "gs://${BUCKET_NAME}" \
 gcloud storage buckets add-iam-policy-binding "gs://${BUCKET_NAME}" \
     --member="serviceAccount:${SA_SIGNER_EMAIL}" \
     --role="roles/storage.objectAdmin" >/dev/null
+
+# 6. Create authorization key
+if ! gcloud secrets describe lakefs-secret-key --project="$PROJECT_ID" &>/dev/null; then
+    echo ">>> Generating random secret key for LakeFS..."
+    SECRET_KEY=$(openssl rand -hex 24)
+
+    echo ">>> Creating Secret: lakefs-secret-key..."
+    gcloud secrets create lakefs-secret-key \
+        --replication-policy="automatic" \
+        --project="$PROJECT_ID"
+
+    printf "%s" "$SECRET_KEY" | gcloud secrets versions add lakefs-secret-key \
+        --data-file=- \
+        --project="$PROJECT_ID"
+else
+    echo ">>> Secret lakefs-secret-key already exists."
+    SECRET_KEY=$(gcloud secrets versions access latest --secret="lakefs-secret-key" --project="$PROJECT_ID")
+fi
+
+# 7. Create admin secret access key
+if ! gcloud secrets describe lakefs-secret-access-key --project="$PROJECT_ID" &>/dev/null; then
+    echo ">>> Generating random secret key for LakeFS..."
+    SECRET_ACCESS_KEY=$(openssl rand -hex 24)
+
+    echo ">>> Creating Secret: lakefs-secret-access-key..."
+    gcloud secrets create lakefs-secret-access-key \
+        --replication-policy="automatic" \
+        --project="$PROJECT_ID"
+
+    printf "%s" "$SECRET_ACCESS_KEY" | gcloud secrets versions add lakefs-secret-access-key \
+        --data-file=- \
+        --project="$PROJECT_ID"
+else
+    echo ">>> Secret lakefs-secret-access-key already exists."
+    SECRET_ACCESS_KEY=$(gcloud secrets versions access latest --secret="lakefs-secret-access-key" --project="$PROJECT_ID")
+fi
 
 echo ">>> Part 2 Complete. Identities and Secrets ready."
 
@@ -419,7 +457,25 @@ while [ \$RETRIES -lt 20 ]; do
     if gcloud secrets versions access latest --secret="lakefs-signer-key" > /etc/lakefs/signer-key.json 2>/dev/null; then
         if [ -s /etc/lakefs/signer-key.json ]; then break; fi
     fi
-    echo "Waiting for Secret Manager (Key)..."
+    echo "Waiting for Secret Manager (Signer Key)..."
+    sleep 3
+    RETRIES=\$((RETRIES+1))
+done
+
+RETRIES=0
+while [ \$RETRIES -lt 20 ]; do
+    SECRET_KEY=\$(gcloud secrets versions access latest --secret="lakefs-secret-key" 2>/dev/null)
+    if [ -n "\$SECRET_KEY" ]; then break; fi
+    echo "Waiting for Secret Manager (Auth Key)..."
+    sleep 3
+    RETRIES=\$((RETRIES+1))
+done
+
+RETRIES=0
+while [ \$RETRIES -lt 20 ]; do
+    SECRET_ACCESS_KEY=\$(gcloud secrets versions access latest --secret="lakefs-secret-access-key" 2>/dev/null)
+    if [ -n "\$SECRET_ACCESS_KEY" ]; then break; fi
+    echo "Waiting for Secret Manager (Auth Key)..."
     sleep 3
     RETRIES=\$((RETRIES+1))
 done
@@ -449,8 +505,6 @@ if [ -z "\$DB_HOST" ]; then
     exit 1
 fi
 
-export AUTH_SECRET=\$(openssl rand -hex 32)
-
 cat <<CONFIG > /etc/lakefs/config.yaml
 database:
   type: "postgres"
@@ -460,11 +514,11 @@ database:
 blockstore:
   type: "gs"
   gs:
-    credentials_json: "/etc/lakefs/signer-key.json"
+    credentials_file: "/etc/lakefs/signer-key.json"
 
 auth:
   encrypt:
-    secret_key: "\${AUTH_SECRET}"
+    secret_key: "\${SECRET_KEY}"
 
 listen_address: "0.0.0.0:8000"
 
@@ -476,30 +530,10 @@ CONFIG
 
 chown lakefs:lakefs /etc/lakefs/config.yaml
 
-echo ">>> Running Database Migration (with retries)..."
-MIGRATE_RETRIES=0
-while [ \$MIGRATE_RETRIES -lt 30 ]; do
-    # 1. First, ensure KV store is initialized/migrated
-    # This specifically addresses the "Failed to get KV version" error
-    if /usr/local/bin/lakefs --config /etc/lakefs/config.yaml kv migrate up; then
-        echo ">>> KV Migration successful."
-
-        # 2. Then run standard relational migrations
-        if /usr/local/bin/lakefs --config /etc/lakefs/config.yaml migrate up; then
-            echo ">>> Relational Migration successful."
-            break
-        fi
-    fi
-
-    echo ">>> Migration failed. DB might be unreachable or KV not ready. Retrying in 5s..."
-    sleep 5
-    MIGRATE_RETRIES=\$((MIGRATE_RETRIES+1))
-done
-
-if [ \$MIGRATE_RETRIES -eq 30 ]; then
-    echo "ERROR: Migration failed after 30 attempts."
-    exit 1
-fi
+/usr/local/bin/lakefs --config /etc/lakefs/config.yaml setup \
+  --user-name "admin" \
+  --access-key-id "${ACCESS_KEY_ID}" \
+  --secret-access-key "\${SECRET_ACCESS_KEY}" || true
 
 echo ">>> Starting LakeFS..."
 systemctl enable lakefs && systemctl start lakefs
@@ -698,51 +732,18 @@ gcloud iam service-accounts add-iam-policy-binding "$GC_SA_EMAIL" --member="serv
 # --- AUTOMATED SMOKE TEST & SETUP ---
 echo ">>> Starting Automated Setup & Verification..."
 
-# 1. Retrieve or Create Admin Credentials
-if gcloud secrets describe lakefs-admin-creds --project="$PROJECT_ID" &>/dev/null; then
-    echo ">>> Found existing Admin Credentials in Secret Manager."
-    CREDS_JSON=$(gcloud secrets versions access latest --secret="lakefs-admin-creds" --project="$PROJECT_ID")
-else
-    echo ">>> No Admin Credentials found. Attempting to initialize LakeFS..."
+echo ">>> Waiting for MIG to be stable..."
+# The fix to runtime-startup.sh should allow this to pass now
+gcloud compute instance-groups managed wait-until --stable "$MIG_NAME" --region="$REGION" --project="$PROJECT_ID"
 
-    echo ">>> Waiting for MIG to be stable..."
-    # The fix to runtime-startup.sh should allow this to pass now
-    gcloud compute instance-groups managed wait-until --stable "$MIG_NAME" --region="$REGION" --project="$PROJECT_ID"
+# 1. Fetch the full URL of a random instance
+INSTANCE_URL=$(gcloud compute instance-groups managed list-instances "$MIG_NAME" \
+    --region="$REGION" --project="$PROJECT_ID" --format="value(instance)" | head -n1)
 
-    # 1. Fetch the full URL of a random instance
-    INSTANCE_URL=$(gcloud compute instance-groups managed list-instances "$MIG_NAME" \
-        --region="$REGION" --project="$PROJECT_ID" --format="value(instance)" | head -n1)
+# 2. Extract the Instance Name (the part after the last slash)
+INSTANCE_NAME=${INSTANCE_URL##*/}
 
-    # 2. Extract the Instance Name (the part after the last slash)
-    INSTANCE_NAME=${INSTANCE_URL##*/}
-
-    # 3. Extract the Zone (the part between 'zones/' and the next slash)
-    INSTANCE_ZONE=$(echo "$INSTANCE_URL" | grep -oP '(?<=zones/)[^/]+')
-
-    echo ">>> Tunnelling to $INSTANCE_NAME in $INSTANCE_ZONE to perform First-Run Setup..."
-
-    # 4. Use the parsed name and zone in the SSH command
-    SETUP_RESPONSE=$(gcloud compute ssh "$INSTANCE_NAME" --zone="$INSTANCE_ZONE" --tunnel-through-iap --quiet \
-        --command "curl -s -X POST http://localhost:8000/api/v1/setup_lakefs -H 'Content-Type: application/json' -d '{\"username\":\"admin\"}'" \
-        -- -o StrictHostKeyChecking=no 2>/dev/null || true)
-
-    if [[ "$SETUP_RESPONSE" != *"access_key_id"* ]]; then
-        echo "ERROR: Failed to initialize LakeFS. Response was: $SETUP_RESPONSE"
-        echo "DEBUG: Check /var/log/syslog on the instance for lakefs startup errors."
-        exit 1
-    fi
-
-    echo ">>> Setup Successful. Saving credentials to Secret Manager..."
-    gcloud secrets create lakefs-admin-creds --replication-policy="automatic" --project="$PROJECT_ID"
-    printf "%s" "$SETUP_RESPONSE" | gcloud secrets versions add lakefs-admin-creds --data-file=- --project="$PROJECT_ID"
-    CREDS_JSON="$SETUP_RESPONSE"
-fi
-
-# Extract Keys for Scheduler using Python
-ACCESS_KEY=$(echo "$CREDS_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin)['access_key_id'])")
-SECRET_KEY=$(echo "$CREDS_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin)['secret_access_key'])")
-
-echo ">>> Admin Access Key: $ACCESS_KEY"
+echo ">>> Admin Access Key: $ACCESS_KEY_ID"
 
 # 2. Create Example Repository (Idempotent)
 echo ">>> Ensuring 'example-repo' exists..."
@@ -750,7 +751,7 @@ echo ">>> Ensuring 'example-repo' exists..."
 # Note: Basic Auth uses AccessKey:SecretKey
 gcloud compute ssh "$INSTANCE_NAME" --zone="${REGION}-a" --tunnel-through-iap --quiet \
     --command "curl -s -X POST http://localhost:8000/api/v1/repositories \
-    -u \"$ACCESS_KEY:$SECRET_KEY\" \
+    -u \"$ACCESS_KEY_ID:$SECRET_ACCESS_KEY\" \
     -H 'Content-Type: application/json' \
     -d '{\"name\":\"example-repo\",\"storage_namespace\":\"gs://${BUCKET_NAME}/example-repo\",\"default_branch\":\"main\"}'" \
     -- -o StrictHostKeyChecking=no >/dev/null 2>&1 || echo "    (Repo creation skipped or failed, possibly already exists)"
@@ -765,8 +766,8 @@ cat <<EOF > batch-request.json
         "containerImage": "treeverse/lakefs-spark-gc:latest",
         "properties": {
             "spark.hadoop.lakefs.api.url": "http://${LB_IP_ADDRESS}/api/v1",
-            "spark.hadoop.lakefs.api.access_key": "${ACCESS_KEY}",
-            "spark.hadoop.lakefs.api.secret_key": "${SECRET_KEY}"
+            "spark.hadoop.lakefs.api.access_key": "${ACCESS_KEY_ID}",
+            "spark.hadoop.lakefs.api.secret_key": "${SECRET_ACCESS_KEY}"
         }
     }
   },
