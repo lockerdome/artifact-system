@@ -28,7 +28,7 @@ LakeFS can be set up with the providion.sh script. This will create a MIG, Postg
 Instance Template, Health Check, Spark vacuum Service, VPC, and a few other odds and ends which enable a highly
 available LakeFS cluster. Note that the script uses two zones with the MIG to ensure high availability and utilizes
 the HA version of Postgres. The costs are low enough that this seems like a worthwhile choice. The script will also
-create a bucket in Cloud Storage called lakefs-data-<project-id>. You will probably want to set the PROJECT_ID before
+create a bucket in Cloud Storage called lakefs-data-{project-id}. You will probably want to set the PROJECT_ID before
 running the provisioning script and check that the IP ranges will work with our broader system.
 
 The secret needed to login with the admin account is saved in the secret manager as lakefs-secret-access-key and
@@ -71,9 +71,9 @@ probably simply be encoded by the lack of an object.
 ### How we scope artifacts vs indexes vs types
 
 In order to support indexes, we need to ensure that they will never overlap with artifacts, but they must be in the same
-path structure where we store all objects. I suggest something simple like this: use artifacts/<artifact id> for the
-artifacts themselves and indexes/<index name>/<index key> for the indexes. We could also have types/<artifact type name>
-be where we store the artifact type information. We could also store types/<artifact type name>/<version> when we wish
+path structure where we store all objects. I suggest something simple like this: use artifacts/{artifact id} for the
+artifacts themselves and indexes/{index name}/{index key} for the indexes. We could also have types/{artifact type name}
+be where we store the artifact type information. We could also store types/{artifact type name}/{version} when we wish
 to version these. I would strongly recommend against making any of these details transparent to end-users and would
 treat the actual paths of objects in cloud storage as a private implimentation detail.
 
@@ -91,7 +91,7 @@ schemas in LakeFs.
 For the actual storing of artifact type information, we could use protobuf for the schema itself. This would then encode
 what will actually be stored in the artifact's object. We can attach metadata in individual fields as needed to define
 things like "index this field". We can also use `extend google.protobuf.MessageOptions` to add functionality into the
-specific type information. I'd suggest we make the contents of the objects stored in types/<artifact type name> a valid
+specific type information. I'd suggest we make the contents of the objects stored in types/{artifact type name} a valid
 protobuf definition. We'll have to decide how we load this, though, because we may want to automatically import the
 extensions to message metadata and other basic types. We can store fields like viewer endpoints and actions as metadata
 which is defined in our extensions to message options such that each artifact type is able to specify those.
