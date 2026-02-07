@@ -739,10 +739,22 @@ gcloud compute instance-groups managed wait-until --stable "$MIG_NAME" --region=
 
 # 1. Fetch the full URL of a random instance
 INSTANCE_URL=$(gcloud compute instance-groups managed list-instances "$MIG_NAME" \
-    --region="$REGION" --project="$PROJECT_ID" --format="value(instance)" | head -n1)
+    --region="$REGION" --project="$PROJECT_ID" --limit=1 --format="value(instance)")
 
-# 2. Extract the Instance Name (the part after the last slash)
+if [[ -z "$INSTANCE_URL" ]]; then
+    echo "ERROR: No instances found in MIG $MIG_NAME."
+    exit 1
+fi
+
+# 2. Extract the Instance Name and Zone from the URL
 INSTANCE_NAME=${INSTANCE_URL##*/}
+INSTANCE_ZONE=${INSTANCE_URL#*zones/}
+INSTANCE_ZONE=${INSTANCE_ZONE%%/*}
+
+if [[ -z "$INSTANCE_ZONE" ]]; then
+    echo "ERROR: Failed to determine instance zone from $INSTANCE_URL"
+    exit 1
+fi
 
 echo ">>> Admin Access Key: $ACCESS_KEY_ID"
 
@@ -750,7 +762,7 @@ echo ">>> Admin Access Key: $ACCESS_KEY_ID"
 echo ">>> Ensuring 'example-repo' exists..."
 # We SSH again to run the curl command using the newly acquired credentials
 # Note: Basic Auth uses AccessKey:SecretKey
-gcloud compute ssh "$INSTANCE_NAME" --zone="${REGION}-a" --tunnel-through-iap --quiet \
+gcloud compute ssh "$INSTANCE_NAME" --zone="$INSTANCE_ZONE" --tunnel-through-iap --quiet \
     --command "curl -s -X POST http://localhost:8000/api/v1/repositories \
     -u \"$ACCESS_KEY_ID:$SECRET_ACCESS_KEY\" \
     -H 'Content-Type: application/json' \
@@ -809,6 +821,6 @@ echo "----------------------------------------------------"
 echo ">>> COMPLETE. LakeFS Infrastructure is deployed & configured."
 echo "----------------------------------------------------"
 echo ">>> Connect to your instance via IAP Tunnel:"
-echo "    gcloud compute ssh $INSTANCE_NAME --zone=${REGION}-a --tunnel-through-iap -- -L 8080:${LB_IP_ADDRESS}:80"
+echo "    gcloud compute ssh $INSTANCE_NAME --zone=${INSTANCE_ZONE} --tunnel-through-iap -- -L 8080:${LB_IP_ADDRESS}:80"
 echo ">>> Then visit: http://localhost:8080"
 echo "----------------------------------------------------"
