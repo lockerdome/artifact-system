@@ -50,6 +50,17 @@ delete_resource() {
     $TYPE delete "$NAME" $FLAGS --quiet || echo "    (Skipped or already deleted)"
 }
 
+remove_binding() {
+    local MEMBER=$1
+    local ROLE=$2
+    echo ">>> Removing IAM binding: $MEMBER ($ROLE)..."
+    gcloud projects remove-iam-policy-binding "$PROJECT_ID" \
+        --member="$MEMBER" \
+        --role="$ROLE" \
+        --condition=None \
+        --quiet || echo "    (Binding already removed)"
+}
+
 echo ">>> Starting Teardown..."
 
 # 1. Delete Cloud Scheduler
@@ -91,13 +102,18 @@ delete_resource "gcloud secrets" "lakefs-db-password" ""
 delete_resource "gcloud secrets" "lakefs-secret-key" ""
 delete_resource "gcloud secrets" "lakefs-secret-access-key" ""
 
-# 9. Delete Identity (Service Accounts)
+# 9. Remove Project IAM Bindings
+remove_binding "serviceAccount:${SA_VM_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" "roles/secretmanager.secretAccessor"
+remove_binding "serviceAccount:${GC_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" "roles/dataproc.worker"
+remove_binding "serviceAccount:${SCHEDULER_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" "roles/dataproc.editor"
+
+# 10. Delete Identity (Service Accounts)
 delete_resource "gcloud iam service-accounts" "${SA_VM_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" ""
 delete_resource "gcloud iam service-accounts" "${SA_SIGNER_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" ""
 delete_resource "gcloud iam service-accounts" "${GC_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" ""
 delete_resource "gcloud iam service-accounts" "${SCHEDULER_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" ""
 
-# 10. Delete Networking
+# 11. Delete Networking
 delete_resource "gcloud compute routers nats" "lakefs-nat" "--router=lakefs-router --region=$REGION"
 delete_resource "gcloud compute routers" "lakefs-router" "--region=$REGION"
 
