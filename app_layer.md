@@ -1,28 +1,19 @@
+# Layered Artifact System
 
+## Layer overview
+1. Storage Layer: durable object storage with versioned commits, branches, merges, and conflict detection. LakeFS is the
+   current implementation, but we could use any system with similar semantics (for example, Dolt). No domain rules.
+1. Artifact Layer: canonical API for artifact CRUD and ID allocation, schema/type registry, index derivation, and index
+   conflict resolution.
+1. App Layer: domain-specific rules, permissions, and workflows around artifacts. An example App Layer service is an
+   Artifact Viewer.
 
-# artifact-server layer above LakeFS
+## Storage Layer
 
-LakeFS provides transactions, versioning and storage. This leaves many application-specific pieces of functionality.
-Specifically, the artifact server must support artifact schemas (and types), application-specific logic, indexes,
-groups, resolving merge conflicts, providing metadata for an artifact type, caching in redis, and many other things.
+The Storage Layer provides transactions, versioning and storage. LakeFS is the current implementation. It does not
+encode artifact schemas or domain logic.
 
-## Necessary features for launch
-
-1. Integration with LakeFS
-1. Indexes for looking up artifacts (and ability to resolve conflicts)
-1. Artifact Type registry (with version and schema support)
-
-## Additional features which should be planned for
-
-1. Caching objects in redis
-1. Some form of validation of permissions
-1. Triggers
-1. Sharding of indexes for when they get extremely large (think "get me all artifacts of type X")
-1. Migrating indexes (adding or removing indexes)
-1. Schema validation for artifacts
-1. Supporting pulling of "part" of an artifact
-
-## Integration with LakeFS
+### Integration with LakeFS
 
 LakeFS can be set up with the provision.sh script. This will create a MIG, Postgres database, Load Balancer, Image,
 Instance Template, Health Check, Spark vacuum Service, VPC, and a few other odds and ends which enable a highly
@@ -44,7 +35,7 @@ cross-repo transactions. Additionally, it is important to note that the Spark cl
 are not recent and not directly pinned by a tag or referenced as the head of a branch. We could choose to change this
 behavior, but, the default they recommend will "vacuum" anything older than the time window and which is not referenced.
 
-### Conflicts
+### Conflict model
 
 LakeFS is designed to be general purpose and, as such, it does not assume that it knows how to merge when objects
 diverge in two branches. This is unlikely to cause a surprise when updating an artifact, however, because we will be
@@ -53,35 +44,47 @@ here: first, we can use pre-merge hooks; I don't recommend those for conflict re
 our own layer on top of LakeFS, I suspect that this feature will be unhelpful for us. The second tool, and the one I
 recommend, is to handle the conflict after trying to merge. To do this, simply create logic that when a transaction
 attempts to merge, if the LakeFS server returns with a Conflict, read through the conflicts, resolve index conflicts
-with application logic and then retry the merge. Repeat this until it merges successfully or too many tries are reached.
-The latter should not really ever occur in production with our current levels of concurrency.
+with artifact layer logic and then retry the merge. Repeat this until it merges successfully or too many tries are
+reached. The latter should not really ever occur in production with our current levels of concurrency.
 
-Conflicts on commit are handled via test-and-set using an object version ID (for example, an ETag) on artifacts. If the
-precondition fails, we return a conflict to the calling service so it can resolve and retry. Indexes are derived by
-application logic and are not manually set, so they should not have logical conflicts on commit. The commit workflow
-will read the latest index state, apply adds/removes derived from the artifact changes, and write back the updated index
-object(s).
+## Artifact Layer
 
-Artifact conflicts (commit precondition failures or merge conflicts) are returned to the calling service to resolve and
-retry. This service treats artifact payloads as opaque and will not attempt to auto-resolve them. Only index conflicts
-are auto-resolved. In the future, we can add application-defined merge logic per artifact type.
+This layer builds on the Storage Layer and provides shared artifact functionality above storage. Specifically, the
+artifact layer must support artifact schemas (and types), ID allocation, indexes, groups, resolving merge conflicts for
+indexes, providing metadata for an artifact type, caching in redis, and other shared functionality. Application-
+specific logic and permissions live in the App Layer.
 
-## Indexes for looking up artifacts
+### Necessary features for launch
+
+1. Integration with LakeFS
+1. Indexes for looking up artifacts (and ability to resolve conflicts)
+1. Artifact Type registry (with version and schema support)
+
+### Additional features which should be planned for
+
+1. Caching objects in redis
+1. Sharding of indexes for when they get extremely large (think "get me all artifacts of type X")
+1. Migrating indexes (adding or removing indexes)
+1. Schema validation for artifacts
+1. Supporting pulling of "part" of an artifact
+
+### Indexes for looking up artifacts
 
 We have discussed having tags or groups which are both essentially higher level abstractions around the idea of an
 index. While what we index on will likely be at least partially driven by the particular artifact type, the underlying
 way we store the artifacts (or singular artifact when an index is unique) which are present in each index will likely
 be uniform. I would suggest a similar approach to what we use in ReactDB. Of note, however, any changes to an index will
 conflict, so merging will require doing a diff between the common base, current head we are merging into and the current
-head of what we are merging for each conflicting index. (See Conflicts above) In other words, we will need to read the
+head of what we are merging for each conflicting index. (See Conflict model above) In other words, we will need to read the
 changes and reconstruct what the edits are for each diverging branch and then apply all those edits. If the index is a
 unique index, we would obviously require that any final version contains zero or one item. Empty indexes should simply
 not exist at HEAD (though history may include prior objects).
 
-Indexes are derived from artifacts by application logic and are never manually set. They only conflict on merge.
-Unique indexes enforce at most a single item across all commits and merges.
+Indexes are derived from artifacts by artifact layer logic and are never manually set. They only conflict on merge.
+The commit workflow reads the latest index state, applies adds/removes derived from the artifact changes, and writes
+back the updated index object(s). Unique indexes enforce at most a single item across all commits and merges.
 
-### Index definition
+#### Index definition
 
 An index definition includes:
 1. key_type: the name of the value and the identifier passed to fetch index calls.
@@ -93,7 +96,7 @@ An index definition includes:
 5. where clauses: predicates that determine whether a value should be indexed. Supported ops include ==, >, <, >=, <=.
    The LHS must be a field; the RHS can be a field or a constant.
 
-### Index merge semantics
+#### Index merge semantics
 
 When a merge reports a conflicting index object, we perform a three-way merge using the merge base and both heads. Each
 index object is treated as a set of entries keyed by artifact ID with associated order field values. For each branch we
@@ -103,14 +106,14 @@ artifact ID, and re-sort by the configured order fields (tie-breaker: artifact I
 and is idempotent across retries. If a unique index ends up with more than one item, the merge fails and the conflict is
 returned to the calling service for resolution.
 
-### Index physical storage
+#### Index physical storage
 
 Index objects are stored under indexes/{key_prefix}/{encoded_keys}. The key_prefix is an unsigned numeric value (default:
 stable hash of key_type) encoded as base64 using the URL-safe alphabet of its big-endian uint64 bytes without padding.
 The encoded_keys is base64 using the URL-safe alphabet of the concatenated binary encodings for each key field.
 Variable-length fields (for example, strings) must include length prefixes in their binary encoding.
 
-### Index object representation
+#### Index object representation
 
 Index objects must be encoded deterministically to make diffs and merges reliable. The value is a column-oriented binary
 format with one column per order field plus an artifact_id column. Rows are ordered by the order fields (tie-breaker:
@@ -118,13 +121,13 @@ artifact_id). The encoding format can be configured per index. By default, each 
 binary values. In the future, we can support dictionary encoding or RLE per column to compress the arrays. Empty indexes
 simply do not exist at HEAD (though history may include prior objects).
 
-### Index sharding (planned)
+#### Index sharding (planned)
 
 When indexes become large, shard them by bucket and store a small manifest object that lists all bucket objects for an
 index key. Bucket naming should be deterministic (for example, a fixed-width prefix of a hash) so that reads can page
 over buckets predictably. The manifest is the canonical entrypoint for reads.
 
-### How we scope artifacts vs indexes vs types
+### Object namespaces and paths
 
 In order to support indexes, we need to ensure that they will never overlap with artifacts, but they must be in the same
 path structure where we store all objects. I suggest something simple like this: use artifacts/{artifact id} for the
@@ -142,7 +145,14 @@ alphabet of its big-endian uint64 bytes without padding and used as the first pa
 encoded_keys is base64 using the URL-safe alphabet of the concatenated binary encodings of each key field
 (length-prefixed where needed).
 
-## Artifact Type registry (with version and schema support)
+### Artifacts
+
+Artifacts are stored as opaque payloads defined by Types; the artifact layer does not auto-resolve payload conflicts.
+Writes use test-and-set via an object version ID (for example, an ETag). If the precondition fails or a merge conflict
+occurs, we return a conflict to the calling service so it can resolve and retry. Only index conflicts are auto-resolved.
+In the future, we can add application-defined merge logic per artifact type.
+
+### Types (artifact type registry)
 
 We likely want to represent the artifact types as tied to the current state of the repo. This is helpful because we can
 create migration transactions and detect when merging if something needs to be corrected before merging. For example, if
@@ -168,3 +178,12 @@ As far as specific fields needed in an artifact definition, I think we would nee
 4. Actions (add a MessageOption for defining a dictionary of actions to an artifact)
 5. Viewer (add a MessageOption for defining the default viewer endpoint)
 6. Custom Instruction (add a MessageOption for defining instructions for LLMs)
+
+## App Layer
+
+The app layer applies domain-specific rules and permissioning on top of the artifact layer.
+
+### Additional features which should be planned for
+
+1. Some form of validation of permissions
+1. Triggers
