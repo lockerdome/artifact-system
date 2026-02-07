@@ -3,7 +3,7 @@
 # artifact-server layer above LakeFS
 
 LakeFS provides transactions, versioning and storage. This leaves many application-specific pieces of functionality.
-Specifically, the artifact server msut support artifact schemas (and types), application-specific logic, indexes,
+Specifically, the artifact server must support artifact schemas (and types), application-specific logic, indexes,
 groups, resolving merge conflicts, providing metadata for an artifact type, caching in redis, and many other things.
 
 ## Necessary features for launch
@@ -24,7 +24,7 @@ groups, resolving merge conflicts, providing metadata for an artifact type, cach
 
 ## Integration with LakeFS
 
-LakeFS can be set up with the providion.sh script. This will create a MIG, Postgres database, Load Balancer, Image,
+LakeFS can be set up with the provision.sh script. This will create a MIG, Postgres database, Load Balancer, Image,
 Instance Template, Health Check, Spark vacuum Service, VPC, and a few other odds and ends which enable a highly
 available LakeFS cluster. Note that the script uses two zones with the MIG to ensure high availability and utilizes
 the HA version of Postgres. The costs are low enough that this seems like a worthwhile choice. The script will also
@@ -52,9 +52,19 @@ using objects to store the state of indexes, those will be very likely to have c
 here: first, we can use pre-merge hooks; I don't recommend those for conflict resolution and, given that we are adding
 our own layer on top of LakeFS, I suspect that this feature will be unhelpful for us. The second tool, and the one I
 recommend, is to handle the conflict after trying to merge. To do this, simply create logic that when a transaction
-attempts to commit, if the LakeFS server returns with a Conflict, read through the conflicts, fix them with application
-logic and then retry the merge. Repeat this until it merges successfully or too many tries are reached. The latter
-should not really ever occur in production with our current levels of concurrency.
+attempts to merge, if the LakeFS server returns with a Conflict, read through the conflicts, resolve index conflicts
+with application logic and then retry the merge. Repeat this until it merges successfully or too many tries are reached.
+The latter should not really ever occur in production with our current levels of concurrency.
+
+Conflicts on commit are handled via test-and-set using an object version ID (for example, an ETag) on artifacts. If the
+precondition fails, we return a conflict to the calling service so it can resolve and retry. Indexes are derived by
+application logic and are not manually set, so they should not have logical conflicts on commit. The commit workflow
+will read the latest index state, apply adds/removes derived from the artifact changes, and write back the updated index
+object(s).
+
+Artifact conflicts (commit precondition failures or merge conflicts) are returned to the calling service to resolve and
+retry. This service treats artifact payloads as opaque and will not attempt to auto-resolve them. Only index conflicts
+are auto-resolved. In the future, we can add application-defined merge logic per artifact type.
 
 ## Indexes for looking up artifacts
 
@@ -65,28 +75,83 @@ be uniform. I would suggest a similar approach to what we use in ReactDB. Of not
 conflict, so merging will require doing a diff between the common base, current head we are merging into and the current
 head of what we are merging for each conflicting index. (See Conflicts above) In other words, we will need to read the
 changes and reconstruct what the edits are for each diverging branch and then apply all those edits. If the index is a
-unique index, we would obviously require that any final version contains zero or one item. Empty indexes should
-probably simply be encoded by the lack of an object.
+unique index, we would obviously require that any final version contains zero or one item. Empty indexes should simply
+not exist at HEAD (though history may include prior objects).
+
+Indexes are derived from artifacts by application logic and are never manually set. They only conflict on merge.
+Unique indexes enforce at most a single item across all commits and merges.
+
+### Index definition
+
+An index definition includes:
+1. key_type: the name of the value and the identifier passed to fetch index calls.
+2. key_prefix: a numeric prefix inside the indexes keyspace. This defaults to a stable hash of key_type.
+3. key: the fields that partition the index. Different key values on the same index type map to different index
+   objects.
+4. order fields: fields that determine the sort order. By default, order is ascending based on each field type's sort
+   order, but this can be overridden per field.
+5. where clauses: predicates that determine whether a value should be indexed. Supported ops include ==, >, <, >=, <=.
+   The LHS must be a field; the RHS can be a field or a constant.
+
+### Index merge semantics
+
+When a merge reports a conflicting index object, we perform a three-way merge using the merge base and both heads. Each
+index object is treated as a set of entries keyed by artifact ID with associated order field values. For each branch we
+compute adds (head minus base) and removes (base minus head). If the same artifact ID exists in both but with different
+order values, treat that as a remove and an add. We apply all removes to the base, then apply all adds, de-duplicate by
+artifact ID, and re-sort by the configured order fields (tie-breaker: artifact ID). This yields a deterministic result
+and is idempotent across retries. If a unique index ends up with more than one item, the merge fails and the conflict is
+returned to the calling service for resolution.
+
+### Index physical storage
+
+Index objects are stored under indexes/{key_prefix}/{encoded_keys}. The key_prefix is an unsigned numeric value (default:
+stable hash of key_type) encoded as base64 using the URL-safe alphabet of its big-endian uint64 bytes without padding.
+The encoded_keys is base64 using the URL-safe alphabet of the concatenated binary encodings for each key field.
+Variable-length fields (for example, strings) must include length prefixes in their binary encoding.
+
+### Index object representation
+
+Index objects must be encoded deterministically to make diffs and merges reliable. The value is a column-oriented binary
+format with one column per order field plus an artifact_id column. Rows are ordered by the order fields (tie-breaker:
+artifact_id). The encoding format can be configured per index. By default, each column is stored as an array of the raw
+binary values. In the future, we can support dictionary encoding or RLE per column to compress the arrays. Empty indexes
+simply do not exist at HEAD (though history may include prior objects).
+
+### Index sharding (planned)
+
+When indexes become large, shard them by bucket and store a small manifest object that lists all bucket objects for an
+index key. Bucket naming should be deterministic (for example, a fixed-width prefix of a hash) so that reads can page
+over buckets predictably. The manifest is the canonical entrypoint for reads.
 
 ### How we scope artifacts vs indexes vs types
 
 In order to support indexes, we need to ensure that they will never overlap with artifacts, but they must be in the same
 path structure where we store all objects. I suggest something simple like this: use artifacts/{artifact id} for the
-artifacts themselves and indexes/{index name}/{index key} for the indexes. We could also have types/{artifact type name}
+artifacts themselves and indexes/{key_prefix}/{encoded_keys} for the indexes. We could also have types/{artifact type name}
 be where we store the artifact type information. We could also store types/{artifact type name}/{version} when we wish
 to version these. I would strongly recommend against making any of these details transparent to end-users and would
-treat the actual paths of objects in cloud storage as a private implimentation detail.
+treat the actual paths of objects in cloud storage as a private implementation detail.
+
+Artifact paths are based on ID and do not include special characters. IDs are likely to be uint_64 and will be encoded
+when used in a path (for example, base64 encoding with the URL-safe alphabet of the big-endian binary representation
+without padding) to avoid special characters in the storage layer.
+
+Index paths are determined based on key_prefix and key values. The key_prefix is encoded as base64 using the URL-safe
+alphabet of its big-endian uint64 bytes without padding and used as the first path segment under indexes/. The
+encoded_keys is base64 using the URL-safe alphabet of the concatenated binary encodings of each key field
+(length-prefixed where needed).
 
 ## Artifact Type registry (with version and schema support)
 
 We likely want to represent the artifact types as tied to the current state of the repo. This is helpful because we can
 create migration transactions and detect when merging if something needs to be corrected before merging. For example, if
 we add an index, we can create a new branch with the index and have it populate that index for all the existing data. On
-merge, it will look at the branch and detect any changes since it was forked which woudl require adjustments to that
+merge, it will look at the branch and detect any changes since it was forked which would require adjustments to that
 index and only merge where everything lines up. We can use a similar process when removing an index. If we want to force
 all artifacts of a particular version of artifact schema to migrate, we can also create this migration transaction. That
 said, we do not need this to be available at launch. It is just the reason why we will want to represent the artifact
-schemas in LakeFs.
+schemas in LakeFS.
 
 For the actual storing of artifact type information, we could use protobuf for the schema itself. This would then encode
 what will actually be stored in the artifact's object. We can attach metadata in individual fields as needed to define
@@ -103,4 +168,3 @@ As far as specific fields needed in an artifact definition, I think we would nee
 4. Actions (add a MessageOption for defining a dictionary of actions to an artifact)
 5. Viewer (add a MessageOption for defining the default viewer endpoint)
 6. Custom Instruction (add a MessageOption for defining instructions for LLMs)
-
