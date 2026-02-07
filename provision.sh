@@ -34,7 +34,8 @@ gcloud services enable \
     servicenetworking.googleapis.com \
     secretmanager.googleapis.com \
     dataproc.googleapis.com \
-    iap.googleapis.com
+    iap.googleapis.com \
+    cloudscheduler.googleapis.com
 
 # 2. Create VPC and Subnet
 if ! gcloud compute networks describe "$VPC_NAME" --project="$PROJECT_ID" &>/dev/null; then
