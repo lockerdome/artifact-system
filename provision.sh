@@ -316,7 +316,12 @@ else
 #!/bin/bash
 set -e
 echo ">>> [BUILD] Starting installation..."
-apt-get update && apt-get install -y curl
+apt-get update
+apt-get install -y curl ca-certificates gnupg apt-transport-https
+curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" > /etc/apt/sources.list.d/google-cloud-sdk.list
+apt-get update
+apt-get install -y google-cloud-cli
 echo ">>> [BUILD] Downloading LakeFS v${LAKEFS_VERSION}..."
 curl -L --fail https://github.com/treeverse/lakefs/releases/download/v${LAKEFS_VERSION}/lakefs_${LAKEFS_VERSION}_Linux_x86_64.tar.gz -o lakefs.tar.gz
 tar -xzf lakefs.tar.gz
@@ -772,6 +777,8 @@ if [[ -z "$INSTANCE_ZONE" ]]; then
 fi
 
 echo ">>> Admin Access Key: $ACCESS_KEY_ID"
+echo ">>> Fetch secret access key with:"
+echo "    gcloud secrets versions access latest --secret=lakefs-secret-access-key --project=$PROJECT_ID"
 
 # 2. Create Example Repository (Idempotent)
 echo ">>> Ensuring 'example-repo' exists..."
