@@ -690,7 +690,7 @@ if ! gcloud compute forwarding-rules describe "${LB_PREFIX}-forwarding-rule" --r
     gcloud compute forwarding-rules create "${LB_PREFIX}-forwarding-rule" \
         --load-balancing-scheme=INTERNAL_MANAGED \
         --network="$VPC_NAME" \
-        --subnet="$SUBNET_NAME" \
+        --subnet="$PROXY_SUBNET_NAME" \
         --ports=80 \
         --target-http-proxy="${LB_PREFIX}-http-proxy" \
         --target-http-proxy-region="$REGION" \
@@ -729,6 +729,20 @@ gcloud storage buckets add-iam-policy-binding "gs://${BUCKET_NAME}" --member="se
 gcloud projects add-iam-policy-binding "$PROJECT_ID" --member="serviceAccount:${GC_SA_EMAIL}" --role="roles/dataproc.worker" --condition=None >/dev/null
 gcloud projects add-iam-policy-binding "$PROJECT_ID" --member="serviceAccount:${SCHEDULER_SA_EMAIL}" --role="roles/dataproc.editor" --condition=None >/dev/null
 gcloud iam service-accounts add-iam-policy-binding "$GC_SA_EMAIL" --member="serviceAccount:${SCHEDULER_SA_EMAIL}" --role="roles/iam.serviceAccountUser" >/dev/null
+
+echo ">>> Ensuring Dataproc service agent subnet access..."
+PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)")
+DATAPROC_SA="service-${PROJECT_NUMBER}@dataproc-accounts.iam.gserviceaccount.com"
+DATAPROC_SA_ALT="service-${PROJECT_NUMBER}@gcp-sa-dataproc.iam.gserviceaccount.com"
+
+for DP_SA in "$DATAPROC_SA" "$DATAPROC_SA_ALT"; do
+    if gcloud iam service-accounts describe "$DP_SA" --project="$PROJECT_ID" &>/dev/null; then
+        gcloud compute networks subnets add-iam-policy-binding "$SUBNET_NAME" \
+            --region="$REGION" \
+            --member="serviceAccount:${DP_SA}" \
+            --role="roles/compute.networkUser" >/dev/null
+    fi
+done
 
 # --- AUTOMATED SMOKE TEST & SETUP ---
 echo ">>> Starting Automated Setup & Verification..."
