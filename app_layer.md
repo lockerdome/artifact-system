@@ -1,5 +1,45 @@
 # Layered Artifact System
 
+## Launch Scope (MVP)
+
+### In scope
+1. Artifact CRUD with append-only writes; deletes are represented as tombstones by writing an empty payload at the same
+   artifact key, and history is retained.
+1. Artifact payloads are structured by registered protobuf schemas, with fields available for indexing; applications may
+   still include opaque sections (for example, raw bytes or text/JSON) inside protobuf envelopes they define.
+1. Test-and-set updates via storage version IDs; payload conflicts bubble to callers while index conflicts are
+   auto-resolved in the artifact layer.
+1. Deterministic index derivation and merges for unique and non-unique indexes; launch uses inline index storage and
+   preserves metadata for future sharded layouts.
+1. Type registry with runtime registration of proto3 schemas, descriptor sets as canonical runtime artifacts, and
+   retained custom options including LLM instruction/description annotations at message and field levels.
+1. Type version resolution via an optional current pointer; updates to current require an expected prior version (etag).
+1. Artifact server API hides branches and transaction mechanics; callers only see conflicts and resolved storage version
+   IDs.
+
+### Non-goals for launch
+
+#### Post-launch goals
+1. Partial-update APIs that avoid full rewrites; any modification writes a full new object and duplicates unchanged data.
+1. Index sharding and index migrations (backfills/reindexes).
+1. Caching layers, triggers, and virtual/computed fields.
+1. Application-defined payload merges (including CRDT-based merges) beyond index-derived merges.
+1. Schema validation for artifacts
+1. Supporting pulling of "part" of an artifact
+7. App layer permissions
+
+#### Not planned
+1. Cross-repo transactions (atomic commits spanning multiple LakeFS repos).
+1. Map field indexing (protobuf map<...> fields); map entries are unordered and ambiguous for index keys/values, so model
+   indexable map-like data as repeated entry messages.
+
+### Dependencies and constraints
+1. LakeFS provides the storage transaction and conflict model; transactions are limited to a single repo.
+1. Append-only history is preserved even when tombstones are written.
+1. Deterministic encoding is required for index objects to ensure reliable diffs and merges.
+1. ID allocation is handled by a separate service.
+1. Index metadata must preserve an upgrade path to future sharded layouts.
+
 ## Layer overview
 1. Storage Layer: durable object storage with versioned commits, branches, merges, and conflict detection. LakeFS is the
    current implementation, but we could use any system with similar semantics (for example, Dolt). No domain rules.
@@ -59,14 +99,6 @@ specific logic and permissions live in the App Layer.
 1. Integration with LakeFS
 1. Indexes for looking up artifacts (and ability to resolve conflicts)
 1. Artifact Type registry (with version and schema support)
-
-### Additional features which should be planned for
-
-1. Caching objects in redis
-1. Sharding of indexes for when they get extremely large (think "get me all artifacts of type X")
-1. Migrating indexes (adding or removing indexes)
-1. Schema validation for artifacts
-1. Supporting pulling of "part" of an artifact
 
 ### Indexes for looking up artifacts
 
@@ -385,7 +417,7 @@ Index and predicate evaluation use protobuf field semantics:
 3. Message-typed fields always have presence; they can be indexed only if a specific scalar sub-field is referenced.
 4. Repeated scalar fields generate one index entry per value; repeated message fields require a scalar sub-field to be
    referenced.
-5. Map fields are not indexable for launch.
+5. Map fields are not indexable for launch; model indexable map-like data as repeated entry messages.
 
 #### Type identity and versioning
 
@@ -411,8 +443,3 @@ imports and extensions so it can be loaded deterministically by the artifact lay
 ## App Layer
 
 The app layer applies domain-specific rules and permissioning on top of the artifact layer.
-
-### Additional features which should be planned for
-
-1. Some form of validation of permissions
-1. Triggers
