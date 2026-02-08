@@ -3,17 +3,16 @@
 ## Launch Scope (MVP)
 
 ### In scope
-1. Artifact CRUD with append-only writes; deletes are represented as tombstones by writing an empty payload at the same
-   artifact key, and history is retained.
+1. Artifact CRUD with append-only writes and tombstone-based deletes (see Delete semantics and retention).
 1. Artifact payloads are structured by registered protobuf schemas, with fields available for indexing; applications may
    still include opaque sections (for example, raw bytes or text/JSON) inside protobuf envelopes they define.
-1. Test-and-set updates via storage version IDs; payload conflicts bubble to callers while index conflicts are
-   auto-resolved in the artifact layer.
+1. Test-and-set updates via storage version IDs (see Artifact contract); conflict ownership is defined in the Conflict
+   retry policy.
 1. Deterministic index derivation and merges for unique and non-unique indexes; launch uses inline index storage and
    preserves metadata for future sharded layouts.
 1. Type registry with runtime registration of proto3 schemas, descriptor sets as canonical runtime artifacts, and
    retained custom options including LLM instruction/description annotations at message and field levels.
-1. Type version resolution via an optional current pointer; updates to current require an expected prior version (etag).
+1. Type version resolution via an optional current pointer (see Type identity and versioning).
 1. Artifact server API hides branches and transaction mechanics; callers only see conflicts and resolved storage version
    IDs.
 
@@ -58,37 +57,29 @@ encode artifact schemas or domain logic.
 
 ### Integration with LakeFS
 
-LakeFS can be set up with the provision.sh script. This will create a MIG, Postgres database, Load Balancer, Image,
-Instance Template, Health Check, Spark vacuum Service, VPC, and a few other odds and ends which enable a highly
-available LakeFS cluster. Note that the script uses two zones with the MIG to ensure high availability and utilizes
-the HA version of Postgres. The costs are low enough that this seems like a worthwhile choice. The script will also
-create a bucket in Cloud Storage called lakefs-data-{project-id}. You will probably want to set the PROJECT_ID before
-running the provisioning script and check that the IP ranges will work with our broader system.
+LakeFS is provisioned via the `provision.sh` script, which creates a MIG, Postgres database (HA), Load Balancer, Image,
+Instance Template, Health Check, Spark vacuum service, VPC, and related resources for a highly available cluster. The
+script uses two zones with the MIG for high availability. It also creates a Cloud Storage bucket named
+`lakefs-data-{project-id}`. Set `PROJECT_ID` before running the script and verify that the IP ranges are compatible with
+the broader network.
 
-The secret needed to login with the admin account is saved in the secret manager as lakefs-secret-access-key and
-the access key id is static and available (or changeable) by updating the ACCESS_KEY_ID value in the provision script.
-With these, you will be able to login to the LakeFS admin portal, but, due to how locked down everything is, you will
-need to tunnel using IAP and SSH then use that connection to locally bind a port which gets forwarded along to one of
-the instances for communicating with the http server. Assuming that the provision script runs successfully, it will
-provide instructions at the end.
+The admin account secret is stored in Secret Manager as `lakefs-secret-access-key`; the access key ID is configured via
+the `ACCESS_KEY_ID` value in the provision script. Access to the LakeFS admin portal requires an IAP/SSH tunnel with
+local port forwarding to one of the instances. The provision script prints connection instructions on success.
 
-I would suggest that we create a repo in LakeFS for the artifacts. It is important to note that if we need to have
-transactions across more than artifacts, all those will need to be in the same repo of LakeFS. It does not support
-cross-repo transactions. Additionally, it is important to note that the Spark cleanup process will remove commits which
-are not recent and not directly pinned by a tag or referenced as the head of a branch. We could choose to change this
-behavior, but, the default they recommend will "vacuum" anything older than the time window and which is not referenced.
+A single LakeFS repo is used for all artifacts. All objects that participate in the same transactions must be in the same
+repo (see Dependencies and constraints). The Spark vacuum process removes commits that are not recent and not pinned by a
+tag or referenced as a branch head. This is the default recommended behavior; to preserve older commits, pin them with
+tags or adjust the retention window.
 
 ### Conflict model
 
-LakeFS is designed to be general purpose and, as such, it does not assume that it knows how to merge when objects
-diverge in two branches. This is unlikely to cause a surprise when updating an artifact, however, because we will be
-using objects to store the state of indexes, those will be very likely to have conflicts. There are two tools available
-here: first, we can use pre-merge hooks; I don't recommend those for conflict resolution and, given that we are adding
-our own layer on top of LakeFS, I suspect that this feature will be unhelpful for us. The second tool, and the one I
-recommend, is to handle the conflict after trying to merge. To do this, simply create logic that when a transaction
-attempts to merge, if the LakeFS server returns with a Conflict, read through the conflicts, resolve index conflicts
-with artifact layer logic and then retry the merge. Repeat this until it merges successfully or the retry limit is
-reached. The retry policy is defined below.
+LakeFS does not perform content-aware merges; when objects diverge on two branches, it reports a conflict. Artifact
+payload conflicts are rare, but index objects — which are updated on every artifact write — conflict frequently under
+concurrent writes. Pre-merge hooks are not used for conflict resolution; instead, the artifact layer handles conflicts
+post-merge. When a merge attempt returns a conflict, the artifact layer reads the conflicting objects, resolves index
+conflicts using deterministic merge logic, and retries the merge. This repeats until the merge succeeds or the retry
+limit is reached. The retry policy is defined below.
 
 #### Conflict retry policy (MVP)
 
@@ -108,7 +99,7 @@ reached. The retry policy is defined below.
 
 **Idempotency requirements**
 1. Index merge logic must be deterministic and idempotent given the same (base, ours, theirs) inputs.
-1. Artifact writes use test-and-set semantics via storage version IDs to prevent lost updates across retries.
+1. Artifact writes use test-and-set semantics (see Artifact contract) to prevent lost updates across retries.
 
 **Conflict response payload**
 When retries are aborted or exhausted, return a structured conflict response containing:
@@ -124,10 +115,9 @@ When retries are aborted or exhausted, return a structured conflict response con
 
 ## Artifact Layer
 
-This layer builds on the Storage Layer and provides shared artifact functionality above storage. Specifically, the
-artifact layer must support artifact schemas (and types), ID allocation, indexes, groups, resolving merge conflicts for
-indexes, providing metadata for an artifact type, caching in redis, and other shared functionality. Application-
-specific logic and permissions live in the App Layer.
+This layer builds on the Storage Layer and provides shared artifact functionality: artifact schemas and types, ID
+allocation, indexes, index conflict resolution, and type metadata. Application-specific logic and permissions live in the
+App Layer.
 
 ### Necessary features for launch
 
@@ -137,19 +127,15 @@ specific logic and permissions live in the App Layer.
 
 ### Indexes for looking up artifacts
 
-We have discussed having tags or groups which are both essentially higher level abstractions around the idea of an
-index. While what we index on will likely be at least partially driven by the particular artifact type, the underlying
-way we store the artifacts (or singular artifact when an index is unique) which are present in each index will likely
-be uniform. I would suggest a similar approach to what we use in ReactDB. Of note, however, any changes to an index will
-conflict, so merging will require doing a diff between the common base, current head we are merging into and the current
-head of what we are merging for each conflicting index. (See Conflict model above) In other words, we will need to read the
-changes and reconstruct what the edits are for each diverging branch and then apply all those edits. If the index is a
-unique index, we would obviously require that any final version contains zero or one item. Empty indexes are tombstoned
-at HEAD (written as empty payloads) so that merges can detect the deletion; history may include prior objects.
+Concepts such as tags and groups are higher-level abstractions built on indexes. The specific fields indexed depend on the
+artifact type, but the underlying index storage format is uniform. Index objects are subject to merge conflicts because
+any concurrent artifact write can update the same index object. Conflict resolution uses a three-way diff between the
+merge base and both heads (see Conflict model). Empty indexes are tombstoned so that merges can detect the deletion (see
+Delete semantics and retention).
 
 Indexes are derived from artifacts by artifact layer logic and are never manually set. They only conflict on merge.
 The commit workflow reads the latest index state, applies adds/removes derived from the artifact changes, and writes
-back the updated index object(s). Unique indexes enforce at most a single item across all commits and merges.
+back the updated index object(s).
 
 #### Index definition
 
@@ -181,8 +167,8 @@ index object is treated as a set of entries keyed by artifact ID with associated
 compute adds (head minus base) and removes (base minus head). If the same artifact ID exists in both but with different
 order values, treat that as a remove and an add. We apply all removes to the base, then apply all adds, de-duplicate by
 artifact ID, and re-sort by the configured order fields (tie-breaker: artifact ID). This yields a deterministic result
-and is idempotent across retries. If a unique index ends up with more than one item, the merge fails and the conflict is
-returned to the calling service for resolution.
+and is idempotent across retries. If a unique index (see Index definition) ends up with more than one item, the merge
+fails and the conflict is returned to the calling service for resolution.
 
 #### Index physical storage
 
@@ -227,8 +213,8 @@ Index objects must be encoded deterministically to make diffs and merges reliabl
 format with one column per order field. Rows are ordered by the order fields, which must
 include artifact_id as the final field. The encoding format can be configured per index. By default, each column is
 stored as an array of the raw binary values. In the future, we can support dictionary encoding or RLE per column to
-compress the arrays. Empty indexes are tombstoned at HEAD (written as empty payloads, analogous to artifact tombstones)
-so that merges can detect the deletion. History may include prior non-empty objects.
+compress the arrays. Empty indexes are tombstoned so that merges can detect the deletion (see Delete semantics and
+retention).
 
 #### Index fetch behavior (MVP)
 
@@ -262,7 +248,7 @@ index-specific protobuf schema.
 The response may also include the index object’s storage version ID for debugging or consistency checks.
 
 **Uniqueness**
-1. For unique indexes, the response contains zero or one entry.
+1. Unique index responses contain zero or one entry (see Index definition for the uniqueness invariant).
 
 #### Index sharding (planned)
 
@@ -272,29 +258,18 @@ over buckets predictably. The manifest is the canonical entrypoint for reads.
 
 ### Object namespaces and paths
 
-In order to support indexes, we need to ensure that they will never overlap with artifacts, but they must be in the same
-path structure where we store all objects. I suggest something simple like this: use artifacts/{artifact id} for the
-artifacts themselves and indexes/{key_prefix}/{encoded_keys} for the indexes (key_prefix is the IndexDefinition artifact
-ID). We could also have types/{artifact type name} be where we store the artifact type information. We could also store
-types/{artifact type name}/{version} when we wish to version these. I would strongly recommend against making any of these
-details transparent to end-users and would treat the actual paths of objects in cloud storage as a private implementation
-detail.
+Object paths are a private implementation detail and must not be exposed to end-users. The top-level namespaces are:
 
-Artifact paths are based on ID and do not include special characters. IDs are likely to be uint_64 and will be encoded
-when used in a path (for example, base64 encoding with the URL-safe alphabet of the big-endian binary representation
-without padding) to avoid special characters in the storage layer.
-
-Index paths are determined based on key_prefix and key values. The key_prefix is the uint64 IndexDefinition artifact ID encoded as base64 using the URL-safe
-alphabet of its big-endian uint64 bytes without padding and used as the first path segment under indexes/. The
-encoded_keys is base64 using the URL-safe alphabet of the concatenated binary encodings of each key field
-(length-prefixed where needed).
+1. `artifacts/{artifact_id}` — artifact payloads. The artifact_id is a uint64 encoded as base64 using the URL-safe
+   alphabet of its big-endian bytes without padding.
+2. `indexes/{key_prefix}/{encoded_keys}` — index objects. Path encoding is defined in Index physical storage.
+3. `types/{type_name}/{version}` — type definitions. The `current` pointer, if used, is at `types/{type_name}/current`.
 
 ### Artifacts
 
-Artifacts are stored as opaque payloads defined by Types; the artifact layer does not auto-resolve payload conflicts.
-Writes use test-and-set via an object version ID (for example, an ETag). If the precondition fails or a merge conflict
-occurs, we return a conflict to the calling service so it can resolve and retry. Only index conflicts are auto-resolved.
-In the future, we can add application-defined merge logic per artifact type.
+Artifacts are stored as opaque payloads defined by Types. Writes use test-and-set via storage version IDs; conflict
+ownership (payload vs. index) is defined in the Conflict retry policy. In the future, we can add application-defined
+merge logic per artifact type.
 
 #### Artifact contract (minimum)
 
@@ -338,8 +313,8 @@ The Artifact Layer presents a single canonical branch to callers; branch and tra
 1. Each Create/Update/Delete runs as an internal transaction and is merged before the call returns success.
 1. Read-after-write: once a write call succeeds, subsequent reads of that artifact key return the committed version and its storage version ID.
 1. Consistency is per artifact key plus its derived index updates; there are no multi-key or cross-artifact atomic transactions in the MVP.
-1. Concurrent writes may diverge internally; artifact payload conflicts are returned to callers, while index conflicts are auto-resolved during merge.
-1. Unique indexes are enforced at merge time: two branches may temporarily violate uniqueness, but only one merge succeeds; the loser receives a conflict.
+1. Concurrent writes may diverge internally; conflict ownership is defined in the Conflict retry policy.
+1. Unique index enforcement is described in Index definition and Index merge semantics.
 
 #### Artifact envelope (optional)
 
@@ -371,30 +346,20 @@ we store standalone definition objects as artifacts (for example, for migrations
 definition type (ArtifactDefinition, IndexDefinition, etc.). TypeDefinition is a built-in meta-type used to describe
 these definition types; it is bootstrapped in the artifact layer and treated as immutable.
 
-We likely want to represent the artifact types as tied to the current state of the repo. This is helpful because we can
-create migration transactions and detect when merging if something needs to be corrected before merging. For example, if
-we add an index, we can create a new branch with the index and have it populate that index for all the existing data. On
-merge, it will look at the branch and detect any changes since it was forked which would require adjustments to that
-index and only merge where everything lines up. We can use a similar process when removing an index. If we want to force
-all artifacts of a particular version of artifact schema to migrate, we can also create this migration transaction. That
-said, we do not need this to be available at launch. It is just the reason why we will want to represent the artifact
-schemas in LakeFS.
+Artifact types are stored in LakeFS so they are tied to the repo state. This enables migration transactions
+(post-launch): a new branch can add an index, backfill it for existing data, and merge only when the index is consistent
+with all changes since the fork point. The same mechanism supports index removal and schema migrations.
 
-For the actual storing of artifact type information, we could use protobuf for the schema itself. This would then encode
-what will actually be stored in the artifact's object. We can attach metadata in individual fields as needed to define
-things like "index this field". We can also use `extend google.protobuf.MessageOptions` to add functionality into the
-specific type information. I'd suggest we make the contents of the objects stored in types/{artifact type name} a valid
-protobuf definition. We'll have to decide how we load this, though, because we may want to automatically import the
-extensions to message metadata and other basic types. We can store fields like viewer endpoints and actions as metadata
-which is defined in our extensions to message options such that each artifact type is able to specify those.
+Type definitions are stored as protobuf files at `types/{type_name}`. Metadata such as index definitions, viewer
+endpoints, and LLM instructions are attached via `extend google.protobuf.MessageOptions`. The registry automatically
+imports option extensions when loading a type definition. See Protocol buffers as the type definition for details.
 
-As far as specific fields needed in an artifact definition, I think we would need the following:
-1. Schema (taken care of by protobuf)
-2. Indexes (add a MessageOption which allows creation of one or more indexes; a FieldOption can be added later as
-   syntactic sugar for single-field indexes)
-3. Actions (add a MessageOption for defining a dictionary of actions to an artifact)
-4. Viewer (add a MessageOption for defining the default viewer endpoint)
-5. Custom Instruction (add a MessageOption for defining instructions for LLMs)
+An artifact definition includes the following metadata:
+1. Schema: defined by the protobuf message itself.
+2. Indexes: a repeated MessageOption listing index definitions; a FieldOption for single-field indexes may be added later.
+3. Actions: a MessageOption defining a dictionary of actions available on artifacts of this type.
+4. Viewer: a MessageOption defining the default viewer endpoint.
+5. Custom Instruction: a MessageOption defining LLM instructions for the type.
 
 #### Protocol buffers as the type definition
 
@@ -582,20 +547,16 @@ Operations (conceptual names; transport is TBD):
 
 Request/response expectations:
 1. artifact_id is allocated by the artifact layer via a separate ID service and returned in Create responses.
-1. type_version is optional for Create/Update; if omitted, resolve to the current pointer and return the resolved
-   version in responses.
-1. Update/Delete require expected storage version ID (test-and-set); mismatches return a conflict.
+1. type_version is optional for Create/Update; resolution behavior is defined in Type identity and versioning.
+1. Update/Delete require expected storage version ID (test-and-set per Artifact contract); mismatches return a conflict.
 1. Reads return payload bytes plus type_name/type_version and storage version ID.
 1. BatchGetArtifacts returns results in the same order as the input IDs. Missing or tombstoned artifacts are represented
    as absent entries (not errors) so callers can correlate by position.
 1. Create/Update/Delete return the resolved type_version (when applicable) and the new storage version ID.
-1. Deletes write tombstones (empty payloads). Get treats tombstones as not found.
+1. Delete and tombstone behavior is defined in Delete semantics and retention.
 
-Conflict/error behavior:
-1. Payload conflicts (expected version mismatch or artifact merge conflicts) return the Conflict response payload with
-   conflict_type=PAYLOAD_CONFLICT.
-1. Unique index conflicts or exhausted index merge retries return conflict_type=INDEX_CONFLICT.
-1. Index conflicts are auto-resolved only when eligible per the Conflict retry policy (MVP).
+Conflict/error behavior: conflict types, response payloads, and auto-resolution eligibility are defined in the Conflict
+retry policy (MVP). The conflict response uses conflict_type values INDEX_CONFLICT and PAYLOAD_CONFLICT.
 
 #### Index fetch API
 
