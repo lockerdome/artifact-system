@@ -83,9 +83,41 @@ using objects to store the state of indexes, those will be very likely to have c
 here: first, we can use pre-merge hooks; I don't recommend those for conflict resolution and, given that we are adding
 our own layer on top of LakeFS, I suspect that this feature will be unhelpful for us. The second tool, and the one I
 recommend, is to handle the conflict after trying to merge. To do this, simply create logic that when a transaction
-attempts to merge, if the LakeFS server returns with a Conflict, read through the conflicts, resolve index conflicts
-with artifact layer logic and then retry the merge. Repeat this until it merges successfully or too many tries are
-reached. The latter should not really ever occur in production with our current levels of concurrency.
+ attempts to merge, if the LakeFS server returns with a Conflict, read through the conflicts, resolve index conflicts
+ with artifact layer logic and then retry the merge. Repeat this until it merges successfully or the retry limit is
+ reached. The retry policy is defined below.
+
+#### Conflict retry policy (MVP)
+
+**Ownership**
+1. Artifact layer (server) retries merges only for **non-unique index** object conflicts that are resolvable by deterministic index merge logic.
+1. Unique index conflicts (including cases where a unique index would contain more than one item) are returned to the caller.
+1. Artifact payload conflicts are never auto-resolved; they are returned to the caller (app layer/client) immediately.
+
+**Eligibility**
+1. Retry only when all reported conflicts are **non-unique index** objects.
+1. If any payload/object conflict outside indexes is present, or any unique index conflict is detected, abort retries and return a conflict response.
+
+**Attempts and backoff**
+1. Maximum attempts: 5 total merge attempts (initial attempt + up to 4 retries).
+1. Backoff: exponential with jitter, starting at 100ms and capped at 2s (for example: 100ms, 200ms, 400ms, 800ms, 1600–2000ms).
+1. Backoff applies between retries only; successful merges return immediately.
+
+**Idempotency requirements**
+1. Index merge logic must be deterministic and idempotent given the same (base, ours, theirs) inputs.
+1. Artifact writes use test-and-set semantics via storage version IDs to prevent lost updates across retries.
+
+**Conflict response payload**
+When retries are aborted or exhausted, return a structured conflict response containing:
+1. conflict_type: one of {INDEX_CONFLICT, PAYLOAD_CONFLICT}.
+1. retryable: boolean indicating whether the server would retry (false when exhausted or payload conflict).
+1. attempts: number of attempts performed.
+1. artifacts/indexes involved: artifact_id for payload conflicts; index key (key_type + encoded key) for index conflicts.
+1. version_ids: base, ours, theirs storage version IDs when available.
+
+**Exhaustion behavior**
+1. If the retry limit is reached while resolving index conflicts, return the conflict response with retryable=false.
+1. Callers may re-read state, resolve conflicts at the application level, and retry the operation with updated expected version IDs.
 
 ## Artifact Layer
 
@@ -159,6 +191,40 @@ include artifact_id as the final field. The encoding format can be configured pe
 stored as an array of the raw binary values. In the future, we can support dictionary encoding or RLE per column to
 compress the arrays. Empty indexes simply do not exist at HEAD (though history may include prior objects).
 
+#### Index fetch behavior (MVP)
+
+The index fetch API (FetchIndex) provides a raw fetch of the materialized index results for a specific index key. There is no
+pagination, cursoring, filtering, or query-time predicate evaluation in the MVP.
+
+**Inputs**
+1. key_type: identifies which index definition to query.
+1. key values: the complete set of key fields defined by the index, provided as typed values. All key fields are
+   required; partial keys are rejected.
+
+**Execution semantics**
+1. The artifact layer locates the index object for (key_type, encoded key values) and reads its current state.
+1. Results are returned in the deterministic order defined by the index’s order fields. Ordering stability is defined
+   by the index definition and does not vary per query.
+1. No query-time filters are applied. The query returns exactly the contents of the index object.
+
+**Where clauses vs fetch-time behavior**
+1. where clauses are evaluated only at index build/update time against artifact payloads.
+1. Fetch execution never re-evaluates where clauses or artifact payloads; it operates solely on the stored index state.
+
+**Response shape**
+The response payload is the concrete, generated index message for the queried index (for example,
+`Index_DataFrameArtifact_by_repo_created_by`). The server returns the index object as stored, using the
+index-specific protobuf schema.
+
+1. The key message corresponds to the index key fields.
+1. The value message contains the ordered columns defined by the index (ending with artifact_id).
+1. Artifact payloads are embedded or referenced according to the index value schema defined for that index.
+
+The response may also include the index object’s storage version ID for debugging or consistency checks.
+
+**Uniqueness**
+1. For unique indexes, the response contains zero or one entry.
+
 #### Index sharding (planned)
 
 When indexes become large, shard them by bucket and store a small manifest object that lists all bucket objects for an
@@ -208,6 +274,31 @@ version ID. Partial updates are out of scope for launch.
 
 The artifact layer stores payload bytes as provided and does not reserialize them. This preserves unknown fields and
 avoids any reliance on canonical protobuf binary encodings. Text/JSON formats are not used for storage.
+
+#### Delete semantics and retention
+
+Deletes are logical tombstones. A delete writes a new version at the same artifact key with an empty payload, advances
+the storage version ID, and returns that version to the caller.
+
+1. Empty payloads are reserved for tombstones. The artifact layer rejects zero-length payloads for live artifacts; if a
+   type needs to represent an "empty" value, include a sentinel field or wrap it in an envelope message.
+1. Index handling: deleting an artifact removes all derived index entries for that artifact ID (as if the artifact no
+   longer matches any where clauses). Unique indexes free the slot. If an index becomes empty, the index object is removed
+   at HEAD per the standard rule.
+1. Reads treat tombstones as not found for standard Get. There is no public restore or audit API in the MVP; to
+   "undelete" a caller writes a new payload with the tombstone's expected version ID, creating a new version in history.
+1. Retention: history is preserved as LakeFS commits but is subject to LakeFS GC/vacuum. To guarantee audit/restore
+windows, pin commits/tags or configure retention accordingly. Hard delete/purge is out of scope for launch.
+
+#### Consistency and transaction semantics
+
+The Artifact Layer presents a single canonical branch to callers; branch and transaction mechanics are internal.
+
+1. Each Create/Update/Delete runs as an internal transaction and is merged before the call returns success.
+1. Read-after-write: once a write call succeeds, subsequent reads of that artifact key return the committed version and its storage version ID.
+1. Consistency is per artifact key plus its derived index updates; there are no multi-key or cross-artifact atomic transactions in the MVP.
+1. Concurrent writes may diverge internally; artifact payload conflicts are returned to callers, while index conflicts are auto-resolved during merge.
+1. Unique indexes are enforced at merge time: two branches may temporarily violate uniqueness, but only one merge succeeds; the loser receives a conflict.
 
 #### Artifact envelope (optional)
 
@@ -427,18 +518,62 @@ pointer object may be stored at types/{type_name}/current to identify the defaul
 type_version, the artifact layer resolves to the current pointer at request time and returns the resolved version in the
 response for reproducibility.
 
-#### Type registry API surface (minimum)
+### Launch API surface (minimum)
 
-The registry must support registering and resolving type versions:
+The Artifact Layer exposes a minimal API surface for launch and uses gRPC for service-to-service communication. The
+server hides branches and transaction mechanics; callers only see resolved storage version IDs and structured
+conflict responses. Client-to-app-layer transport remains application-specific and will be decided per application.
+
+#### Artifact CRUD API
+
+Operations (conceptual names; transport is TBD):
+1. CreateArtifact(type_name, type_version?, payload)
+2. GetArtifact(artifact_id)
+3. UpdateArtifact(artifact_id, expected_version_id, type_name, type_version?, payload)
+4. DeleteArtifact(artifact_id, expected_version_id)
+
+Request/response expectations:
+1. artifact_id is allocated by the artifact layer via a separate ID service and returned in Create responses.
+1. type_version is optional for Create/Update; if omitted, resolve to the current pointer and return the resolved
+   version in responses.
+1. Update/Delete require expected storage version ID (test-and-set); mismatches return a conflict.
+1. Reads return payload bytes plus type_name/type_version and storage version ID.
+1. Create/Update/Delete return the resolved type_version (when applicable) and the new storage version ID.
+1. Deletes write tombstones (empty payloads). Get treats tombstones as not found.
+
+Conflict/error behavior:
+1. Payload conflicts (expected version mismatch or artifact merge conflicts) return the Conflict response payload with
+   conflict_type=PAYLOAD_CONFLICT.
+1. Unique index conflicts or exhausted index merge retries return conflict_type=INDEX_CONFLICT.
+1. Index conflicts are auto-resolved only when eligible per the Conflict retry policy (MVP).
+
+#### Index fetch API
+
+Operation:
+1. FetchIndex(key_type, key)
+
+Inputs:
+1. key_type identifies the index definition.
+1. key must include the complete set of key fields; partial keys are rejected.
+
+Response:
+1. Returns the index object stored for (key_type, encoded key values) in deterministic order.
+1. Response shape and field semantics are defined in Index fetch behavior (MVP), including the generated index message
+   and optional storage version ID.
+
+#### Type registry API
+
+The registry supports registering and resolving type versions:
 1. RegisterTypeVersion(type_name, version, schema, metadata)
-2. GetTypeVersion(type_name, version)
-3. ListTypeVersions(type_name)
-4. SetCurrentTypeVersion(type_name, version) (optional)
-5. ResolveTypeVersion(type_name) -> version (current)
+1. GetTypeVersion(type_name, version)
+1. ListTypeVersions(type_name)
+1. SetCurrentTypeVersion(type_name, version, expected_version_id) (optional)
+1. ResolveTypeVersion(type_name) -> version (current)
 
 RegisterTypeVersion performs protobuf schema validation and validates metadata (for example, index definitions reference
 existing fields and supported types). The registry stores the protobuf schema (source or descriptor) plus any required
-imports and extensions so it can be loaded deterministically by the artifact layer.
+imports and extensions so it can be loaded deterministically by the artifact layer. SetCurrentTypeVersion requires an
+expected prior version (etag) to prevent lost updates.
 
 ## App Layer
 
