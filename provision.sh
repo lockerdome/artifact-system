@@ -188,24 +188,25 @@ echo ">>> Waiting 20s for Service Account propagation..."
 sleep 20
 
 # 3. Handle Signer Key
-echo ">>> Updating Signer Key (Rotating)..."
-# We allow this to run every time to ensure we have a valid key in the secret
-gcloud iam service-accounts keys create lakefs-signer.json \
-    --iam-account="$SA_SIGNER_EMAIL" \
-    --project="$PROJECT_ID"
-
 if ! gcloud secrets describe lakefs-signer-key --project="$PROJECT_ID" &>/dev/null; then
+    echo ">>> Creating Signer Key..."
+    gcloud iam service-accounts keys create lakefs-signer.json \
+        --iam-account="$SA_SIGNER_EMAIL" \
+        --project="$PROJECT_ID"
+
     echo ">>> Creating Secret: lakefs-signer-key..."
     gcloud secrets create lakefs-signer-key \
         --replication-policy="automatic" \
         --project="$PROJECT_ID"
-fi
 
-echo ">>> Uploading new key version..."
-gcloud secrets versions add lakefs-signer-key \
-    --data-file="lakefs-signer.json" \
-    --project="$PROJECT_ID"
-rm lakefs-signer.json
+    echo ">>> Uploading key version..."
+    gcloud secrets versions add lakefs-signer-key \
+        --data-file="lakefs-signer.json" \
+        --project="$PROJECT_ID"
+    rm lakefs-signer.json
+else
+    echo ">>> Secret lakefs-signer-key already exists. Reusing existing key."
+fi
 
 # 4. Handle DB Password
 # We check if password secret exists. If it does, we assume it's set to avoid resetting DB password causing downtime.
