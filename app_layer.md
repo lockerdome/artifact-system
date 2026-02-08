@@ -94,10 +94,10 @@ An index definition includes:
 2. key_prefix: a numeric prefix inside the indexes keyspace. This defaults to a stable hash of key_type.
 3. key: the fields that partition the index. Different key values on the same index type map to different index
    objects.
-4. order fields: fields that determine the sort order. By default, order is ascending based on each field type's sort
-   order, but this can be overridden per field. The special field name artifact_id refers to the artifact ID (not a
-   payload field) and must be included as the final order field to guarantee uniqueness. This is a simplification of a
-   general unique constraint on index rows.
+4. order fields: fields that determine the sort order. Each order field must declare a direction (ASC or DESC) based on
+   the field type's sort order. The special field name artifact_id refers to the artifact ID (not a payload field) and
+   must be included as the final order field to guarantee uniqueness. This is a simplification of a general unique
+   constraint on index rows.
 5. where clauses: predicates that determine whether a value should be indexed. Supported ops include ==, >, <, >=, <=.
    The LHS must be a field; the RHS can be a field or a constant.
 6. unique: whether the index enforces at most one artifact ID per index key.
@@ -177,6 +177,22 @@ version ID. Partial updates are out of scope for launch.
 The artifact layer stores payload bytes as provided and does not reserialize them. This preserves unknown fields and
 avoids any reliance on canonical protobuf binary encodings. Text/JSON formats are not used for storage.
 
+#### Artifact envelope (optional)
+
+If a composite artifact message is needed for APIs, we can assemble it without duplicating stored data. The stored
+payload is the type-specific protobuf message; the artifact_id and type metadata live outside the payload. A caller can
+request a typed envelope such as:
+
+```proto
+message DataFrameArtifactRecord {
+  uint64 id = 1;
+  DataFrameArtifact value = 2;
+}
+```
+
+The service can construct this record from the stored payload bytes and the path-derived artifact_id/type metadata. If a
+type schema includes an id field, it must match the artifact_id.
+
 ### Types (artifact type registry)
 
 #### Type taxonomy and bootstrapping
@@ -245,6 +261,10 @@ loads the descriptor set with the option extensions so the artifact layer can re
 The type-level option indexes is a repeated list of IndexDefinition objects. Each `option (indexes) = { ... }` entry
 defines one index for the enclosing message type.
 
+OrderDefinition.direction is required; the registry rejects index definitions with ORDER_BY_UNSPECIFIED.
+
+WhereClause.op is required; the registry rejects where clauses with OP_UNSPECIFIED.
+
 ```proto
 syntax = "proto3";
 
@@ -302,8 +322,8 @@ extend google.protobuf.MessageOptions {
 }
 
 message DataFrameArtifact {
-  option (indexes) = { key_type: "by_owner" key: ["created_by"] order: { field: "artifact_id" } };
-  option (indexes) = { key_type: "by_repo_created_by" key: ["repo_id", "created_by"] order: { field: "artifact_id" } };
+  option (indexes) = { key_type: "by_owner" key: ["created_by"] order: { field: "artifact_id" direction: ASCENDING } };
+  option (indexes) = { key_type: "by_repo_created_by" key: ["repo_id", "created_by"] order: { field: "artifact_id" direction: ASCENDING } };
 
   uint64 created_by = 1;
   uint64 repo_id = 2;
@@ -315,22 +335,42 @@ message DataFrameArtifact {
 
 Index payloads are stored as proto3 messages that wrap the columnar binary values. Columns are stored as raw bytes to
 enable typed-array handling in JavaScript and efficient scans in backend languages. Index keys are encoded in the object
-path and are not stored in the payload; if we store them for debugging, they must match the path-derived key.
+path and are not stored in the payload; when a composite object is needed, the service can reconstruct the key from the
+path and assemble a key/value envelope without rewriting the stored payload.
 
 For the DataFrameArtifact example, the by_owner index uses key = created_by and the by_repo_created_by index uses
-key = (repo_id, created_by). The generated payload messages for those indexes are:
+key = (repo_id, created_by). The generated schemas for those indexes are:
 
 ```proto
 syntax = "proto3";
 
-message Index_by_owner {
+message IndexValue_DataFrameArtifact_by_owner {
   uint32 row_count = 1;
   bytes artifact_id = 2;
 }
 
-message Index_by_repo_created_by {
+message IndexKey_DataFrameArtifact_by_owner {
+  uint64 created_by = 1;
+}
+
+message Index_DataFrameArtifact_by_owner {
+  IndexKey_DataFrameArtifact_by_owner key = 1;
+  IndexValue_DataFrameArtifact_by_owner value = 2;
+}
+
+message IndexValue_DataFrameArtifact_by_repo_created_by {
   uint32 row_count = 1;
   bytes artifact_id = 2;
+}
+
+message IndexKey_DataFrameArtifact_by_repo_created_by {
+  uint64 repo_id = 1;
+  uint64 created_by = 2;
+}
+
+message Index_DataFrameArtifact_by_repo_created_by {
+  IndexKey_DataFrameArtifact_by_repo_created_by key = 1;
+  IndexValue_DataFrameArtifact_by_repo_created_by value = 2;
 }
 ```
 
