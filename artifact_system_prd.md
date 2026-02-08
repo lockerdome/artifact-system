@@ -127,8 +127,9 @@ App Layer.
 
 ### Indexes for looking up artifacts
 
-Concepts such as tags and groups are higher-level abstractions built on indexes. The specific fields indexed depend on the
-artifact type, but the underlying index storage format is uniform. Index objects are subject to merge conflicts because
+Concepts such as tags and groups are not separate primitives; they are implemented as indexes (for example, a "tags"
+index is a non-unique index keyed by tag value). The specific fields indexed depend on the artifact type, but the
+underlying index storage format is uniform. Index objects are subject to merge conflicts because
 any concurrent artifact write can update the same index object. Conflict resolution uses a three-way diff between the
 merge base and both heads (see Conflict model). Empty indexes are tombstoned so that merges can detect the deletion (see
 Delete semantics and retention).
@@ -178,8 +179,12 @@ Variable-length fields (for example, strings) must include length prefixes in th
 
 #### Index key/value encoding (MVP)
 
-Index keys and order-field columns use a deterministic binary encoding independent of protobuf wire encoding. Encoding
-is little-endian to enable zero-copy access on common hosts. Ordering comparisons use the field's native type semantics
+Index keys and order-field columns use a deterministic binary encoding independent of protobuf wire encoding. Key field
+values are encoded as little-endian to enable zero-copy access on common hosts. Note that this differs from the
+big-endian encoding used for ID-based path segments (artifact_id in paths, key_prefix in index paths); path segments
+prioritize human-sortable lexicographic order, while key field values prioritize host-native access.
+
+Ordering comparisons use the field's native type semantics
 (numeric order for numbers, lexicographic for strings/bytes) on decoded values, not raw bytes. This means byte-level
 comparison (for example, memcmp on encoded keys) is not valid for ordering; index merge logic and any sorted operations
 must decode values before comparing. If byte-level key ordering is needed in the future (for example, for range
@@ -357,8 +362,9 @@ imports option extensions when loading a type definition. See Protocol buffers a
 An artifact definition includes the following metadata:
 1. Schema: defined by the protobuf message itself.
 2. Indexes: a repeated MessageOption listing index definitions; a FieldOption for single-field indexes may be added later.
-3. Actions: a MessageOption defining a dictionary of actions available on artifacts of this type.
-4. Viewer: a MessageOption defining the default viewer endpoint.
+3. Actions: a MessageOption defining a dictionary of actions available on artifacts of this type. Stored as metadata at
+   registration; interpretation is an App Layer concern and is not consumed by the artifact layer at launch.
+4. Viewer: a MessageOption defining the default viewer endpoint. Same as Actions — stored but not interpreted at launch.
 5. Custom Instruction: a MessageOption defining LLM instructions for the type.
 
 #### Protocol buffers as the type definition
@@ -538,7 +544,7 @@ conflict responses. Client-to-app-layer transport remains application-specific a
 
 #### Artifact CRUD API
 
-Operations (conceptual names; transport is TBD):
+Operations (gRPC service-to-service; client-to-app transport is application-specific):
 1. CreateArtifact(type_name, type_version?, payload)
 2. GetArtifact(artifact_id)
 3. BatchGetArtifacts(artifact_ids)
