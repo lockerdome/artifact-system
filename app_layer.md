@@ -86,15 +86,21 @@ back the updated index object(s). Unique indexes enforce at most a single item a
 
 #### Index definition
 
+Index definitions are expressed as protobuf messages (IndexDefinition) and attached to artifact types via a
+message-level custom option (indexes). The IndexDefinition schema describes the fields below.
+
 An index definition includes:
 1. key_type: the name of the value and the identifier passed to fetch index calls.
 2. key_prefix: a numeric prefix inside the indexes keyspace. This defaults to a stable hash of key_type.
 3. key: the fields that partition the index. Different key values on the same index type map to different index
    objects.
 4. order fields: fields that determine the sort order. By default, order is ascending based on each field type's sort
-   order, but this can be overridden per field.
+   order, but this can be overridden per field. The special field name artifact_id refers to the artifact ID (not a
+   payload field) and must be included as the final order field to guarantee uniqueness. This is a simplification of a
+   general unique constraint on index rows.
 5. where clauses: predicates that determine whether a value should be indexed. Supported ops include ==, >, <, >=, <=.
    The LHS must be a field; the RHS can be a field or a constant.
+6. unique: whether the index enforces at most one artifact ID per index key.
 
 #### Index merge semantics
 
@@ -116,10 +122,10 @@ Variable-length fields (for example, strings) must include length prefixes in th
 #### Index object representation
 
 Index objects must be encoded deterministically to make diffs and merges reliable. The value is a column-oriented binary
-format with one column per order field plus an artifact_id column. Rows are ordered by the order fields (tie-breaker:
-artifact_id). The encoding format can be configured per index. By default, each column is stored as an array of the raw
-binary values. In the future, we can support dictionary encoding or RLE per column to compress the arrays. Empty indexes
-simply do not exist at HEAD (though history may include prior objects).
+format with one column per order field. Rows are ordered by the order fields, which must
+include artifact_id as the final field. The encoding format can be configured per index. By default, each column is
+stored as an array of the raw binary values. In the future, we can support dictionary encoding or RLE per column to
+compress the arrays. Empty indexes simply do not exist at HEAD (though history may include prior objects).
 
 #### Index sharding (planned)
 
@@ -152,7 +158,38 @@ Writes use test-and-set via an object version ID (for example, an ETag). If the 
 occurs, we return a conflict to the calling service so it can resolve and retry. Only index conflicts are auto-resolved.
 In the future, we can add application-defined merge logic per artifact type.
 
+#### Artifact contract (minimum)
+
+Artifacts are defined by (artifact_id, type_name, type_version, payload).
+1. artifact_id: opaque uint64 allocated by a separate ID allocation service.
+2. type_name/type_version: must resolve to a registered type version in the registry.
+3. payload: serialized protobuf message (binary wire format) for the resolved type/version.
+
+The artifact_id is metadata and does not need to be duplicated in the payload. If a type schema includes an id field, the
+artifact layer should validate that it matches the artifact_id.
+
+On create/update, the artifact layer validates the payload using standard protobuf validation for the declared
+type/version and validates any type metadata constraints (for example, indexes defined in metadata). Responses return
+the resolved type/version and the storage version ID so callers can perform safe updates. Updates and deletes require an
+expected storage version ID to avoid lost updates. Reads return payload bytes plus the type name/version and the storage
+version ID. Partial updates are out of scope for launch.
+
+The artifact layer stores payload bytes as provided and does not reserialize them. This preserves unknown fields and
+avoids any reliance on canonical protobuf binary encodings. Text/JSON formats are not used for storage.
+
 ### Types (artifact type registry)
+
+#### Type taxonomy and bootstrapping
+
+In this document, "type" applies to both artifact payloads and definition objects:
+1. Artifact types: schemas for artifact payloads.
+2. Definition types: schemas for definition objects (artifact definitions and index definitions).
+3. TypeDefinition: the schema for type definitions themselves.
+
+Definition objects are represented as protobuf messages and are usually embedded as type metadata via custom options. If
+we store standalone definition objects as artifacts (for example, for migrations), their payloads conform to their
+definition type (ArtifactDefinition, IndexDefinition, etc.). TypeDefinition is a built-in meta-type used to describe
+these definition types; it is bootstrapped in the artifact layer and treated as immutable.
 
 We likely want to represent the artifact types as tied to the current state of the repo. This is helpful because we can
 create migration transactions and detect when merging if something needs to be corrected before merging. For example, if
@@ -173,11 +210,163 @@ which is defined in our extensions to message options such that each artifact ty
 
 As far as specific fields needed in an artifact definition, I think we would need the following:
 1. Schema (taken care of by protobuf)
-2. Single Field Indexes (add a custom FieldOption which allows specifying an index on a field)
-3. Compound Indexes (add a MessageOption which allows creation of one or more compound indexes)
-4. Actions (add a MessageOption for defining a dictionary of actions to an artifact)
-5. Viewer (add a MessageOption for defining the default viewer endpoint)
-6. Custom Instruction (add a MessageOption for defining instructions for LLMs)
+2. Indexes (add a MessageOption which allows creation of one or more indexes; a FieldOption can be added later as
+   syntactic sugar for single-field indexes)
+3. Actions (add a MessageOption for defining a dictionary of actions to an artifact)
+4. Viewer (add a MessageOption for defining the default viewer endpoint)
+5. Custom Instruction (add a MessageOption for defining instructions for LLMs)
+
+#### Protocol buffers as the type definition
+
+Protocol buffers are the canonical representation for types. A type version stores a compiled
+google.protobuf.FileDescriptorSet that includes the defining .proto and all transitive imports (including option
+extensions). The descriptor set is authoritative for parsing, validation, and index derivation. The registry must accept
+new .proto definitions at runtime and compile them into a descriptor set on registration. The original .proto source
+should be stored alongside the descriptor set for inspection and re-compilation, but the descriptor set is the required
+runtime artifact.
+
+Standard protobuf validation for registration is: compile with protoc, reject parse/descriptor errors, and only accept
+proto3 syntax for launch. Custom options are supported (see below) and must be retained at runtime so that metadata is
+available via descriptors.
+
+#### Custom options as metadata
+
+Type metadata is defined using protobuf custom options (extensions). In proto3, extensions are permitted only for custom
+options, which aligns with our needs.
+1. Message options: indexes, actions, viewer endpoint, LLM instructions.
+2. Field options (optional): syntactic sugar for single-field indexes.
+3. Virtual fields (planned): a MessageOption for declaring computed fields; the expression AST schema is to be defined.
+
+Custom options must use runtime retention (not source-only retention) so they appear in the descriptor set. The registry
+loads the descriptor set with the option extensions so the artifact layer can read metadata deterministically.
+
+#### Index options schema (example)
+
+The type-level option indexes is a repeated list of IndexDefinition objects. Each `option (indexes) = { ... }` entry
+defines one index for the enclosing message type.
+
+```proto
+syntax = "proto3";
+
+import "google/protobuf/descriptor.proto";
+
+message Constant {
+  oneof value {
+    string string_value = 1;
+    int64 int64_value = 2;
+    uint64 uint64_value = 3;
+    bool bool_value = 4;
+    double double_value = 5;
+  }
+}
+
+message OrderDefinition {
+  string field = 1;
+  enum OrderBy {
+    ORDER_BY_UNSPECIFIED = 0;
+    ASCENDING = 1;
+    DESCENDING = 2;
+  }
+  OrderBy direction = 2;
+}
+
+message WhereClause {
+  string lhs = 1;
+  enum Op {
+    OP_UNSPECIFIED = 0;
+    GT = 1;
+    LT = 2;
+    LTE = 3;
+    GTE = 4;
+    EQ = 5;
+    NE = 6;
+  }
+  Op op = 2;
+  oneof rhs {
+    string rhs_field = 3;
+    Constant rhs_value = 4;
+  }
+}
+
+message IndexDefinition {
+  string key_type = 1;
+  optional uint32 key_prefix = 2;
+  repeated string key = 3;
+  repeated OrderDefinition order = 4;
+  repeated WhereClause where = 5;
+  bool unique = 6;
+}
+
+extend google.protobuf.MessageOptions {
+  repeated IndexDefinition indexes = 50002;
+}
+
+message DataFrameArtifact {
+  option (indexes) = { key_type: "by_owner" key: ["created_by"] order: { field: "artifact_id" } };
+  option (indexes) = { key_type: "by_repo_created_by" key: ["repo_id", "created_by"] order: { field: "artifact_id" } };
+
+  uint64 created_by = 1;
+  uint64 repo_id = 2;
+  bytes dataframe = 3;
+}
+```
+
+#### Index object schema (generated example)
+
+Index payloads are stored as proto3 messages that wrap the columnar binary values. Columns are stored as raw bytes to
+enable typed-array handling in JavaScript and efficient scans in backend languages. Index keys are encoded in the object
+path and are not stored in the payload; if we store them for debugging, they must match the path-derived key.
+
+For the DataFrameArtifact example, the by_owner index uses key = created_by and the by_repo_created_by index uses
+key = (repo_id, created_by). The generated payload messages for those indexes are:
+
+```proto
+syntax = "proto3";
+
+message Index_by_owner {
+  uint32 row_count = 1;
+  bytes artifact_id = 2;
+}
+
+message Index_by_repo_created_by {
+  uint32 row_count = 1;
+  bytes artifact_id = 2;
+}
+```
+
+If an index has additional order fields, include one bytes column per order field in order (ending with artifact_id).
+
+#### Field presence and indexing semantics
+
+Index and predicate evaluation use protobuf field semantics:
+1. Optional fields have explicit presence; if unset, the field is treated as missing for where clauses and index keys.
+2. Implicit-presence scalar fields (proto3 without optional) have no presence; missing is indistinguishable from the
+   default value. For any field used in predicates or index keys, prefer optional.
+3. Message-typed fields always have presence; they can be indexed only if a specific scalar sub-field is referenced.
+4. Repeated scalar fields generate one index entry per value; repeated message fields require a scalar sub-field to be
+   referenced.
+5. Map fields are not indexable for launch.
+
+#### Type identity and versioning
+
+Types are identified by (type_name, type_version). Type versions are immutable once registered; any schema or metadata
+change is a new version. The canonical storage path for a version is types/{type_name}/{version}. Optionally, a small
+pointer object may be stored at types/{type_name}/current to identify the default version. If a CRUD request omits
+type_version, the artifact layer resolves to the current pointer at request time and returns the resolved version in the
+response for reproducibility.
+
+#### Type registry API surface (minimum)
+
+The registry must support registering and resolving type versions:
+1. RegisterTypeVersion(type_name, version, schema, metadata)
+2. GetTypeVersion(type_name, version)
+3. ListTypeVersions(type_name)
+4. SetCurrentTypeVersion(type_name, version) (optional)
+5. ResolveTypeVersion(type_name) -> version (current)
+
+RegisterTypeVersion performs protobuf schema validation and validates metadata (for example, index definitions reference
+existing fields and supported types). The registry stores the protobuf schema (source or descriptor) plus any required
+imports and extensions so it can be loaded deterministically by the artifact layer.
 
 ## App Layer
 
