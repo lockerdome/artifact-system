@@ -42,7 +42,8 @@ if ! gcloud compute networks describe "$VPC_NAME" --project="$PROJECT_ID" &>/dev
     echo ">>> Creating VPC: $VPC_NAME..."
     gcloud compute networks create "$VPC_NAME" \
         --subnet-mode=custom \
-        --bgp-routing-mode=regional
+        --bgp-routing-mode=regional \
+        --project="$PROJECT_ID"
 else
     echo ">>> VPC $VPC_NAME already exists."
 fi
@@ -51,7 +52,8 @@ if ! gcloud compute routers describe lakefs-router --region="$REGION" --project=
     echo ">>> Creating Cloud Router..."
     gcloud compute routers create lakefs-router \
         --network="$VPC_NAME" \
-        --region="$REGION"
+        --region="$REGION" \
+        --project="$PROJECT_ID"
 else
     echo ">>> Cloud Router lakefs-router already exists."
 fi
@@ -62,7 +64,8 @@ if ! gcloud compute routers nats describe lakefs-nat --region="$REGION" --router
         --router=lakefs-router \
         --region="$REGION" \
         --auto-allocate-nat-external-ips \
-        --nat-all-subnet-ip-ranges
+        --nat-all-subnet-ip-ranges \
+        --project="$PROJECT_ID"
 else
     echo ">>> Cloud NAT lakefs-nat already exists."
 fi
@@ -73,7 +76,8 @@ if ! gcloud compute networks subnets describe "$SUBNET_NAME" --region="$REGION" 
         --network="$VPC_NAME" \
         --region="$REGION" \
         --range="$SUBNET_RANGE" \
-        --enable-private-ip-google-access
+        --enable-private-ip-google-access \
+        --project="$PROJECT_ID"
 else
     echo ">>> Subnet $SUBNET_NAME already exists."
 fi
@@ -86,7 +90,8 @@ if ! gcloud compute addresses describe google-managed-services-"$VPC_NAME" --glo
         --purpose=VPC_PEERING \
         --addresses="${PSA_RANGE%/*}" \
         --prefix-length="${PSA_RANGE#*/}" \
-        --network="$VPC_NAME"
+        --network="$VPC_NAME" \
+        --project="$PROJECT_ID"
 else
     echo ">>> PSA Address Range already allocated."
 fi
@@ -138,7 +143,8 @@ if [[ -z "$USER_EXISTS" ]]; then
     echo ">>> Creating Database User 'lakefs'..."
     gcloud sql users create lakefs \
         --instance="$DB_INSTANCE_NAME" \
-        --password="temporary-password-to-be-changed"
+        --password="temporary-password-to-be-changed" \
+        --project="$PROJECT_ID"
 else
     echo ">>> Database User 'lakefs' already exists."
 fi
@@ -155,7 +161,7 @@ export SA_SIGNER_EMAIL="${SA_SIGNER_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 echo ">>> Starting Part 2: Identity & Secrets setup..."
 
 # 1. Create the GCS Bucket
-if ! gcloud storage buckets describe "gs://${BUCKET_NAME}" &>/dev/null; then
+if ! gcloud storage buckets describe "gs://${BUCKET_NAME}" --project="$PROJECT_ID" &>/dev/null; then
     echo ">>> Creating Bucket gs://${BUCKET_NAME}..."
     gcloud storage buckets create "gs://${BUCKET_NAME}" \
         --project="$PROJECT_ID" \
@@ -397,7 +403,7 @@ EOF
         echo ""
 
     echo ">>> Stopping Builder VM..."
-    gcloud compute instances stop "$BUILDER_VM_NAME" --zone="$ZONE"
+    gcloud compute instances stop "$BUILDER_VM_NAME" --zone="$ZONE" --project="$PROJECT_ID"
 
     echo ">>> Creating Custom Image: $IMAGE_NAME..."
     gcloud compute images create "$IMAGE_NAME" \
@@ -407,7 +413,7 @@ EOF
         --family="lakefs-server"
 
     echo ">>> Deleting Builder VM..."
-    gcloud compute instances delete "$BUILDER_VM_NAME" --zone="$ZONE" --quiet
+    gcloud compute instances delete "$BUILDER_VM_NAME" --zone="$ZONE" --project="$PROJECT_ID" --quiet
     rm build-script.sh
 fi
 
@@ -556,7 +562,8 @@ if ! gcloud compute health-checks describe lakefs-health-check --region="$REGION
         --check-interval=5s \
         --timeout=5s \
         --unhealthy-threshold=2 \
-        --healthy-threshold=2
+        --healthy-threshold=2 \
+        --project="$PROJECT_ID"
 else
     echo ">>> Health check already exists."
 fi
@@ -599,13 +606,15 @@ fi
 echo ">>> Configuring Autohealing and Named Ports..."
 gcloud compute instance-groups managed set-named-ports "$MIG_NAME" \
     --named-ports="http:8000" \
-    --region="$REGION"
+    --region="$REGION" \
+    --project="$PROJECT_ID"
 
 echo ">>> Updating Autohealing Policy..."
 gcloud beta compute instance-groups managed update "$MIG_NAME" \
     --region="$REGION" \
     --health-check="https://www.googleapis.com/compute/v1/projects/${PROJECT_ID}/regions/${REGION}/healthChecks/lakefs-health-check" \
-    --initial-delay=300
+    --initial-delay=300 \
+    --project="$PROJECT_ID"
 
 rm runtime-startup.sh
 echo ">>> Part 3B Complete."
@@ -619,7 +628,8 @@ if ! gcloud compute networks subnets describe "${PROXY_SUBNET_NAME}" --region="$
         --role=ACTIVE \
         --region="$REGION" \
         --network="$VPC_NAME" \
-        --range="$LB_RANGE"
+        --range="$LB_RANGE" \
+        --project="$PROJECT_ID"
 else
     echo ">>> Proxy subnet already exists."
 fi
@@ -639,7 +649,7 @@ else
 fi
 
 # Add Backend
-BACKENDS=$(gcloud compute backend-services describe "${LB_PREFIX}-backend" --region="$REGION" --format="value(backends)" || true)
+BACKENDS=$(gcloud compute backend-services describe "${LB_PREFIX}-backend" --region="$REGION" --project="$PROJECT_ID" --format="value(backends)" || true)
 if [[ -z "$BACKENDS" ]]; then
     gcloud compute backend-services add-backend "${LB_PREFIX}-backend" \
         --instance-group="$MIG_NAME" \
@@ -678,7 +688,7 @@ if ! gcloud compute firewall-rules describe allow-proxy-to-mig --project="$PROJE
         --project="$PROJECT_ID"
 fi
 
-# 5. NEW: Enable IAP SSH Access
+# 5. Enable IAP SSH Access
 if ! gcloud compute firewall-rules describe allow-ssh-ingress-from-iap --project="$PROJECT_ID" &>/dev/null; then
     echo ">>> Creating Firewall Rule for IAP SSH..."
     gcloud compute firewall-rules create allow-ssh-ingress-from-iap \
@@ -746,7 +756,8 @@ for DP_SA in "$DATAPROC_SA" "$DATAPROC_SA_ALT"; do
         gcloud compute networks subnets add-iam-policy-binding "$SUBNET_NAME" \
             --region="$REGION" \
             --member="serviceAccount:${DP_SA}" \
-            --role="roles/compute.networkUser" >/dev/null
+            --role="roles/compute.networkUser" \
+            --project="$PROJECT_ID" >/dev/null
     fi
 done
 
@@ -784,7 +795,7 @@ echo "    gcloud secrets versions access latest --secret=lakefs-secret-access-ke
 echo ">>> Ensuring 'example-repo' exists..."
 # We SSH again to run the curl command using the newly acquired credentials
 # Note: Basic Auth uses AccessKey:SecretKey
-gcloud compute ssh "$INSTANCE_NAME" --zone="$INSTANCE_ZONE" --tunnel-through-iap --quiet \
+gcloud compute ssh "$INSTANCE_NAME" --zone="$INSTANCE_ZONE" --tunnel-through-iap --project="$PROJECT_ID" --quiet \
     --command "curl -s -X POST http://localhost:8000/api/v1/repositories \
     -u \"$ACCESS_KEY_ID:$SECRET_ACCESS_KEY\" \
     -H 'Content-Type: application/json' \
