@@ -101,6 +101,7 @@ delete_resource "gcloud secrets" "lakefs-signer-key" ""
 delete_resource "gcloud secrets" "lakefs-db-password" ""
 delete_resource "gcloud secrets" "lakefs-secret-key" ""
 delete_resource "gcloud secrets" "lakefs-secret-access-key" ""
+delete_resource "gcloud secrets" "lakefs-access-key-id" ""
 
 # 9. Remove Project IAM Bindings
 remove_binding "serviceAccount:${SA_VM_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" "roles/secretmanager.secretAccessor"
