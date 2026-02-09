@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e  # Exit immediately if a command exits with a non-zero status
+set -eux
 
 cleanup() {
     rm -f lakefs-signer.json build-script.sh runtime-startup.sh batch-request.json admin-creds.json

@@ -1,4 +1,5 @@
 #!/bin/bash
+set -eux
 
 # --- CONFIGURATION ---
 export PROJECT_ID="your-project-id"
