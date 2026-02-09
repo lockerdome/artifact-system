@@ -21,9 +21,6 @@ export DB_INSTANCE_NAME="lakefs-db"
 export LB_PREFIX="lakefs-lb"
 export ACCESS_KEY_ID="e4f3c46f902cce3b13da679b"
 
-# Set the project context
-gcloud config set project "$PROJECT_ID"
-
 echo ">>> Starting Part 1: Foundation setup for Project: $PROJECT_ID in $REGION"
 
 # 1. Enable APIs
@@ -35,7 +32,8 @@ gcloud services enable \
     secretmanager.googleapis.com \
     dataproc.googleapis.com \
     iap.googleapis.com \
-    cloudscheduler.googleapis.com
+    cloudscheduler.googleapis.com \
+    --project="$PROJECT_ID"
 
 # 2. Create VPC and Subnet
 if ! gcloud compute networks describe "$VPC_NAME" --project="$PROJECT_ID" &>/dev/null; then
@@ -132,7 +130,7 @@ fi
 # 5. Create Database and User
 if ! gcloud sql databases describe lakefs --instance="$DB_INSTANCE_NAME" --project="$PROJECT_ID" &>/dev/null; then
     echo ">>> Creating Database 'lakefs'..."
-    gcloud sql databases create lakefs --instance="$DB_INSTANCE_NAME"
+    gcloud sql databases create lakefs --instance="$DB_INSTANCE_NAME" --project="$PROJECT_ID"
 else
     echo ">>> Database 'lakefs' already exists."
 fi
@@ -253,15 +251,18 @@ echo ">>> Ensuring IAM Roles..."
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
     --member="serviceAccount:${SA_VM_EMAIL}" \
     --role="roles/secretmanager.secretAccessor" \
-    --condition=None >/dev/null
+    --condition=None \
+    --project="$PROJECT_ID" >/dev/null
 
 gcloud storage buckets add-iam-policy-binding "gs://${BUCKET_NAME}" \
     --member="serviceAccount:${SA_VM_EMAIL}" \
-    --role="roles/storage.objectAdmin" >/dev/null
+    --role="roles/storage.objectAdmin" \
+    --project="$PROJECT_ID" >/dev/null
 
 gcloud storage buckets add-iam-policy-binding "gs://${BUCKET_NAME}" \
     --member="serviceAccount:${SA_SIGNER_EMAIL}" \
-    --role="roles/storage.objectAdmin" >/dev/null
+    --role="roles/storage.objectAdmin" \
+    --project="$PROJECT_ID" >/dev/null
 
 # 6. Create authorization key
 if ! gcloud secrets describe lakefs-secret-key --project="$PROJECT_ID" &>/dev/null; then
@@ -314,7 +315,7 @@ else
     # CLEANUP STALE BUILDER IF EXISTS
     if gcloud compute instances describe "$BUILDER_VM_NAME" --zone="$ZONE" --project="$PROJECT_ID" &>/dev/null; then
         echo ">>> Found stale Builder VM. Deleting..."
-        gcloud compute instances delete "$BUILDER_VM_NAME" --zone="$ZONE" --quiet
+        gcloud compute instances delete "$BUILDER_VM_NAME" --zone="$ZONE" --project="$PROJECT_ID" --quiet
     fi
 
     # 2. Define Build Script
@@ -390,7 +391,7 @@ EOF
             fi
 
             # Fetch serial output; ignore errors if API is busy
-            output=$(gcloud compute instances get-serial-port-output "$BUILDER_VM_NAME" --zone="$ZONE" 2>/dev/null)
+            output=$(gcloud compute instances get-serial-port-output "$BUILDER_VM_NAME" --zone="$ZONE" --project="$PROJECT_ID" 2>/dev/null)
 
             if echo "$output" | grep -q "BUILD_COMPLETE"; then
                 echo ">>> Build signal received!"
@@ -714,7 +715,7 @@ if ! gcloud compute forwarding-rules describe "${LB_PREFIX}-forwarding-rule" --r
         --project="$PROJECT_ID"
 fi
 
-LB_IP_ADDRESS=$(gcloud compute forwarding-rules describe "${LB_PREFIX}-forwarding-rule" --region="$REGION" --format="value(IPAddress)")
+LB_IP_ADDRESS=$(gcloud compute forwarding-rules describe "${LB_PREFIX}-forwarding-rule" --region="$REGION" --project="$PROJECT_ID" --format="value(IPAddress)")
 echo ">>> Internal LB Created at: $LB_IP_ADDRESS"
 
 echo ">>> Part 4 Complete."
@@ -741,13 +742,13 @@ echo ">>> Waiting 20s for IAM propagation..."
 sleep 20
 
 # IAM Roles
-gcloud storage buckets add-iam-policy-binding "gs://${BUCKET_NAME}" --member="serviceAccount:${GC_SA_EMAIL}" --role="roles/storage.objectAdmin" >/dev/null
-gcloud projects add-iam-policy-binding "$PROJECT_ID" --member="serviceAccount:${GC_SA_EMAIL}" --role="roles/dataproc.worker" --condition=None >/dev/null
-gcloud projects add-iam-policy-binding "$PROJECT_ID" --member="serviceAccount:${SCHEDULER_SA_EMAIL}" --role="roles/dataproc.editor" --condition=None >/dev/null
-gcloud iam service-accounts add-iam-policy-binding "$GC_SA_EMAIL" --member="serviceAccount:${SCHEDULER_SA_EMAIL}" --role="roles/iam.serviceAccountUser" >/dev/null
+gcloud storage buckets add-iam-policy-binding "gs://${BUCKET_NAME}" --member="serviceAccount:${GC_SA_EMAIL}" --role="roles/storage.objectAdmin" --project="$PROJECT_ID" >/dev/null
+gcloud projects add-iam-policy-binding "$PROJECT_ID" --member="serviceAccount:${GC_SA_EMAIL}" --role="roles/dataproc.worker" --condition=None --project="$PROJECT_ID" >/dev/null
+gcloud projects add-iam-policy-binding "$PROJECT_ID" --member="serviceAccount:${SCHEDULER_SA_EMAIL}" --role="roles/dataproc.editor" --condition=None --project="$PROJECT_ID" >/dev/null
+gcloud iam service-accounts add-iam-policy-binding "$GC_SA_EMAIL" --member="serviceAccount:${SCHEDULER_SA_EMAIL}" --role="roles/iam.serviceAccountUser" --project="$PROJECT_ID" >/dev/null
 
 echo ">>> Ensuring Dataproc service agent subnet access..."
-PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)")
+PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)" --project="$PROJECT_ID")
 DATAPROC_SA="service-${PROJECT_NUMBER}@dataproc-accounts.iam.gserviceaccount.com"
 DATAPROC_SA_ALT="service-${PROJECT_NUMBER}@gcp-sa-dataproc.iam.gserviceaccount.com"
 

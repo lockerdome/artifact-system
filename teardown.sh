@@ -41,14 +41,12 @@ if [[ ! $REPLY =~ ^[Yy]$ ]]; then
     exit 1
 fi
 
-gcloud config set project "$PROJECT_ID"
-
 delete_resource() {
     local TYPE=$1
     local NAME=$2
     local FLAGS=$3
     echo ">>> Deleting $TYPE: $NAME..."
-    $TYPE delete "$NAME" $FLAGS --quiet || echo "    (Skipped or already deleted)"
+    $TYPE delete "$NAME" $FLAGS --project="$PROJECT_ID" --quiet || echo "    (Skipped or already deleted)"
 }
 
 remove_binding() {
@@ -90,7 +88,7 @@ delete_resource "gcloud compute instances" "lakefs-builder-temp" "--zone=${REGIO
 
 # 7. Delete Data & Storage
 echo ">>> Deleting GCS Bucket: gs://${BUCKET_NAME}..."
-gcloud storage rm -r "gs://${BUCKET_NAME}" --quiet || echo "    (Bucket already gone)"
+gcloud storage rm -r "gs://${BUCKET_NAME}" --project="$PROJECT_ID" --quiet || echo "    (Bucket already gone)"
 
 delete_resource "gcloud sql instances" "$DB_INSTANCE_NAME" ""
 
