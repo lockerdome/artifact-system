@@ -40,6 +40,9 @@
    approach: once the front buffer crosses a high-water mark, the back buffer is filled asynchronously. When the front
    buffer is exhausted, front and back swap. This ensures CreateArtifact calls do not block on the ID service under
    normal load. If both buffers are exhausted (ID service prolonged outage), CreateArtifact returns an unavailable error.
+1. GCS enforces a 1024-byte maximum object name (UTF-8 encoded). The full GCS path includes the lakeFS installation
+   prefix and the object key. Index object paths use content-addressed hashing (see Index physical storage) to guarantee
+   a fixed-length path segment regardless of key field sizes.
 1. Index metadata must preserve an upgrade path to future sharded layouts.
 
 ## Layer overview
@@ -173,23 +176,34 @@ fails and the conflict is returned to the calling service for resolution.
 
 #### Index physical storage
 
-Index objects are stored under indexes/{key_prefix}/{encoded_keys}. The key_prefix is the uint64 IndexDefinition artifact ID encoded as base64 using the URL-safe alphabet of its big-endian uint64 bytes without padding.
-The encoded_keys is base64 using the URL-safe alphabet of the concatenated binary encodings for each key field.
-Variable-length fields (for example, strings) must include length prefixes in their binary encoding.
+Index objects are stored under indexes/{key_prefix}/{key_hash}. The key_prefix is the uint64 IndexDefinition artifact ID
+encoded as base64 using the URL-safe alphabet of its big-endian uint64 bytes without padding. The key_hash is the
+SHA-256 digest of the deterministically encoded key bytes (see Index key encoding), rendered as base64 using the URL-safe
+alphabet without padding (always 43 characters). This content-addressed scheme produces a fixed-length path
+(indexes/ + key_prefix + / + key_hash = 63 bytes) regardless of key field sizes, satisfying the GCS 1024-byte object
+name limit (see Dependencies and constraints). Because the path is a hash, the actual key field values are stored in the
+index object payload (see Index object representation).
 
-#### Index key/value encoding (MVP)
+#### Index key encoding
 
-Index keys and order-field columns use a deterministic binary encoding independent of protobuf wire encoding. Key field
-values are encoded as little-endian to enable zero-copy access on common hosts. Note that this differs from the
-big-endian encoding used for ID-based path segments (artifact_id in paths, key_prefix in index paths); path segments
-prioritize human-sortable lexicographic order, while key field values prioritize host-native access.
+Index keys use a deterministic binary encoding independent of protobuf wire encoding. The encoded bytes are the
+pre-image for the SHA-256 hash used in the index object path (see Index physical storage). Deterministic encoding is
+critical: different encodings of the same logical key would produce different hashes and thus different paths, creating
+orphaned index objects.
 
-Ordering comparisons use the field's native type semantics
-(numeric order for numbers, lexicographic for strings/bytes) on decoded values, not raw bytes. This means byte-level
-comparison (for example, memcmp on encoded keys) is not valid for ordering; index merge logic and any sorted operations
-must decode values before comparing. If byte-level key ordering is needed in the future (for example, for range
-partitioning or sharded bucket assignment), the encoding would need to change to an order-preserving format (such as
-big-endian for unsigned integers). This is acceptable for the MVP since all comparisons are decode-then-compare.
+Key field values are encoded as little-endian to enable zero-copy access on common hosts. This differs from the
+big-endian encoding used for ID-based path segments (artifact_id in paths, key_prefix in index paths), which prioritize
+human-sortable lexicographic order.
+
+Index value payloads (order-field columns) are stored as typed protobuf fields and use standard protobuf wire encoding,
+not the custom binary encoding defined here; see Index object representation for details.
+
+Ordering comparisons in index merge logic and sorted operations use the field's native type semantics (numeric order for
+numbers, lexicographic for strings/bytes) on decoded protobuf values. All comparisons are decode-then-compare.
+
+**Key encoding rules**
+
+To produce the hash pre-image, concatenate key field encodings in the declared order using the following rules.
 
 1. int32, sint32, sfixed32: 4-byte two's-complement little-endian.
 1. uint32, fixed32: 4-byte unsigned little-endian.
@@ -206,20 +220,20 @@ big-endian for unsigned integers). This is acceptable for the MVP since all comp
 Varint length prefixes must use minimal encoding: the shortest base-128 representation with no leading zero groups. This
 is required for deterministic encoding; non-minimal varints must be rejected during index derivation.
 
-1. If a key or order field references a scalar sub-field of a message, encode the referenced scalar using the same rules.
-
-For encoded_keys, concatenate key field encodings in order. For columnar order-field values, each row value is encoded
-using the same rules; variable-length values include length prefixes to preserve row boundaries. Sorting and comparison
-operate on decoded values.
+1. If a key field references a scalar sub-field of a message, encode the referenced scalar using the same rules.
 
 #### Index object representation
 
-Index objects must be encoded deterministically to make diffs and merges reliable. The value is a column-oriented binary
-format with one column per order field. Rows are ordered by the order fields, which must
-include artifact_id as the final field. The encoding format can be configured per index. By default, each column is
-stored as an array of the raw binary values. In the future, we can support dictionary encoding or RLE per column to
-compress the arrays. Empty indexes are tombstoned so that merges can detect the deletion (see Delete semantics and
-retention).
+Index objects must be encoded deterministically to make diffs and merges reliable. The stored payload is the full
+`Index_*` proto3 message, which contains the key fields (via an embedded `IndexKey_*` sub-message) and the value fields
+(via an embedded `IndexValue_*` sub-message with one `repeated` typed field per order column, forming parallel arrays in
+columnar layout). Key fields are always stored in the payload because index object paths use a content-addressed hash and
+the key cannot be reconstructed from the path (see Index physical storage). Rows are ordered by the order fields, which
+must include artifact_id as the final field. All columns have the same length, equal to the row count. Using typed proto
+fields (rather than raw bytes) means serialization, deserialization, and type safety are handled by the protobuf runtime;
+no custom binary codec is needed for the stored payload. Deterministic encoding is achieved by using protobuf
+deterministic serialization (sorted map keys, fixed field order). Empty indexes are tombstoned so that merges can detect
+the deletion (see Delete semantics and retention).
 
 #### Index fetch behavior (MVP)
 
@@ -247,7 +261,8 @@ The response payload is the concrete, generated index message for the queried in
 index-specific protobuf schema.
 
 1. The key message corresponds to the index key fields.
-1. The value message contains the ordered columns defined by the index (ending with artifact_id).
+1. The value message contains typed `repeated` fields for each order column defined by the index (ending with
+   artifact_id); see Index object schema for the generated layout.
 1. Artifact payloads are embedded or referenced according to the index value schema defined for that index.
 
 The response may also include the index object’s storage version ID for debugging or consistency checks.
@@ -267,7 +282,8 @@ Object paths are a private implementation detail and must not be exposed to end-
 
 1. `artifacts/{artifact_id}` — artifact payloads. The artifact_id is a uint64 encoded as base64 using the URL-safe
    alphabet of its big-endian bytes without padding.
-2. `indexes/{key_prefix}/{encoded_keys}` — index objects. Path encoding is defined in Index physical storage.
+2. `indexes/{key_prefix}/{key_hash}` — index objects. The key_hash is a SHA-256 content-addressed hash of the encoded
+   key bytes; path encoding is defined in Index physical storage.
 3. `types/{type_name}/{version}` — type definitions. The `current` pointer, if used, is at `types/{type_name}/current`.
 
 ### Artifacts
@@ -467,10 +483,11 @@ message DataFrameArtifact {
 
 #### Index object schema (generated example)
 
-Index payloads are stored as proto3 messages that wrap the columnar binary values. Columns are stored as raw bytes to
-enable typed-array handling in JavaScript and efficient scans in backend languages. Index keys are encoded in the object
-path and are not stored in the payload; when a composite object is needed, the service can reconstruct the key from the
-path and assemble a key/value envelope without rewriting the stored payload.
+The stored index payload is the full `Index_*` proto3 message containing both the key (as an `IndexKey_*` sub-message)
+and the value (as an `IndexValue_*` sub-message with typed `repeated` fields forming parallel columnar arrays). Each
+order field maps to a `repeated` field of the corresponding protobuf type, and all columns have the same length. The
+`IndexKey_*` message is also used as the API input for `FetchIndex` requests. Key fields are always stored in the payload
+because the index object path is a content-addressed hash of the encoded key bytes (see Index physical storage).
 
 For the DataFrameArtifact example, the by_owner index uses key = created_by and the by_repo_created_by index uses
 key = (repo_id, created_by). The generated schemas for those indexes are:
@@ -480,7 +497,7 @@ syntax = "proto3";
 
 message IndexValue_DataFrameArtifact_by_owner {
   uint32 row_count = 1;
-  bytes artifact_id = 2;
+  repeated uint64 artifact_id = 2;
 }
 
 message IndexKey_DataFrameArtifact_by_owner {
@@ -494,7 +511,7 @@ message Index_DataFrameArtifact_by_owner {
 
 message IndexValue_DataFrameArtifact_by_repo_created_by {
   uint32 row_count = 1;
-  bytes artifact_id = 2;
+  repeated uint64 artifact_id = 2;
 }
 
 message IndexKey_DataFrameArtifact_by_repo_created_by {
@@ -508,7 +525,20 @@ message Index_DataFrameArtifact_by_repo_created_by {
 }
 ```
 
-If an index has additional order fields, include one bytes column per order field in order (ending with artifact_id).
+If an index has additional order fields, include one `repeated` typed column per order field in order (ending with
+artifact_id). For example, an index with `order: [{ field: "created_at" }, { field: "artifact_id" }]` on a message where
+`created_at` is `int64` would generate:
+
+```proto
+message IndexValue_Example_by_time {
+  uint32 row_count = 1;
+  repeated int64 created_at = 2;
+  repeated uint64 artifact_id = 3;
+}
+```
+
+All `repeated` columns must have exactly `row_count` elements; the artifact layer rejects index payloads where column
+lengths differ.
 
 #### Field presence and indexing semantics
 
