@@ -165,11 +165,13 @@ An index definition includes:
    the field type's sort order. The special field name artifact_id refers to the artifact ID (not a payload field) and
    must be included as an order field to make each row uniquely identifiable. In the MVP, artifact_id is required but
    does not need to be the final order field. This is a simplification of a general unique constraint on index rows.
-4. where clauses: predicates that determine whether a value should be indexed. Supported ops include ==, !=, >, <, >=,
-   <=, and IS_SET. The LHS must be a field; the RHS can be a field or a constant. The IS_SET operator checks whether an
-   `optional` field has explicit presence and requires no RHS; it is the preferred way to gate an index on field
-   presence. The != (NE) operator can also serve as a presence gate for `optional` fields (since missing fields evaluate
-   to false for any comparison), but IS_SET is unambiguous and does not depend on choosing a sentinel RHS value.
+4. where clause: an optional predicate tree that determines whether a value should be indexed. The WhereClause is a
+   recursive structure: leaf nodes are binary (==, !=, >, <, >=, <=) or unary (IS_SET) predicates; compound nodes are
+   And or Or combinators that contain child clauses. Binary clauses require a field as LHS and a field or constant as
+   RHS. IS_SET checks whether an `optional` field has explicit presence and is the preferred way to gate an index on
+   field presence. The != (NE) binary operator can also serve as a presence gate for `optional` fields (since missing
+   fields evaluate to false for any comparison), but IS_SET is unambiguous and does not depend on choosing a sentinel
+   RHS value. If multiple conditions are needed, wrap them in an And or Or clause; there is no implicit conjunction.
 5. unique: whether the index enforces at most one artifact ID per index key.
 
 #### Index merge semantics
@@ -445,9 +447,12 @@ defines one index for the enclosing message type.
 
 OrderDefinition.direction is required; the registry rejects index definitions with ORDER_BY_UNSPECIFIED.
 
-WhereClause.op is required; the registry rejects where clauses with OP_UNSPECIFIED. IS_SET requires no RHS (rhs must be
-unset); the registry rejects IS_SET clauses that specify an rhs_field or rhs_value. IS_SET is only valid on fields with
-explicit presence (`optional`); the registry rejects IS_SET on implicit-presence scalars.
+WhereClause must set exactly one variant of the `clause` oneof. The op field is required in leaf variants; the registry
+rejects clauses with OP_UNSPECIFIED. For BinaryWhereClause, the LHS must be a field and the RHS must be set (field or
+constant). For UnaryWhereClause, IS_SET is only valid on fields with explicit presence (`optional`); the registry rejects
+IS_SET on implicit-presence scalars. AndWhereClause and OrWhereClause must contain at least two child clauses; the
+registry rejects empty or single-element compound clauses (use the child directly instead). The registry enforces a
+maximum nesting depth to prevent unbounded recursion.
 
 ```proto
 syntax = "proto3";
@@ -474,7 +479,7 @@ message OrderDefinition {
   OrderBy direction = 2;
 }
 
-message WhereClause {
+message BinaryWhereClause {
   string lhs = 1;
   enum Op {
     OP_UNSPECIFIED = 0;
@@ -484,7 +489,6 @@ message WhereClause {
     GTE = 4;
     EQ = 5;
     NE = 6;
-    IS_SET = 7;
   }
   Op op = 2;
   oneof rhs {
@@ -493,11 +497,37 @@ message WhereClause {
   }
 }
 
+message UnaryWhereClause {
+  string field = 1;
+  enum Op {
+    OP_UNSPECIFIED = 0;
+    IS_SET = 1;
+  }
+  Op op = 2;
+}
+
+message AndWhereClause {
+  repeated WhereClause clauses = 1;
+}
+
+message OrWhereClause {
+  repeated WhereClause clauses = 1;
+}
+
+message WhereClause {
+  oneof clause {
+    BinaryWhereClause binary = 1;
+    UnaryWhereClause unary = 2;
+    AndWhereClause and = 3;
+    OrWhereClause or = 4;
+  }
+}
+
 message IndexDefinition {
   string key_type = 1;
   repeated string key = 2;
   repeated OrderDefinition order = 3;
-  repeated WhereClause where = 4;
+  optional WhereClause where = 4;
   bool unique = 5;
 }
 
