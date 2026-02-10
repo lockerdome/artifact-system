@@ -40,6 +40,8 @@
    approach: once the front buffer crosses a high-water mark, the back buffer is filled asynchronously. When the front
    buffer is exhausted, front and back swap. This ensures CreateArtifact calls do not block on the ID service under
    normal load. If both buffers are exhausted (ID service prolonged outage), CreateArtifact returns an unavailable error.
+   IDs are opaque uint64 values; gaps are expected (for example, if the server crashes after allocating an ID but before
+   committing the artifact) and are benign.
 1. GCS enforces a 1024-byte maximum object name (UTF-8 encoded). The full GCS path includes the lakeFS installation
    prefix and the object key. Index object paths use content-addressed hashing (see Index physical storage) to guarantee
    a fixed-length path segment regardless of key field sizes.
@@ -71,9 +73,11 @@ the `ACCESS_KEY_ID` value in the provision script. Access to the LakeFS admin po
 local port forwarding to one of the instances. The provision script prints connection instructions on success.
 
 A single LakeFS repo is used for all artifacts. All objects that participate in the same transactions must be in the same
-repo (see Dependencies and constraints). The Spark vacuum process removes commits that are not recent and not pinned by a
-tag or referenced as a branch head. This is the default recommended behavior; to preserve older commits, pin them with
-tags or adjust the retention window.
+repo (see Dependencies and constraints). In the future, repo-scoped artifacts may be supported (for example, isolating a
+specific tenant's artifacts into a dedicated repo) to reduce merge contention at scale. The Spark vacuum process removes commits that are not recent and not pinned by a
+tag or referenced as a branch head. The canonical branch head is always pinned. Ephemeral write branches that are not
+merged within 7 days are eligible for cleanup. To preserve older commits beyond the default retention window, pin them
+with tags or adjust the retention configuration.
 
 ### Conflict model
 
@@ -162,9 +166,10 @@ An index definition includes:
    must be included as an order field to make each row uniquely identifiable. In the MVP, artifact_id is required but
    does not need to be the final order field. This is a simplification of a general unique constraint on index rows.
 4. where clauses: predicates that determine whether a value should be indexed. Supported ops include ==, !=, >, <, >=,
-   <=. The LHS must be a field; the RHS can be a field or a constant. The != (NE) operator is useful for "field is
-   present" filtering: since missing fields evaluate to false for any comparison, a where clause like
-   `{ lhs: "foo" op: NE rhs_value: { ... } }` effectively gates the index on field presence.
+   <=, and IS_SET. The LHS must be a field; the RHS can be a field or a constant. The IS_SET operator checks whether an
+   `optional` field has explicit presence and requires no RHS; it is the preferred way to gate an index on field
+   presence. The != (NE) operator can also serve as a presence gate for `optional` fields (since missing fields evaluate
+   to false for any comparison), but IS_SET is unambiguous and does not depend on choosing a sentinel RHS value.
 5. unique: whether the index enforces at most one artifact ID per index key.
 
 #### Index merge semantics
@@ -182,11 +187,11 @@ uniqueness; uniqueness is enforced when changes are merged into the canonical br
 #### Index physical storage
 
 Index objects are stored under indexes/{key_prefix}/{key_hash}. The key_prefix is the uint64 IndexDefinition artifact ID
-encoded as base64 using the URL-safe alphabet of its big-endian uint64 bytes without padding. The key_hash is the
-SHA-256 digest of the deterministically encoded key bytes (see Index key encoding), rendered as base64 using the URL-safe
-alphabet without padding (always 43 characters). This content-addressed scheme produces a fixed-length path
-(indexes/ + key_prefix + / + key_hash = 63 bytes) regardless of key field sizes, satisfying the GCS 1024-byte object
-name limit (see Dependencies and constraints). Because the path is a hash, the actual key field values are stored in the
+encoded as base64 using the URL-safe alphabet of its big-endian uint64 bytes without padding (always 11 characters). The
+key_hash is the SHA-256 digest of the deterministically encoded key bytes (see Index key encoding), rendered as base64
+using the URL-safe alphabet without padding (always 43 characters). This content-addressed scheme produces a fixed-length
+path (indexes/ [8] + key_prefix [11] + / [1] + key_hash [43] = 63 bytes) regardless of key field sizes, satisfying the
+GCS 1024-byte object name limit (see Dependencies and constraints). Because the path is a hash, the actual key field values are stored in the
 index object payload (see Index object representation).
 
 #### Index key encoding
@@ -252,8 +257,10 @@ pagination, cursoring, filtering, or query-time predicate evaluation in the MVP.
    required; partial keys are rejected.
 
 **Execution semantics**
-1. The artifact layer locates the index object for (key_type, encoded key values) and reads its current state.
-1. Results are returned in the deterministic order defined by the index’s order fields. Ordering stability is defined
+1. The artifact layer locates the index object for (key_type, encoded key values) and reads its current state from the
+   canonical branch head by default. An optional version specifier (LakeFS commit ID) may be provided to read from a
+   specific point in time, supporting MVCC and consistent reads across multiple fetch calls.
+1. Results are returned in the deterministic order defined by the index's order fields. Ordering stability is defined
    by the index definition and does not vary per query.
 1. No query-time filters are applied. The query returns exactly the contents of the index object.
 
@@ -281,7 +288,9 @@ The response may also include the index object’s storage version ID for debugg
 
 When indexes become large, shard them by bucket and store a small manifest object that lists all bucket objects for an
 index key. Bucket naming should be deterministic (for example, a fixed-width prefix of a hash) so that reads can page
-over buckets predictably. The manifest is the canonical entrypoint for reads.
+over buckets predictably. The manifest is the canonical entrypoint for reads. The MVP index metadata must preserve a
+forward-compatible upgrade path so that individual indexes can be dynamically migrated from single-object to sharded
+layout without rewriting all index consumers.
 
 ### Object namespaces and paths
 
@@ -291,7 +300,10 @@ Object paths are a private implementation detail and must not be exposed to end-
    alphabet of its big-endian bytes without padding.
 2. `indexes/{key_prefix}/{key_hash}` — index objects. The key_hash is a SHA-256 content-addressed hash of the encoded
    key bytes; path encoding is defined in Index physical storage.
-3. `types/{type_name}/{version}` — type definitions. The `current` pointer, if used, is at `types/{type_name}/current`.
+3. `types/{type_id}/{version_id}` — type definitions. The `type_id` is the artifact ID representing the logical type and
+   `version_id` is the artifact ID representing the physical version, both encoded as base64url of big-endian uint64
+   bytes without padding (matching the artifact_id encoding). The `current` pointer, if used, is at
+   `types/{type_id}/current`.
 
 ### Artifacts
 
@@ -337,12 +349,20 @@ windows, pin commits/tags or configure retention accordingly. Hard delete/purge 
 
 #### Consistency and transaction semantics
 
-The Artifact Layer presents a single canonical branch to callers; branch and transaction mechanics are internal.
+The Artifact Layer presents a single canonical branch to callers; branch and transaction mechanics are internal. The
+internal strategy is branch-per-write: each Create/Update/Delete creates an ephemeral branch from the canonical branch
+head, commits artifact and index changes to that branch, and merges back into the canonical branch. LakeFS merges operate
+on metadata (not data copies), so merge operations are fast even at scale.
 
-1. Each Create/Update/Delete runs as an internal transaction and is merged before the call returns success.
+1. Each Create/Update/Delete runs as an internal transaction (ephemeral branch + merge) and is merged before the call
+   returns success.
 1. Read-after-write: once a write call succeeds, subsequent reads of that artifact key return the committed version and its storage version ID.
 1. Consistency is per artifact key plus its derived index updates; there are no multi-key or cross-artifact atomic transactions in the MVP.
 1. Concurrent writes may diverge internally; conflict ownership is defined in the Conflict retry policy.
+1. If a write fails mid-transaction (for example, index derivation rejects a NaN float key), the ephemeral branch is
+   abandoned without merging. There is no rollback; the branch simply never reaches the canonical branch. Abandoned
+   branches are cleaned up by the LakeFS Spark GC service, which removes branches that are not recent and not referenced
+   by tags or branch heads.
 1. Unique index enforcement is described in Index definition and Index merge semantics.
 
 #### Artifact envelope (optional)
@@ -379,7 +399,8 @@ Artifact types are stored in LakeFS so they are tied to the repo state. This ena
 (post-launch): a new branch can add an index, backfill it for existing data, and merge only when the index is consistent
 with all changes since the fork point. The same mechanism supports index removal and schema migrations.
 
-Type definitions are stored per version at `types/{type_name}/{version}`. Each version stores the descriptor set
+Type definitions are stored per version at `types/{type_id}/{version_id}`, where `type_id` and `version_id` are artifact
+IDs (see Object namespaces and paths for encoding). Each version stores the descriptor set
 alongside the original .proto source for inspection and re-compilation. Metadata such as index definitions, viewer
 endpoints, and LLM instructions are attached via `extend google.protobuf.MessageOptions`. The registry automatically
 imports option extensions when loading a type definition. See Protocol buffers as the type definition for details.
@@ -402,8 +423,9 @@ should be stored alongside the descriptor set for inspection and re-compilation,
 runtime artifact.
 
 Standard protobuf validation for registration is: compile with protoc, reject parse/descriptor errors, and only accept
-proto3 syntax for launch. Custom options are supported (see below) and must be retained at runtime so that metadata is
-available via descriptors.
+proto3 syntax for launch. Runtime compilation should enforce resource limits (maximum input file size, compilation
+timeout, nesting depth) to prevent resource exhaustion from malformed or adversarial schemas. Custom options are
+supported (see below) and must be retained at runtime so that metadata is available via descriptors.
 
 #### Custom options as metadata
 
@@ -423,7 +445,9 @@ defines one index for the enclosing message type.
 
 OrderDefinition.direction is required; the registry rejects index definitions with ORDER_BY_UNSPECIFIED.
 
-WhereClause.op is required; the registry rejects where clauses with OP_UNSPECIFIED.
+WhereClause.op is required; the registry rejects where clauses with OP_UNSPECIFIED. IS_SET requires no RHS (rhs must be
+unset); the registry rejects IS_SET clauses that specify an rhs_field or rhs_value. IS_SET is only valid on fields with
+explicit presence (`optional`); the registry rejects IS_SET on implicit-presence scalars.
 
 ```proto
 syntax = "proto3";
@@ -460,6 +484,7 @@ message WhereClause {
     GTE = 4;
     EQ = 5;
     NE = 6;
+    IS_SET = 7;
   }
   Op op = 2;
   oneof rhs {
@@ -546,8 +571,9 @@ message IndexValue_Example_by_time {
 }
 ```
 
-All `repeated` columns must have exactly `row_count` elements; the artifact layer validates `row_count` and rejects index
-payloads where column lengths differ or `row_count` does not match.
+All `repeated` columns must have exactly `row_count` elements. The artifact layer validates `row_count` at write time as a
+defensive check (since the artifact layer itself authors index objects, this guards against implementation bugs) and
+rejects index payloads where column lengths differ or `row_count` does not match.
 
 #### Field presence and indexing semantics
 
@@ -564,16 +590,18 @@ Index and predicate evaluation use protobuf field semantics:
    for key=10, key=30, and key=55. When the repeated field changes, entries are removed from index objects for values no
    longer present and added to index objects for new values. This mechanism also supports future virtual/computed fields
    (for example, deterministic keyword extraction) where a single artifact maps to multiple index keys. Repeated message
-   fields require a scalar sub-field to be referenced.
+   fields require a scalar sub-field to be referenced. For launch, at most one repeated field is permitted per index
+   definition (across key and order fields combined) to avoid cartesian-product fan-out during writes and merges. The
+   registry rejects index definitions that reference more than one repeated field.
 5. Map fields are not indexable for launch; model indexable map-like data as repeated entry messages.
 
 #### Type identity and versioning
 
 Types are identified by (type_name, type_version). Type versions are immutable once registered; any schema or metadata
-change is a new version. The canonical storage path for a version is types/{type_name}/{version}. Optionally, a small
-pointer object may be stored at types/{type_name}/current to identify the default version. If a CRUD request omits
-type_version, the artifact layer resolves to the current pointer at request time and returns the resolved version in the
-response for reproducibility.
+change is a new version. The canonical storage path for a version is `types/{type_id}/{version_id}` (see Object
+namespaces and paths). Optionally, a small pointer object may be stored at `types/{type_id}/current` to identify the
+default version. If a CRUD request omits type_version, the artifact layer resolves to the current pointer at request time
+and returns the resolved version in the response for reproducibility.
 
 ### Launch API surface (minimum)
 
@@ -625,7 +653,7 @@ The registry supports registering and resolving type versions:
 1. RegisterTypeVersion(type_name, version, schema, metadata)
 1. GetTypeVersion(type_name, version)
 1. ListTypeVersions(type_name)
-1. SetCurrentTypeVersion(type_name, version, expected_version_id) (optional)
+1. SetCurrentTypeVersion(type_name, version, expected_current_version) (optional)
 1. ResolveTypeVersion(type_name) -> version (current)
 
 RegisterTypeVersion performs protobuf schema validation and validates metadata (for example, index definitions reference
@@ -633,7 +661,10 @@ existing fields and supported types). For each new index definition, the registr
 (via standard ID allocation) and stores it as part of the registration transaction; the assigned artifact_id is returned
 in type metadata and used as key_prefix in index storage paths. When a prior version exists for the same type_name, the
 registry validates schema compatibility against the most recent version. Compatibility rules for launch:
-1. Existing fields must not be removed or have their type changed.
+1. Existing fields must not be removed or have their type changed. These rules apply recursively to nested message
+   types: removing or changing a field in a nested message is a breaking change. Adding fields to a `oneof` is
+   permitted; removing `oneof` fields or the `oneof` itself is a breaking change. Changing a field between `optional`,
+   `required`, and `repeated` is a type change.
 1. Existing index definitions must not be removed or modified. A modification is any change that would alter what is
    indexed or the shape of the index payload: changes to key fields, order fields, where clauses, or the unique flag.
    Such changes require a full index rebuild (backfill), which is post-launch.
@@ -643,8 +674,13 @@ registry validates schema compatibility against the most recent version. Compati
 1. Field number reassignment is rejected.
 
 The registry stores the protobuf schema (source or descriptor) plus any required imports and extensions so it can be
-loaded deterministically by the artifact layer. SetCurrentTypeVersion requires an expected prior version (etag) to
-prevent lost updates.
+loaded deterministically by the artifact layer. SetCurrentTypeVersion requires `expected_current_version` — the type
+version string that `current` currently points to — to prevent lost updates via compare-and-swap. This is distinct from
+the LakeFS storage version ID used for artifact test-and-set; it compares the logical type version pointer.
+
+RegisterTypeVersion and SetCurrentTypeVersion are separate operations. A registered version that is not yet current is a
+valid state — it can be used explicitly by callers that specify a type_version, but will not be resolved by default. Type
+registration and current-pointer updates are low-concurrency administrative operations; contention is not expected.
 
 ## App Layer
 
