@@ -11,8 +11,10 @@
 1. Deterministic index derivation and merges for unique and non-unique indexes; launch uses inline index storage and
    preserves metadata for future sharded layouts.
 1. Type registry with runtime registration of proto3 schemas, descriptor sets as canonical runtime artifacts, and
-   retained custom options including LLM instruction/description annotations at message and field levels.
-1. Type version resolution via an optional current pointer (see Type identity and versioning).
+   retained custom options including LLM instruction/description annotations at message and field levels. Types, type
+   versions, and index definitions are first-class artifacts with their own indexes (see Built-in types and
+   bootstrapping).
+1. Type version resolution via an optional current pointer on TypeDefinition (see Type identity and versioning).
 1. Artifact server API hides branches and transaction mechanics; callers only see conflicts and resolved storage version
    IDs.
 
@@ -125,7 +127,9 @@ When retries are aborted or exhausted, return a structured conflict response con
 ## Artifact Layer
 
 This layer builds on the Storage Layer and provides shared artifact functionality: artifact schemas and types, ID
-allocation, indexes, index conflict resolution, and type metadata. Application-specific logic and permissions live in the
+allocation, indexes, index conflict resolution, and type metadata. The type system is self-describing: TypeDefinition,
+TypeVersionDefinition, and IndexDefinition are all stored as first-class artifacts with their own indexes, bootstrapped
+via a genesis commit (see Built-in types and bootstrapping). Application-specific logic and permissions live in the
 App Layer.
 
 ### Necessary features for launch
@@ -133,6 +137,7 @@ App Layer.
 1. Integration with LakeFS
 1. Indexes for looking up artifacts (and ability to resolve conflicts)
 1. Artifact Type registry (with version and schema support)
+1. Genesis bootstrap for built-in types and indexes
 
 ### Indexes for looking up artifacts
 
@@ -151,9 +156,10 @@ back the updated index object(s).
 Index definitions are expressed as protobuf messages (IndexDefinition) and attached to artifact types via a
 message-level custom option (indexes). The IndexDefinition schema describes the fields below. Each IndexDefinition is
 stored as an artifact (of the built-in IndexDefinition type) and receives its own artifact_id via the standard ID
-allocation path during type registration. That artifact_id is used as the key_prefix in index storage paths and is
-returned in type metadata. This means IndexDefinition artifacts are created as part of the RegisterTypeVersion
-transaction before any user artifacts of that type exist.
+allocation path during type registration. That artifact_id is used as the key_prefix in index storage paths. Index
+definition artifact_ids are resolved at runtime by extracting key_type values from the TypeVersionDefinition's descriptor
+set custom options and looking them up via the `index_key_type_unique` index. IndexDefinition artifacts are created as
+part of the RegisterTypeVersion transaction before any user artifacts of that type exist.
 
 An index definition includes:
 1. key_type: the name of the index and the identifier passed to fetch index calls. key_type must be globally unique
@@ -301,14 +307,12 @@ layout without rewriting all index consumers.
 
 Object paths are a private implementation detail and must not be exposed to end-users. The top-level namespaces are:
 
-1. `artifacts/{artifact_id}` — artifact payloads. The artifact_id is a uint64 encoded as base64 using the URL-safe
-   alphabet of its big-endian bytes without padding.
+1. `artifacts/{artifact_id}` — artifact payloads, including built-in definition artifacts (TypeDefinition,
+   TypeVersionDefinition, IndexDefinition). The artifact_id is a uint64 encoded as base64 using the URL-safe alphabet of
+   its big-endian bytes without padding. Type definitions, type versions, and index definitions are all stored in this
+   namespace and are located via indexes (see Built-in types and bootstrap indexes).
 2. `indexes/{key_prefix}/{key_hash}` — index objects. The key_hash is a SHA-256 content-addressed hash of the encoded
    key bytes; path encoding is defined in Index physical storage.
-3. `types/{type_id}/{version_id}` — type definitions. The `type_id` is the artifact ID representing the logical type and
-   `version_id` is the artifact ID representing the physical version, both encoded as base64url of big-endian uint64
-   bytes without padding (matching the artifact_id encoding). The `current` pointer, if used, is at
-   `types/{type_id}/current`.
 
 ### Artifacts
 
@@ -318,20 +322,26 @@ merge logic per artifact type.
 
 #### Artifact contract (minimum)
 
-Artifacts are defined by (artifact_id, type_name, type_version, payload).
+Artifacts are defined by (artifact_id, type_name, version_id, payload).
 1. artifact_id: opaque uint64 allocated by a separate ID allocation service.
-2. type_name/type_version: must resolve to a registered type version in the registry.
-3. payload: serialized protobuf message (binary wire format) for the resolved type/version.
+2. type_name: the fully-qualified proto message name. Must resolve to a registered TypeDefinition artifact via the
+   `type_name_unique` index.
+3. version_id: optional uint64 artifact_id of a TypeVersionDefinition. If omitted, the artifact layer resolves to the
+   TypeDefinition's current_version_id (see Type identity and versioning). The resolved TypeVersionDefinition must have a
+   type_id matching the TypeDefinition's artifact_id.
+4. payload: serialized protobuf message (binary wire format) for the resolved type version.
 
 The artifact_id is metadata and does not need to be duplicated in the payload. If a type schema includes an id field, the
 artifact layer should validate that it matches the artifact_id.
 
-On create/update, the artifact layer validates the payload using standard proto3 structural validation for the declared
-type/version and validates any type metadata constraints (for example, indexes defined in metadata). Artifact validation
-is limited to proto3 structural checks; semantic or business validation is out of scope for launch. Responses return the
-resolved type/version and the storage version ID so callers can perform safe updates. Updates and deletes require an
-expected storage version ID to avoid lost updates. Reads return payload bytes plus the type name/version and the storage
-version ID. Partial updates are out of scope for launch.
+On create/update, the artifact layer checks the TypeDefinition's `immutable` flag; if true, UpdateArtifact and
+DeleteArtifact are rejected. The artifact layer validates the payload using standard proto3 structural validation against
+the message identified by type_name in the TypeVersionDefinition's descriptor set, and derives index entries from the
+index declarations in the descriptor set's custom options. Artifact validation is limited to proto3 structural checks;
+semantic or business validation is out of scope for launch. Responses return the resolved version_id (the
+TypeVersionDefinition artifact_id) and the storage version ID so callers can perform safe updates. Updates and deletes
+require an expected storage version ID to avoid lost updates. Reads return payload bytes plus type_name, version_id, and
+storage version ID. Partial updates are out of scope for launch.
 
 The artifact layer stores payload bytes as provided and does not reserialize them. This preserves unknown fields and
 avoids any reliance on canonical protobuf binary encodings. Text/JSON formats are not used for storage.
@@ -388,51 +398,102 @@ type schema includes an id field, it must match the artifact_id.
 
 ### Types (artifact type registry)
 
-#### Type taxonomy and bootstrapping
+#### Built-in types and bootstrapping
 
-In this document, "type" applies to both artifact payloads and definition objects:
-1. Artifact types: schemas for artifact payloads.
-2. Definition types: schemas for definition objects (artifact definitions and index definitions).
-3. TypeDefinition: the schema for type definitions themselves.
+The artifact system uses three built-in artifact types to describe itself. All definition objects are first-class
+artifacts stored in the `artifacts/` namespace and queryable via standard indexes. Their schemas are compiled into the
+artifact layer binary but are also stored as artifacts so the system is fully self-describing.
 
-Definition objects are represented as protobuf messages and are usually embedded as type metadata via custom options. If
-we store standalone definition objects as artifacts (for example, for migrations), their payloads conform to their
-definition type (ArtifactDefinition, IndexDefinition, etc.). TypeDefinition is a built-in meta-type used to describe
-these definition types; it is bootstrapped in the artifact layer and treated as immutable.
+1. **TypeDefinition**: represents a logical artifact type. One TypeDefinition artifact exists per type_name. Contains the
+   type_name (which is the fully-qualified proto message name) and an optional current_version_id pointer to the default
+   TypeVersionDefinition. Also carries an `immutable` flag: when true, UpdateArtifact and DeleteArtifact are rejected for
+   artifacts of this type (Create is still permitted through the registry API).
+2. **TypeVersionDefinition**: represents a specific version of a type. Contains the type_id (artifact_id of the parent
+   TypeDefinition), the compiled FileDescriptorSet, and the original .proto source. Multiple TypeVersionDefinition
+   artifacts may exist for a single TypeDefinition. TypeVersionDefinition is immutable (its TypeDefinition has
+   `immutable = true`); once registered, a version cannot be modified or deleted. Metadata such as index definitions,
+   actions, viewer endpoints, and LLM instructions are attached as custom options within the descriptor set and are not
+   denormalized onto the TypeVersionDefinition message (see Custom options as metadata).
+3. **IndexDefinition**: represents a single index. Contains the key_type, key fields, order fields, optional where
+   clause, and unique flag. IndexDefinition is immutable. Each IndexDefinition artifact receives an artifact_id that is
+   used as the key_prefix in index storage paths (see Index physical storage).
 
-IndexDefinition declares a self-referential unique index (`index_key_type_unique`) on its own `key_type` field. This
-means the IndexDefinition type's own index must exist before it can enforce uniqueness on subsequently registered index
-definitions. During system bootstrapping, the artifact layer creates the `index_key_type_unique` IndexDefinition artifact
-as part of initialization — before any user-defined types are registered. This bootstrap artifact is self-referential: it
-is the first entry in its own index. Subsequent IndexDefinition artifacts created during type registration then have their
-`key_type` uniqueness enforced by the standard unique index merge path, with no special-case logic required.
+All types (including user-defined artifact types) are stored in LakeFS so they are tied to the repo state. This enables
+migration transactions (post-launch): a new branch can add an index, backfill it for existing data, and merge only when
+the index is consistent with all changes since the fork point. The same mechanism supports index removal and schema
+migrations.
 
-Artifact types are stored in LakeFS so they are tied to the repo state. This enables migration transactions
-(post-launch): a new branch can add an index, backfill it for existing data, and merge only when the index is consistent
-with all changes since the fork point. The same mechanism supports index removal and schema migrations.
+#### Bootstrap indexes
 
-Type definitions are stored per version at `types/{type_id}/{version_id}`, where `type_id` and `version_id` are artifact
-IDs (see Object namespaces and paths for encoding). Each version stores the descriptor set
-alongside the original .proto source for inspection and re-compilation. Metadata such as index definitions, viewer
-endpoints, and LLM instructions are attached via `extend google.protobuf.MessageOptions`. The registry automatically
-imports option extensions when loading a type definition. See Protocol buffers as the type definition for details.
+The built-in types declare the following indexes on themselves:
 
-An artifact definition includes the following metadata:
-1. Schema: defined by the protobuf message itself.
-2. Indexes: a repeated MessageOption listing index definitions; a FieldOption for single-field indexes may be added later.
-3. Actions: a MessageOption defining a dictionary of actions available on artifacts of this type. Stored as metadata at
+| Index key_type | On type | Key | Unique | Purpose |
+|----------------|---------|-----|--------|---------|
+| `index_key_type_unique` | IndexDefinition | `[key_type]` | yes | Enforces globally unique index names; enables key_type to IndexDefinition artifact lookup |
+| `type_name_unique` | TypeDefinition | `[type_name]` | yes | Enforces one TypeDefinition per type_name; enables type resolution |
+| `all_types` | TypeDefinition | `[]` | no | Lists all registered type artifact_ids |
+| `type_versions_by_type` | TypeVersionDefinition | `[type_id]` | no | Lists all version artifact_ids for a type |
+| `all_index_definitions` | IndexDefinition | `[]` | no | Lists all registered index definition artifact_ids |
+
+These indexes are created during genesis bootstrapping and use the same storage and merge mechanics as all other indexes.
+
+#### Genesis bootstrap
+
+The artifact layer initializes the system with a single atomic genesis commit that creates all built-in type artifacts,
+index definition artifacts, and their derived index entries. The genesis transaction does not use the normal
+RegisterTypeVersion code path because circular dependencies between the built-in types make the standard validation and
+derivation pipeline impossible at initialization time. Instead, the built-in artifacts and indexes are authored directly
+with pre-allocated IDs. This is analogous to how a database bootstraps its own catalog tables.
+
+The genesis commit creates artifacts in the following dependency order:
+
+1. **IndexDefinition type** (TypeDefinition + TypeVersionDefinition artifacts): must be first because every other type
+   declares indexes, and creating index definitions requires the IndexDefinition type to exist.
+2. **`index_key_type_unique`** (IndexDefinition artifact): self-referential — this is the first IndexDefinition artifact
+   and the first entry in its own index. All subsequently created IndexDefinition artifacts have their key_type uniqueness
+   enforced by this index.
+3. **`all_index_definitions`** (IndexDefinition artifact): the global index for IndexDefinition artifacts; enforced by
+   step 2.
+4. **TypeDefinition type** (TypeDefinition + TypeVersionDefinition artifacts): declares `type_name_unique` and
+   `all_types` indexes on itself.
+5. **`type_name_unique`** and **`all_types`** (IndexDefinition artifacts): created for the TypeDefinition type's declared
+   indexes; key_type uniqueness enforced by step 2.
+6. **TypeVersionDefinition type** (TypeDefinition + TypeVersionDefinition artifacts): declares `type_versions_by_type`
+   index on itself.
+7. **`type_versions_by_type`** (IndexDefinition artifact): created for the TypeVersionDefinition type's declared index;
+   key_type uniqueness enforced by step 2.
+8. **All derived index entries**: populate every bootstrap index with entries for all artifacts created above.
+9. **Atomic commit**: the entire genesis state is committed as a single transaction to the canonical branch.
+
+After the genesis commit, the system is self-describing and all subsequent operations (including user type registrations)
+use the standard RegisterTypeVersion code path. The genesis commit is idempotent — if the canonical branch already
+contains the genesis state, initialization is a no-op.
+
+#### Type metadata via custom options
+
+Type metadata is expressed as custom options on the proto message and stored within the TypeVersionDefinition's descriptor
+set. The artifact layer does not denormalize metadata onto the TypeVersionDefinition message; it reads metadata from the
+descriptor set at runtime. An artifact type's metadata includes:
+1. Indexes: a repeated MessageOption (`indexes`) listing index definitions. See Index options schema.
+2. Actions: a MessageOption defining a dictionary of actions available on artifacts of this type. Stored as metadata at
    registration; interpretation is an App Layer concern and is not consumed by the artifact layer at launch.
-4. Viewer: a MessageOption defining the default viewer endpoint. Same as Actions — stored but not interpreted at launch.
-5. Custom Instruction: a MessageOption defining LLM instructions for the type.
+3. Viewer: a MessageOption defining the default viewer endpoint. Same as Actions — stored but not interpreted at launch.
+4. Custom Instruction: a MessageOption defining LLM instructions for the type.
+5. A FieldOption for single-field indexes may be added later.
 
 #### Protocol buffers as the type definition
 
-Protocol buffers are the canonical representation for types. A type version stores a compiled
-google.protobuf.FileDescriptorSet that includes the defining .proto and all transitive imports (including option
-extensions). The descriptor set is authoritative for parsing, validation, and index derivation. The registry must accept
-new .proto definitions at runtime and compile them into a descriptor set on registration. The original .proto source
-should be stored alongside the descriptor set for inspection and re-compilation, but the descriptor set is the required
-runtime artifact.
+Protocol buffers are the canonical representation for types. Each TypeVersionDefinition artifact stores a compiled
+google.protobuf.FileDescriptorSet and the original .proto source. The descriptor set includes the defining .proto and
+all transitive imports (excluding system protos, which are injected at load time — see Custom options as metadata). The
+descriptor set is authoritative for parsing, validation, and index derivation. The registry must accept new .proto
+definitions at runtime and compile them into a descriptor set on registration. The original .proto source is stored
+alongside the descriptor set for inspection and re-compilation, but the descriptor set is the required runtime artifact.
+
+The type_name on the parent TypeDefinition is the fully-qualified proto message name (for example,
+`mypackage.DataFrameArtifact` or simply `DataFrameArtifact` if no package is declared). The registry uses type_name to
+locate the artifact payload message within the descriptor set. This means the external API identifier for a type is the
+same as the proto message name, ensuring a single unambiguous mapping between types and their schemas.
 
 Standard protobuf validation for registration is: compile with protoc, reject parse/descriptor errors, and only accept
 proto3 syntax for launch. Runtime compilation should enforce resource limits (maximum input file size, compilation
@@ -449,6 +510,12 @@ options, which aligns with our needs.
 
 Custom options must use runtime retention (not source-only retention) so they appear in the descriptor set. The registry
 loads the descriptor set with the option extensions so the artifact layer can read metadata deterministically.
+
+The artifact system's own proto definitions (IndexDefinition, OrderDefinition, WhereClause, the `indexes` message
+extension, and other system messages) are injected as well-known imports at load time rather than stored in each
+TypeVersionDefinition's descriptor set. This keeps descriptor sets smaller and ensures that system proto changes do not
+require re-registering all existing types. During compilation, the registry provides these system protos as available
+imports alongside the standard google.protobuf imports.
 
 #### Index options schema (example)
 
@@ -535,6 +602,7 @@ message WhereClause {
 
 message IndexDefinition {
   option (indexes) = { key_type: "index_key_type_unique" key: ["key_type"] order: { field: "artifact_id" direction: ASCENDING } unique: true };
+  option (indexes) = { key_type: "all_index_definitions" key: [] order: { field: "artifact_id" direction: ASCENDING } };
 
   string key_type = 1;
   repeated string key = 2;
@@ -546,6 +614,29 @@ message IndexDefinition {
 extend google.protobuf.MessageOptions {
   repeated IndexDefinition indexes = 50002;
 }
+
+// Built-in types: TypeDefinition and TypeVersionDefinition are stored as artifacts
+// and use the same index mechanics as all other artifact types.
+
+message TypeDefinition {
+  option (indexes) = { key_type: "type_name_unique" key: ["type_name"] order: { field: "artifact_id" direction: ASCENDING } unique: true };
+  option (indexes) = { key_type: "all_types" key: [] order: { field: "artifact_id" direction: ASCENDING } };
+
+  string type_name = 1;
+  optional uint64 current_version_id = 2;
+  bool immutable = 3;
+}
+
+message TypeVersionDefinition {
+  option (indexes) = { key_type: "type_versions_by_type" key: ["type_id"] order: { field: "artifact_id" direction: ASCENDING } };
+
+  uint64 type_id = 1;
+  google.protobuf.FileDescriptorSet descriptor_set = 2;
+  string proto_source = 3;
+}
+
+// Example user-defined artifact type. The type_name for this type is "DataFrameArtifact"
+// (the fully-qualified proto message name).
 
 message DataFrameArtifact {
   option (indexes) = { key_type: "by_owner" key: ["created_by"] order: { field: "artifact_id" direction: ASCENDING } };
@@ -639,11 +730,21 @@ Index and predicate evaluation use protobuf field semantics:
 
 #### Type identity and versioning
 
-Types are identified by (type_name, type_version). Type versions are immutable once registered; any schema or metadata
-change is a new version. The canonical storage path for a version is `types/{type_id}/{version_id}` (see Object
-namespaces and paths). Optionally, a small pointer object may be stored at `types/{type_id}/current` to identify the
-default version. If a CRUD request omits type_version, the artifact layer resolves to the current pointer at request time
-and returns the resolved version in the response for reproducibility.
+A logical type is represented by a TypeDefinition artifact identified by type_name (the fully-qualified proto message
+name). Type versions are represented by TypeVersionDefinition artifacts, each linked to its parent TypeDefinition via the
+type_id field. Type versions are immutable once registered; any schema or metadata change creates a new
+TypeVersionDefinition artifact.
+
+The TypeDefinition artifact contains an optional `current_version_id` field pointing to the default
+TypeVersionDefinition artifact_id. If a CRUD request omits the version_id, the artifact layer resolves to the
+current_version_id at request time and returns the resolved version artifact_id in the response for reproducibility. A
+TypeDefinition with no current_version_id set is a valid state — versions can be used explicitly by callers that specify
+a version_id, but no default resolution is available.
+
+Versions are identified by their artifact_id (a uint64), not by a human-readable version string. The
+`type_versions_by_type` index lists all version artifact_ids for a given type_id in creation order (ascending
+artifact_id). Callers that need a specific non-current version must reference it by artifact_id, which is returned at
+registration time.
 
 ### Launch API surface (minimum)
 
@@ -654,21 +755,23 @@ conflict responses. Client-to-app-layer transport remains application-specific a
 #### Artifact CRUD API
 
 Operations (gRPC service-to-service; client-to-app transport is application-specific):
-1. CreateArtifact(type_name, type_version?, payload)
+1. CreateArtifact(type_name, version_id?, payload)
 2. GetArtifact(artifact_id)
 3. BatchGetArtifacts(artifact_ids)
-4. UpdateArtifact(artifact_id, expected_version_id, type_name, type_version?, payload)
-5. DeleteArtifact(artifact_id, expected_version_id)
+4. UpdateArtifact(artifact_id, expected_storage_version_id, type_name, version_id?, payload)
+5. DeleteArtifact(artifact_id, expected_storage_version_id)
 
 Request/response expectations:
 1. artifact_id is allocated by the artifact layer via a separate ID service and returned in Create responses.
-1. type_version is optional for Create/Update; resolution behavior is defined in Type identity and versioning.
-1. Update/Delete require expected storage version ID (test-and-set per Artifact contract); mismatches return a
-   VERSION_MISMATCH conflict.
-1. Reads return payload bytes plus type_name/type_version and storage version ID.
+1. version_id is an optional uint64 (TypeVersionDefinition artifact_id) for Create/Update; resolution behavior is defined
+   in Type identity and versioning. If omitted, the artifact layer resolves to the TypeDefinition's current_version_id.
+1. Update/Delete require an expected storage version ID (test-and-set per Artifact contract); mismatches return a
+   VERSION_MISMATCH conflict. Update/Delete are rejected if the TypeDefinition's `immutable` flag is true.
+1. Reads return payload bytes plus type_name, version_id (the resolved TypeVersionDefinition artifact_id), and storage
+   version ID.
 1. BatchGetArtifacts returns results in the same order as the input IDs using explicit per-id results (for example, a
    `oneof { artifact, not_found }` wrapper) so missing or tombstoned artifacts preserve positional correlation.
-1. Create/Update/Delete return the resolved type_version (when applicable) and the new storage version ID.
+1. Create/Update/Delete return the resolved version_id and the new storage version ID.
 1. Delete and tombstone behavior is defined in Delete semantics and retention.
 
 Conflict/error behavior: conflict types, response payloads, and auto-resolution eligibility are defined in the Conflict
@@ -691,18 +794,29 @@ Response:
 
 #### Type registry API
 
-The registry supports registering and resolving type versions:
-1. RegisterTypeVersion(type_name, version, schema, metadata)
-1. GetTypeVersion(type_name, version)
-1. ListTypeVersions(type_name)
-1. SetCurrentTypeVersion(type_name, version, expected_current_version) (optional)
-1. ResolveTypeVersion(type_name) -> version (current)
+The registry supports registering and resolving type versions. All registry operations create or modify TypeDefinition,
+TypeVersionDefinition, and IndexDefinition artifacts via the standard artifact storage path, but enforce additional
+validation rules that the generic CRUD API does not.
 
-RegisterTypeVersion performs protobuf schema validation and validates metadata (for example, index definitions reference
-existing fields and supported types). For each new index definition, the registry creates an IndexDefinition artifact
-(via standard ID allocation) and stores it as part of the registration transaction; the assigned artifact_id is returned
-in type metadata and used as key_prefix in index storage paths. When a prior version exists for the same type_name, the
-registry validates schema compatibility against the most recent version. Compatibility rules for launch:
+1. RegisterTypeVersion(type_name, proto_source) -> version_id
+1. GetTypeVersion(version_id) -> TypeVersionDefinition
+1. ListTypeVersions(type_name) -> repeated version_id
+1. SetCurrentTypeVersion(type_name, version_id, expected_version_id)
+1. ResolveTypeVersion(type_name) -> version_id (current)
+
+**RegisterTypeVersion** compiles the .proto source into a FileDescriptorSet (injecting system protos as well-known
+imports), locates the message identified by type_name in the descriptor set, and validates the schema. It then:
+1. Looks up the TypeDefinition via the `type_name_unique` index. If not found, creates a new TypeDefinition artifact
+   (`type_name`, `current_version_id` unset, `immutable = false` for user types).
+2. If a prior TypeVersionDefinition exists for this type (checked via `type_versions_by_type` index), validates schema
+   compatibility against the most recent version.
+3. Extracts index declarations from the message's custom options. For each key_type, checks the `index_key_type_unique`
+   index: if an IndexDefinition already exists, validates compatibility; if not, creates a new IndexDefinition artifact.
+4. Creates a TypeVersionDefinition artifact (type_id = TypeDefinition artifact_id, descriptor_set, proto_source).
+5. Derives all index entries for the new artifacts and commits atomically.
+6. Returns the new TypeVersionDefinition artifact_id (the version_id).
+
+Schema compatibility rules for launch:
 1. Existing fields must not be removed or have their type changed. These rules apply recursively to nested message
    types: removing or changing a field in a nested message is a breaking change. Adding fields to a `oneof` is
    permitted; removing `oneof` fields or the `oneof` itself is a breaking change. Changing a field between `optional`,
@@ -715,13 +829,16 @@ registry validates schema compatibility against the most recent version. Compati
    the subset of artifacts it claims to cover.
 1. Field number reassignment is rejected.
 
-The registry stores the protobuf schema (source or descriptor) plus any required imports and extensions so it can be
-loaded deterministically by the artifact layer. SetCurrentTypeVersion requires `expected_current_version` — the type
-version string that `current` currently points to — to prevent lost updates via compare-and-swap. This is distinct from
-the LakeFS storage version ID used for artifact test-and-set; it compares the logical type version pointer.
+**ListTypeVersions** fetches the `type_versions_by_type` index for the TypeDefinition's artifact_id, returning version
+artifact_ids in creation order.
+
+**SetCurrentTypeVersion** updates the TypeDefinition artifact's `current_version_id` field via UpdateArtifact with
+test-and-set semantics. The `expected_version_id` is the current_version_id that the caller expects (use 0 or absent for
+the initial set). The registry validates that the target version_id references a TypeVersionDefinition whose type_id
+matches the TypeDefinition's artifact_id before applying the update.
 
 RegisterTypeVersion and SetCurrentTypeVersion are separate operations. A registered version that is not yet current is a
-valid state — it can be used explicitly by callers that specify a type_version, but will not be resolved by default. Type
+valid state — it can be used explicitly by callers that specify a version_id, but will not be resolved by default. Type
 registration and current-pointer updates are low-concurrency administrative operations; contention is not expected.
 
 ## App Layer
