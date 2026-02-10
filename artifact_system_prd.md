@@ -106,11 +106,13 @@ limit is reached. The retry policy is defined below.
 
 **Conflict response payload**
 When retries are aborted or exhausted, return a structured conflict response containing:
-1. conflict_type: one of {INDEX_CONFLICT, PAYLOAD_CONFLICT}.
+1. conflict_type: one of {INDEX_CONFLICT, PAYLOAD_CONFLICT, VERSION_MISMATCH}.
 1. retryable: boolean indicating whether the server would retry (false when exhausted or payload conflict).
 1. attempts: number of attempts performed.
-1. artifacts/indexes involved: artifact_id for payload conflicts; index key (key_type + encoded key) for index conflicts.
-1. version_ids: base, ours, theirs storage version IDs when available.
+1. artifacts/indexes involved: artifact_id for payload conflicts; index key (key_type + encoded key) for index conflicts;
+   artifact_id for version mismatches.
+1. version_ids: base, ours, theirs storage version IDs when available; for VERSION_MISMATCH include expected_version_id
+   and current_version_id.
 
 **Exhaustion behavior**
 1. If the retry limit is reached while resolving index conflicts, return the conflict response with retryable=false.
@@ -134,8 +136,7 @@ Concepts such as tags and groups are not separate primitives; they are implement
 index is a non-unique index keyed by tag value). The specific fields indexed depend on the artifact type, but the
 underlying index storage format is uniform. Index objects are subject to merge conflicts because
 any concurrent artifact write can update the same index object. Conflict resolution uses a three-way diff between the
-merge base and both heads (see Conflict model). Empty indexes are tombstoned so that merges can detect the deletion (see
-Delete semantics and retention).
+merge base and both heads (see Conflict model).
 
 Indexes are derived from artifacts by artifact layer logic and are never manually set. They only conflict on merge.
 The commit workflow reads the latest index state, applies adds/removes derived from the artifact changes, and writes
@@ -151,13 +152,15 @@ returned in type metadata. This means IndexDefinition artifacts are created as p
 transaction before any user artifacts of that type exist.
 
 An index definition includes:
-1. key_type: the name of the value and the identifier passed to fetch index calls.
+1. key_type: the name of the index and the identifier passed to fetch index calls. key_type must be globally unique
+   across all registered index definitions; this uniqueness constraint is enforced by the registry (not encoded in
+   proto3).
 2. key: the fields that partition the index. Different key values on the same index type map to different index
    objects.
 3. order fields: fields that determine the sort order. Each order field must declare a direction (ASC or DESC) based on
    the field type's sort order. The special field name artifact_id refers to the artifact ID (not a payload field) and
-   must be included as the final order field to guarantee uniqueness. This is a simplification of a general unique
-   constraint on index rows.
+   must be included as an order field to make each row uniquely identifiable. In the MVP, artifact_id is required but
+   does not need to be the final order field. This is a simplification of a general unique constraint on index rows.
 4. where clauses: predicates that determine whether a value should be indexed. Supported ops include ==, !=, >, <, >=,
    <=. The LHS must be a field; the RHS can be a field or a constant. The != (NE) operator is useful for "field is
    present" filtering: since missing fields evaluate to false for any comparison, a where clause like
@@ -170,9 +173,11 @@ When a merge reports a conflicting index object, we perform a three-way merge us
 index object is treated as a set of entries keyed by artifact ID with associated order field values. For each branch we
 compute adds (head minus base) and removes (base minus head). If the same artifact ID exists in both but with different
 order values, treat that as a remove and an add. We apply all removes to the base, then apply all adds, de-duplicate by
-artifact ID, and re-sort by the configured order fields (tie-breaker: artifact ID). This yields a deterministic result
-and is idempotent across retries. If a unique index (see Index definition) ends up with more than one item, the merge
-fails and the conflict is returned to the calling service for resolution.
+artifact ID, and re-sort by the configured order fields. This yields a
+deterministic result and is idempotent across retries. If a unique index (see Index definition) ends up with more than
+one item, the merge
+fails and the conflict is returned to the calling service for resolution. Unmerged branches may temporarily violate
+uniqueness; uniqueness is enforced when changes are merged into the canonical branch.
 
 #### Index physical storage
 
@@ -187,9 +192,10 @@ index object payload (see Index object representation).
 #### Index key encoding
 
 Index keys use a deterministic binary encoding independent of protobuf wire encoding. The encoded bytes are the
-pre-image for the SHA-256 hash used in the index object path (see Index physical storage). Deterministic encoding is
-critical: different encodings of the same logical key would produce different hashes and thus different paths, creating
-orphaned index objects.
+pre-image for the SHA-256 hash used in the index object path (see Index physical storage). This encoding is the only
+source of truth for key identity in content-addressed paths; we do not rely on the protobuf serialization of stored
+index objects to represent logical keys. Deterministic encoding is critical: different encodings of the same logical key
+would produce different hashes and thus different paths, creating orphaned index objects.
 
 Key field values are encoded as little-endian to enable zero-copy access on common hosts. This differs from the
 big-endian encoding used for ID-based path segments (artifact_id in paths, key_prefix in index paths), which prioritize
@@ -199,7 +205,8 @@ Index value payloads (order-field columns) are stored as typed protobuf fields a
 not the custom binary encoding defined here; see Index object representation for details.
 
 Ordering comparisons in index merge logic and sorted operations use the field's native type semantics (numeric order for
-numbers, lexicographic for strings/bytes) on decoded protobuf values. All comparisons are decode-then-compare.
+numbers, lexicographic for strings/bytes) on decoded protobuf values. All comparisons are decode-then-compare; ordering
+is independent of the key hash encoding.
 
 **Key encoding rules**
 
@@ -228,12 +235,11 @@ Index objects must be encoded deterministically to make diffs and merges reliabl
 `Index_*` proto3 message, which contains the key fields (via an embedded `IndexKey_*` sub-message) and the value fields
 (via an embedded `IndexValue_*` sub-message with one `repeated` typed field per order column, forming parallel arrays in
 columnar layout). Key fields are always stored in the payload because index object paths use a content-addressed hash and
-the key cannot be reconstructed from the path (see Index physical storage). Rows are ordered by the order fields, which
-must include artifact_id as the final field. All columns have the same length, equal to the row count. Using typed proto
+the key cannot be reconstructed from the path (see Index physical storage). Rows are ordered by the order fields. All
+columns have the same length, equal to the row count. Using typed proto
 fields (rather than raw bytes) means serialization, deserialization, and type safety are handled by the protobuf runtime;
 no custom binary codec is needed for the stored payload. Deterministic encoding is achieved by using protobuf
-deterministic serialization (sorted map keys, fixed field order). Empty indexes are tombstoned so that merges can detect
-the deletion (see Delete semantics and retention).
+deterministic serialization (sorted map keys, fixed field order).
 
 #### Index fetch behavior (MVP)
 
@@ -261,9 +267,10 @@ The response payload is the concrete, generated index message for the queried in
 index-specific protobuf schema.
 
 1. The key message corresponds to the index key fields.
-1. The value message contains typed `repeated` fields for each order column defined by the index (ending with
-   artifact_id); see Index object schema for the generated layout.
-1. Artifact payloads are embedded or referenced according to the index value schema defined for that index.
+1. The value message contains typed `repeated` fields for each order column defined by the index, in the declared order;
+   see Index object schema for the generated layout. The MVP does not implicitly embed artifact payloads in index values
+   unless the index schema explicitly defines such fields.
+1. Empty or tombstoned indexes return an index message with zero entries.
 
 The response may also include the index object’s storage version ID for debugging or consistency checks.
 
@@ -320,8 +327,9 @@ the storage version ID, and returns that version to the caller.
 1. Empty payloads are reserved for tombstones. The artifact layer rejects zero-length payloads for live artifacts; if a
    type needs to represent an "empty" value, include a sentinel field or wrap it in an envelope message.
 1. Index handling: deleting an artifact removes all derived index entries for that artifact ID (as if the artifact no
-   longer matches any where clauses). Unique indexes free the slot. If an index becomes empty, it is tombstoned (written
-   as an empty payload) so that merges can detect the deletion.
+   longer matches any where clauses). Unique indexes free the slot. If an index becomes empty, it is tombstoned by
+   storing an index object with an empty value portion (row_count = 0 and no value entries) so merges can detect
+   deletions.
 1. Reads treat tombstones as not found for standard Get. There is no public restore or audit API in the MVP; to
    "undelete" a caller writes a new payload with the tombstone's expected version ID, creating a new version in history.
 1. Retention: history is preserved as LakeFS commits but is subject to LakeFS GC/vacuum. To guarantee audit/restore
@@ -371,7 +379,8 @@ Artifact types are stored in LakeFS so they are tied to the repo state. This ena
 (post-launch): a new branch can add an index, backfill it for existing data, and merge only when the index is consistent
 with all changes since the fork point. The same mechanism supports index removal and schema migrations.
 
-Type definitions are stored as protobuf files at `types/{type_name}`. Metadata such as index definitions, viewer
+Type definitions are stored per version at `types/{type_name}/{version}`. Each version stores the descriptor set
+alongside the original .proto source for inspection and re-compilation. Metadata such as index definitions, viewer
 endpoints, and LLM instructions are attached via `extend google.protobuf.MessageOptions`. The registry automatically
 imports option extensions when loading a type definition. See Protocol buffers as the type definition for details.
 
@@ -525,8 +534,8 @@ message Index_DataFrameArtifact_by_repo_created_by {
 }
 ```
 
-If an index has additional order fields, include one `repeated` typed column per order field in order (ending with
-artifact_id). For example, an index with `order: [{ field: "created_at" }, { field: "artifact_id" }]` on a message where
+If an index has additional order fields, include one `repeated` typed column per order field in order. For example, an
+index with `order: [{ field: "created_at" }, { field: "artifact_id" }]` on a message where
 `created_at` is `int64` would generate:
 
 ```proto
@@ -537,8 +546,8 @@ message IndexValue_Example_by_time {
 }
 ```
 
-All `repeated` columns must have exactly `row_count` elements; the artifact layer rejects index payloads where column
-lengths differ.
+All `repeated` columns must have exactly `row_count` elements; the artifact layer validates `row_count` and rejects index
+payloads where column lengths differ or `row_count` does not match.
 
 #### Field presence and indexing semantics
 
@@ -584,15 +593,17 @@ Operations (gRPC service-to-service; client-to-app transport is application-spec
 Request/response expectations:
 1. artifact_id is allocated by the artifact layer via a separate ID service and returned in Create responses.
 1. type_version is optional for Create/Update; resolution behavior is defined in Type identity and versioning.
-1. Update/Delete require expected storage version ID (test-and-set per Artifact contract); mismatches return a conflict.
+1. Update/Delete require expected storage version ID (test-and-set per Artifact contract); mismatches return a
+   VERSION_MISMATCH conflict.
 1. Reads return payload bytes plus type_name/type_version and storage version ID.
-1. BatchGetArtifacts returns results in the same order as the input IDs. Missing or tombstoned artifacts are represented
-   as absent entries (not errors) so callers can correlate by position.
+1. BatchGetArtifacts returns results in the same order as the input IDs using explicit per-id results (for example, a
+   `oneof { artifact, not_found }` wrapper) so missing or tombstoned artifacts preserve positional correlation.
 1. Create/Update/Delete return the resolved type_version (when applicable) and the new storage version ID.
 1. Delete and tombstone behavior is defined in Delete semantics and retention.
 
 Conflict/error behavior: conflict types, response payloads, and auto-resolution eligibility are defined in the Conflict
-retry policy (MVP). The conflict response uses conflict_type values INDEX_CONFLICT and PAYLOAD_CONFLICT.
+retry policy (MVP). The conflict response uses conflict_type values INDEX_CONFLICT, PAYLOAD_CONFLICT, and
+VERSION_MISMATCH.
 
 #### Index fetch API
 
@@ -626,7 +637,9 @@ registry validates schema compatibility against the most recent version. Compati
 1. Existing index definitions must not be removed or modified. A modification is any change that would alter what is
    indexed or the shape of the index payload: changes to key fields, order fields, where clauses, or the unique flag.
    Such changes require a full index rebuild (backfill), which is post-launch.
-1. New fields and new indexes may be added.
+1. New fields and new indexes may be added. New indexes apply only to writes after registration (no backfill in the MVP),
+   so index completeness for historical data is not guaranteed. Where clauses should be used to make the index valid for
+   the subset of artifacts it claims to cover.
 1. Field number reassignment is rejected.
 
 The registry stores the protobuf schema (source or descriptor) plus any required imports and extensions so it can be
