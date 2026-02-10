@@ -157,8 +157,11 @@ transaction before any user artifacts of that type exist.
 
 An index definition includes:
 1. key_type: the name of the index and the identifier passed to fetch index calls. key_type must be globally unique
-   across all registered index definitions; this uniqueness constraint is enforced by the registry (not encoded in
-   proto3).
+   across all registered index definitions; this uniqueness constraint is enforced by a self-referential unique index
+   (`index_key_type_unique`) declared on the IndexDefinition message itself. Because IndexDefinition instances are stored
+   as artifacts, the standard unique index merge semantics (see Index merge semantics) enforce at most one
+   IndexDefinition per key_type value. This eliminates the need for special-case registry logic and ensures the
+   constraint is enforced consistently through the same path as all other unique indexes.
 2. key: the fields that partition the index. Different key values on the same index type map to different index
    objects.
 3. order fields: fields that determine the sort order. Each order field must declare a direction (ASC or DESC) based on
@@ -397,6 +400,13 @@ we store standalone definition objects as artifacts (for example, for migrations
 definition type (ArtifactDefinition, IndexDefinition, etc.). TypeDefinition is a built-in meta-type used to describe
 these definition types; it is bootstrapped in the artifact layer and treated as immutable.
 
+IndexDefinition declares a self-referential unique index (`index_key_type_unique`) on its own `key_type` field. This
+means the IndexDefinition type's own index must exist before it can enforce uniqueness on subsequently registered index
+definitions. During system bootstrapping, the artifact layer creates the `index_key_type_unique` IndexDefinition artifact
+as part of initialization — before any user-defined types are registered. This bootstrap artifact is self-referential: it
+is the first entry in its own index. Subsequent IndexDefinition artifacts created during type registration then have their
+`key_type` uniqueness enforced by the standard unique index merge path, with no special-case logic required.
+
 Artifact types are stored in LakeFS so they are tied to the repo state. This enables migration transactions
 (post-launch): a new branch can add an index, backfill it for existing data, and merge only when the index is consistent
 with all changes since the fork point. The same mechanism supports index removal and schema migrations.
@@ -524,6 +534,8 @@ message WhereClause {
 }
 
 message IndexDefinition {
+  option (indexes) = { key_type: "index_key_type_unique" key: ["key_type"] order: { field: "artifact_id" direction: ASCENDING } unique: true };
+
   string key_type = 1;
   repeated string key = 2;
   repeated OrderDefinition order = 3;
