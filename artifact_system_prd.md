@@ -10,10 +10,12 @@
    retry policy.
 1. Deterministic index derivation and merges for unique and non-unique indexes; launch uses inline index storage and
    preserves metadata for future sharded layouts.
+1. Referential integrity with field-level reference options, write-time validation, and delete-time enforcement
+   (restrict/cascade/set-null).
 1. Type registry with runtime registration of proto3 schemas, descriptor sets as canonical runtime artifacts, and
    retained custom options including LLM instruction/description annotations at message and field levels. Types, type
-   versions, and index definitions are first-class artifacts with their own indexes (see Built-in types and
-   bootstrapping).
+   versions, index definitions, and reference definitions are first-class artifacts with their own indexes (see Built-in
+   types and bootstrapping).
 1. Type version resolution via an optional current pointer on TypeDefinition (see Type identity and versioning).
 1. Artifact server API hides branches and transaction mechanics; callers only see conflicts and resolved storage version
    IDs.
@@ -25,7 +27,8 @@
 1. Index sharding and index migrations (backfills/reindexes).
 1. Caching layers, triggers, and virtual/computed fields.
 1. Application-defined payload merges (including CRDT-based merges) beyond index-derived merges.
-1. Extended artifact validation beyond proto3 structural checks (semantic/business rules).
+1. Extended artifact validation beyond proto3 structural checks and referential integrity (semantic/business rules).
+1. Compound reference keys and reference lookups by unique indexes (non-artifact_id).
 1. Supporting pulling of "part" of an artifact
 1. App layer permissions
 
@@ -112,11 +115,12 @@ limit is reached. The retry policy is defined below.
 
 **Conflict response payload**
 When retries are aborted or exhausted, return a structured conflict response containing:
-1. conflict_type: one of {INDEX_CONFLICT, PAYLOAD_CONFLICT, VERSION_MISMATCH}.
+1. conflict_type: one of {INDEX_CONFLICT, PAYLOAD_CONFLICT, VERSION_MISMATCH, REFERENTIAL_INTEGRITY_VIOLATION}.
 1. retryable: boolean indicating whether the server would retry (false when exhausted or payload conflict).
 1. attempts: number of attempts performed.
 1. artifacts/indexes involved: artifact_id for payload conflicts; index key (key_type + encoded key) for index conflicts;
-   artifact_id for version mismatches.
+   artifact_id for version mismatches; for referential integrity violations include the target artifact_id, the reference
+   key_type, and the referencing artifact_ids.
 1. version_ids: base, ours, theirs storage version IDs when available; for VERSION_MISMATCH include expected_version_id
    and current_version_id.
 
@@ -128,15 +132,16 @@ When retries are aborted or exhausted, return a structured conflict response con
 
 This layer builds on the Storage Layer and provides shared artifact functionality: artifact schemas and types, ID
 allocation, indexes, index conflict resolution, and type metadata. The type system is self-describing: TypeDefinition,
-TypeVersionDefinition, and IndexDefinition are all stored as first-class artifacts with their own indexes, bootstrapped
-via a genesis commit (see Built-in types and bootstrapping). Application-specific logic and permissions live in the
-App Layer.
+TypeVersionDefinition, IndexDefinition, and ReferenceDefinition are all stored as first-class artifacts with their own
+indexes, bootstrapped via a genesis commit (see Built-in types and bootstrapping). Application-specific logic and
+permissions live in the App Layer.
 
 ### Necessary features for launch
 
 1. Integration with LakeFS
 1. Indexes for looking up artifacts (and ability to resolve conflicts)
 1. Artifact Type registry (with version and schema support)
+1. Referential integrity validation and delete-time enforcement
 1. Genesis bootstrap for built-in types and indexes
 
 ### Indexes for looking up artifacts
@@ -308,9 +313,10 @@ layout without rewriting all index consumers.
 Object paths are a private implementation detail and must not be exposed to end-users. The top-level namespaces are:
 
 1. `artifacts/{artifact_id}` — artifact payloads, including built-in definition artifacts (TypeDefinition,
-   TypeVersionDefinition, IndexDefinition). The artifact_id is a uint64 encoded as base64 using the URL-safe alphabet of
-   its big-endian bytes without padding. Type definitions, type versions, and index definitions are all stored in this
-   namespace and are located via indexes (see Built-in types and bootstrap indexes).
+   TypeVersionDefinition, IndexDefinition, ReferenceDefinition). The artifact_id is a uint64 encoded as base64 using the
+   URL-safe alphabet of its big-endian bytes without padding. Type definitions, type versions, index definitions, and
+   reference definitions are all stored in this namespace and are located via indexes (see Built-in types and bootstrap
+   indexes).
 2. `indexes/{key_prefix}/{key_hash}` — index objects. The key_hash is a SHA-256 content-addressed hash of the encoded
    key bytes; path encoding is defined in Index physical storage.
 
@@ -337,14 +343,66 @@ artifact layer should validate that it matches the artifact_id.
 On create/update, the artifact layer checks the TypeDefinition's `immutable` flag; if true, UpdateArtifact and
 DeleteArtifact are rejected. The artifact layer validates the payload using standard proto3 structural validation against
 the message identified by type_name in the TypeVersionDefinition's descriptor set, and derives index entries from the
-index declarations in the descriptor set's custom options. Artifact validation is limited to proto3 structural checks;
-semantic or business validation is out of scope for launch. Responses return the resolved version_id (the
+index declarations in the descriptor set's custom options. Artifact validation is limited to proto3 structural checks
+and referential integrity (see below); semantic or business validation is out of scope for launch. Responses return the
+resolved version_id (the
 TypeVersionDefinition artifact_id) and the storage version ID so callers can perform safe updates. Updates and deletes
 require an expected storage version ID to avoid lost updates. Reads return payload bytes plus type_name, version_id, and
 storage version ID. Partial updates are out of scope for launch.
 
 The artifact layer stores payload bytes as provided and does not reserialize them. This preserves unknown fields and
 avoids any reliance on canonical protobuf binary encodings. Text/JSON formats are not used for storage.
+
+#### Referential integrity (MVP)
+
+Referential integrity is expressed via field-level options on `uint64` fields that reference other artifacts by
+artifact_id. Each reference declaration is materialized as a ReferenceDefinition artifact at registration time (see
+Built-in types and bootstrapping). The descriptor set options are the source of truth; ReferenceDefinition artifacts are
+derived materializations for reverse lookup and enforcement.
+
+**Declaration and registration rules**
+1. The references option is valid only on `uint64`, `optional uint64`, or `repeated uint64` fields. The registry rejects
+   references on any other field type.
+1. `on_delete` is required; `ON_DELETE_UNSPECIFIED` is rejected.
+1. `SET_NULL` is valid on `optional` or `repeated` fields; it is rejected on implicit-presence scalars.
+1. Implicit-presence scalar reference fields always validate their value (including defaults); use `optional` to allow
+   null. Repeated reference fields treat an empty list as null.
+1. `target_type_name` must resolve to an existing TypeDefinition via the `type_name_unique` index.
+1. A covering index is required on the referencing message: exactly one index must exist where the reference field is
+   the **sole key** and the where clause is either absent or a single `IS_SET` on the reference field. The covering index
+   may be unique or non-unique. `IS_SET` is recommended when adding optional reference fields to existing types to avoid
+   indexing unset values. For repeated reference fields, the covering index must have no where clause.
+1. Multiple reference fields are allowed per message; each is validated independently.
+
+**Write-time validation**
+1. On Create/Update, if a reference field is set, the artifact layer reads the referenced artifact by artifact_id and
+   verifies it exists, is not tombstoned, and its type_name matches `target_type_name`.
+1. If a reference field is unset (optional), it is treated as null and does not require validation.
+1. For repeated reference fields, each value is validated and the list must not contain duplicates; duplicate values are
+   rejected on Create/Update.
+1. References are enforced on create/update; existing stored artifacts are not revalidated until they are updated.
+
+**Delete-time enforcement**
+1. On Delete, the artifact layer resolves the artifact's type_name and fetches all ReferenceDefinition artifacts from the
+   `references_by_target_type` index for that type.
+1. For each ReferenceDefinition, it fetches the covering index with key = deleted artifact_id to list referencing
+   artifacts.
+1. Enforcement by `on_delete`:
+   1. **RESTRICT**: reject the delete if any referencing artifacts exist that are not already scheduled for delete in the
+      current transaction.
+   1. **CASCADE**: delete each referencing artifact (recursively applying referential integrity).
+   1. **SET_NULL**: update each referencing artifact to clear the reference field (for repeated fields, remove the
+      referenced value from the list).
+1. All cascades and nullify updates run in the same internal transaction (same ephemeral branch) as the original delete
+   and are merged atomically.
+1. Cascading cycles are handled by tracking scheduled deletes and skipping already-marked artifacts; this prevents
+   infinite recursion while allowing mutually-referencing artifacts to be deleted in the same transaction.
+1. Referential integrity violations return conflict_type = REFERENTIAL_INTEGRITY_VIOLATION.
+
+**Forward compatibility**
+1. MVP references are `uint64` artifact_ids validated by GetArtifact + type_name checks. Future versions may allow
+   references by unique index (for example, a compound key struct). This would add a `target_index_key_type` to
+   ReferenceOption/ReferenceDefinition and require the reference field to match the target index key schema.
 
 #### Delete semantics and retention
 
@@ -357,6 +415,8 @@ the storage version ID, and returns that version to the caller.
    longer matches any where clauses). Unique indexes free the slot. If an index becomes empty, it is tombstoned by
    storing an index object with an empty value portion (row_count = 0 and no value entries) so merges can detect
    deletions.
+1. Referential integrity: deletes may be rejected (RESTRICT), cascade, or nullify references based on reference field
+   options; enforcement occurs in the same internal transaction (see Referential integrity).
 1. Reads treat tombstones as not found for standard Get. There is no public restore or audit API in the MVP; to
    "undelete" a caller writes a new payload with the tombstone's expected version ID, creating a new version in history.
 1. Retention: history is preserved as LakeFS commits but is subject to LakeFS GC/vacuum. To guarantee audit/restore
@@ -371,6 +431,7 @@ on metadata (not data copies), so merge operations are fast even at scale.
 
 1. Each Create/Update/Delete runs as an internal transaction (ephemeral branch + merge) and is merged before the call
    returns success.
+1. Delete operations that cascade or nullify references perform all dependent writes in the same internal transaction.
 1. Read-after-write: once a write call succeeds, subsequent reads of that artifact key return the committed version and its storage version ID.
 1. Consistency is per artifact key plus its derived index updates; there are no multi-key or cross-artifact atomic transactions in the MVP.
 1. Concurrent writes may diverge internally; conflict ownership is defined in the Conflict retry policy.
@@ -400,7 +461,7 @@ type schema includes an id field, it must match the artifact_id.
 
 #### Built-in types and bootstrapping
 
-The artifact system uses three built-in artifact types to describe itself. All definition objects are first-class
+The artifact system uses four built-in artifact types to describe itself. All definition objects are first-class
 artifacts stored in the `artifacts/` namespace and queryable via standard indexes. Their schemas are compiled into the
 artifact layer binary but are also stored as artifacts so the system is fully self-describing.
 
@@ -417,6 +478,11 @@ artifact layer binary but are also stored as artifacts so the system is fully se
 3. **IndexDefinition**: represents a single index. Contains the key_type, key fields, order fields, optional where
    clause, and unique flag. IndexDefinition is immutable. Each IndexDefinition artifact receives an artifact_id that is
    used as the key_prefix in index storage paths (see Index physical storage).
+4. **ReferenceDefinition**: represents a single referential integrity declaration. Contains the referencing type, target
+   type, reference field, covering index key_type, and on_delete behavior. key_type is a globally unique identifier;
+   the recommended format is `{referencing_type_name}.{field_name}`. The unique key_type is used by the registry to
+   detect duplicates across type versions without scanning all reference definitions. ReferenceDefinition is immutable
+   and is created during RegisterTypeVersion when reference field options are detected.
 
 All types (including user-defined artifact types) are stored in LakeFS so they are tied to the repo state. This enables
 migration transactions (post-launch): a new branch can add an index, backfill it for existing data, and merge only when
@@ -434,6 +500,9 @@ The built-in types declare the following indexes on themselves:
 | `all_types` | TypeDefinition | `[]` | no | Lists all registered type artifact_ids |
 | `type_versions_by_type` | TypeVersionDefinition | `[type_id]` | no | Lists all version artifact_ids for a type |
 | `all_index_definitions` | IndexDefinition | `[]` | no | Lists all registered index definition artifact_ids |
+| `reference_key_type_unique` | ReferenceDefinition | `[key_type]` | yes | Enforces globally unique reference identifiers; used by the registry to de-duplicate reference definitions |
+| `references_by_target_type` | ReferenceDefinition | `[target_type_name]` | no | Finds references targeting a given type |
+| `all_reference_definitions` | ReferenceDefinition | `[]` | no | Lists all registered reference definition artifact_ids |
 
 These indexes are created during genesis bootstrapping and use the same storage and merge mechanics as all other indexes.
 
@@ -462,8 +531,13 @@ The genesis commit creates artifacts in the following dependency order:
    index on itself.
 7. **`type_versions_by_type`** (IndexDefinition artifact): created for the TypeVersionDefinition type's declared index;
    key_type uniqueness enforced by step 2.
-8. **All derived index entries**: populate every bootstrap index with entries for all artifacts created above.
-9. **Atomic commit**: the entire genesis state is committed as a single transaction to the canonical branch.
+8. **ReferenceDefinition type** (TypeDefinition + TypeVersionDefinition artifacts): declares reference indexes on itself.
+9. **`reference_key_type_unique`**, **`references_by_target_type`**, and **`all_reference_definitions`** (IndexDefinition
+   artifacts): created for the ReferenceDefinition type's declared indexes; key_type uniqueness enforced by step 2.
+10. **Built-in ReferenceDefinition artifacts**: materialize reference declarations for built-in types (for example,
+    `TypeVersionDefinition.type_id` -> `TypeDefinition`, `TypeDefinition.current_version_id` -> `TypeVersionDefinition`).
+11. **All derived index entries**: populate every bootstrap index with entries for all artifacts created above.
+12. **Atomic commit**: the entire genesis state is committed as a single transaction to the canonical branch.
 
 After the genesis commit, the system is self-describing and all subsequent operations (including user type registrations)
 use the standard RegisterTypeVersion code path. The genesis commit is idempotent — if the canonical branch already
@@ -479,7 +553,8 @@ descriptor set at runtime. An artifact type's metadata includes:
    registration; interpretation is an App Layer concern and is not consumed by the artifact layer at launch.
 3. Viewer: a MessageOption defining the default viewer endpoint. Same as Actions — stored but not interpreted at launch.
 4. Custom Instruction: a MessageOption defining LLM instructions for the type.
-5. A FieldOption for single-field indexes may be added later.
+5. Referential integrity: a FieldOption (`references`) declaring artifact-to-artifact references.
+6. A FieldOption for single-field indexes may be added later.
 
 #### Protocol buffers as the type definition
 
@@ -505,14 +580,16 @@ supported (see below) and must be retained at runtime so that metadata is availa
 Type metadata is defined using protobuf custom options (extensions). In proto3, extensions are permitted only for custom
 options, which aligns with our needs.
 1. Message options: indexes, actions, viewer endpoint, LLM instructions.
-2. Field options (optional): syntactic sugar for single-field indexes.
-3. Virtual fields (planned): a MessageOption for declaring computed fields; the expression AST schema is to be defined.
+2. Field options: referential integrity (`references`).
+3. Field options (optional): syntactic sugar for single-field indexes.
+4. Virtual fields (planned): a MessageOption for declaring computed fields; the expression AST schema is to be defined.
 
 Custom options must use runtime retention (not source-only retention) so they appear in the descriptor set. The registry
 loads the descriptor set with the option extensions so the artifact layer can read metadata deterministically.
 
-The artifact system's own proto definitions (IndexDefinition, OrderDefinition, WhereClause, the `indexes` message
-extension, and other system messages) are injected as well-known imports at load time rather than stored in each
+The artifact system's own proto definitions (IndexDefinition, ReferenceDefinition, ReferenceOption, OrderDefinition,
+WhereClause, the `indexes` and `references` message extensions, and other system messages) are injected as well-known
+imports at load time rather than stored in each
 TypeVersionDefinition's descriptor set. This keeps descriptor sets smaller and ensures that system proto changes do not
 require re-registering all existing types. During compilation, the registry provides these system protos as available
 imports alongside the standard google.protobuf imports.
@@ -530,6 +607,11 @@ constant). For UnaryWhereClause, IS_SET is only valid on fields with explicit pr
 IS_SET on implicit-presence scalars. AndWhereClause and OrWhereClause must contain at least two child clauses; the
 registry rejects empty or single-element compound clauses (use the child directly instead). The registry enforces a
 maximum nesting depth to prevent unbounded recursion.
+
+ReferenceOption is valid only on `uint64`, `optional uint64`, or `repeated uint64` fields. `on_delete` is required, and
+`SET_NULL` is only valid on `optional` or `repeated` fields. Each reference requires exactly one covering index with the
+reference field as the sole key and a where clause that is either absent or a single `IS_SET` on the reference field; the
+registry rejects missing or ambiguous coverage. Repeated reference fields must not contain duplicate values.
 
 ```proto
 syntax = "proto3";
@@ -615,8 +697,24 @@ extend google.protobuf.MessageOptions {
   repeated IndexDefinition indexes = 50002;
 }
 
-// Built-in types: TypeDefinition and TypeVersionDefinition are stored as artifacts
-// and use the same index mechanics as all other artifact types.
+message ReferenceOption {
+  string target_type_name = 1;
+  enum OnDelete {
+    ON_DELETE_UNSPECIFIED = 0;
+    RESTRICT = 1;
+    CASCADE = 2;
+    SET_NULL = 3;
+  }
+  OnDelete on_delete = 2;
+}
+
+extend google.protobuf.FieldOptions {
+  optional ReferenceOption references = 50003;
+}
+
+// Built-in types: TypeDefinition, TypeVersionDefinition, IndexDefinition, and
+// ReferenceDefinition are stored as artifacts and use the same index mechanics
+// as all other artifact types.
 
 message TypeDefinition {
   option (indexes) = { key_type: "type_name_unique" key: ["type_name"] order: { field: "artifact_id" direction: ASCENDING } unique: true };
@@ -635,6 +733,19 @@ message TypeVersionDefinition {
   string proto_source = 3;
 }
 
+message ReferenceDefinition {
+  option (indexes) = { key_type: "reference_key_type_unique" key: ["key_type"] order: { field: "artifact_id" direction: ASCENDING } unique: true };
+  option (indexes) = { key_type: "references_by_target_type" key: ["target_type_name"] order: { field: "artifact_id" direction: ASCENDING } };
+  option (indexes) = { key_type: "all_reference_definitions" key: [] order: { field: "artifact_id" direction: ASCENDING } };
+
+  string key_type = 1;
+  string target_type_name = 2;
+  string referencing_type_name = 3;
+  string field_name = 4;
+  string covering_index_key_type = 5;
+  ReferenceOption.OnDelete on_delete = 6;
+}
+
 // Example user-defined artifact type. The type_name for this type is "DataFrameArtifact"
 // (the fully-qualified proto message name).
 
@@ -642,7 +753,7 @@ message DataFrameArtifact {
   option (indexes) = { key_type: "by_owner" key: ["created_by"] order: { field: "artifact_id" direction: ASCENDING } };
   option (indexes) = { key_type: "by_repo_created_by" key: ["repo_id", "created_by"] order: { field: "artifact_id" direction: ASCENDING } };
 
-  uint64 created_by = 1;
+  uint64 created_by = 1 [(references) = { target_type_name: "User" on_delete: RESTRICT }];
   uint64 repo_id = 2;
   bytes dataframe = 3;
 }
@@ -767,6 +878,8 @@ Request/response expectations:
    in Type identity and versioning. If omitted, the artifact layer resolves to the TypeDefinition's current_version_id.
 1. Update/Delete require an expected storage version ID (test-and-set per Artifact contract); mismatches return a
    VERSION_MISMATCH conflict. Update/Delete are rejected if the TypeDefinition's `immutable` flag is true.
+1. Create/Update validate referential integrity for reference fields; deletes may be rejected (RESTRICT) or may cascade
+   or nullify references depending on declared `on_delete` behavior.
 1. Reads return payload bytes plus type_name, version_id (the resolved TypeVersionDefinition artifact_id), and storage
    version ID.
 1. BatchGetArtifacts returns results in the same order as the input IDs using explicit per-id results (for example, a
@@ -776,7 +889,7 @@ Request/response expectations:
 
 Conflict/error behavior: conflict types, response payloads, and auto-resolution eligibility are defined in the Conflict
 retry policy (MVP). The conflict response uses conflict_type values INDEX_CONFLICT, PAYLOAD_CONFLICT, and
-VERSION_MISMATCH.
+VERSION_MISMATCH, and REFERENTIAL_INTEGRITY_VIOLATION.
 
 #### Index fetch API
 
@@ -795,8 +908,8 @@ Response:
 #### Type registry API
 
 The registry supports registering and resolving type versions. All registry operations create or modify TypeDefinition,
-TypeVersionDefinition, and IndexDefinition artifacts via the standard artifact storage path, but enforce additional
-validation rules that the generic CRUD API does not.
+TypeVersionDefinition, IndexDefinition, and ReferenceDefinition artifacts via the standard artifact storage path, but
+enforce additional validation rules that the generic CRUD API does not.
 
 1. RegisterTypeVersion(type_name, proto_source) -> version_id
 1. GetTypeVersion(version_id) -> TypeVersionDefinition
@@ -812,9 +925,13 @@ imports), locates the message identified by type_name in the descriptor set, and
    compatibility against the most recent version.
 3. Extracts index declarations from the message's custom options. For each key_type, checks the `index_key_type_unique`
    index: if an IndexDefinition already exists, validates compatibility; if not, creates a new IndexDefinition artifact.
-4. Creates a TypeVersionDefinition artifact (type_id = TypeDefinition artifact_id, descriptor_set, proto_source).
-5. Derives all index entries for the new artifacts and commits atomically.
-6. Returns the new TypeVersionDefinition artifact_id (the version_id).
+4. Extracts reference declarations from field options. For each reference, validates field type, `on_delete`,
+   `target_type_name`, and presence of a covering index (reference field as sole key with a where clause that is either
+   absent or a single `IS_SET` on the reference field). For each reference, checks `reference_key_type_unique`: if a
+   ReferenceDefinition already exists, validates compatibility; if not, creates a new ReferenceDefinition artifact.
+5. Creates a TypeVersionDefinition artifact (type_id = TypeDefinition artifact_id, descriptor_set, proto_source).
+6. Derives all index entries for the new artifacts and commits atomically.
+7. Returns the new TypeVersionDefinition artifact_id (the version_id).
 
 Schema compatibility rules for launch:
 1. Existing fields must not be removed or have their type changed. These rules apply recursively to nested message
@@ -824,9 +941,11 @@ Schema compatibility rules for launch:
 1. Existing index definitions must not be removed or modified. A modification is any change that would alter what is
    indexed or the shape of the index payload: changes to key fields, order fields, where clauses, or the unique flag.
    Such changes require a full index rebuild (backfill), which is post-launch.
-1. New fields and new indexes may be added. New indexes apply only to writes after registration (no backfill in the MVP),
-   so index completeness for historical data is not guaranteed. Where clauses should be used to make the index valid for
-   the subset of artifacts it claims to cover.
+1. Existing reference declarations must not be removed or modified. A modification includes changes to target_type_name,
+   the reference field, the covering index key_type, or the on_delete behavior. Such changes are post-launch.
+1. New fields, new indexes, and new reference declarations may be added. New indexes apply only to writes after
+   registration (no backfill in the MVP), so index completeness for historical data is not guaranteed. Where clauses
+   should be used to make the index valid for the subset of artifacts it claims to cover.
 1. Field number reassignment is rejected.
 
 **ListTypeVersions** fetches the `type_versions_by_type` index for the TypeDefinition's artifact_id, returning version
