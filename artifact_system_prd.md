@@ -6,8 +6,9 @@
 1. Artifact CRUD with append-only writes and tombstone-based deletes (see Delete semantics and retention).
 1. Artifact payloads are structured by registered protobuf schemas, with fields available for indexing; applications may
    still include opaque sections (for example, raw bytes or text/JSON) inside protobuf envelopes they define.
-1. Test-and-set updates via storage version IDs (see Artifact contract); conflict ownership is defined in the Conflict
-   retry policy.
+1. Snapshot and transaction-based concurrency model exposed to the App Layer (see Consistency and transaction semantics).
+   Snapshots are immutable read-only commit pointers; transactions are mutable read-write branch pointers with snapshot
+   isolation. Conflict ownership is defined in the Conflict retry policy.
 1. Deterministic index derivation and merges for unique and non-unique indexes; launch uses inline index storage and
    preserves metadata for future sharded layouts.
 1. Referential integrity with field-level reference options, write-time validation, and delete-time enforcement
@@ -17,8 +18,10 @@
    versions, index definitions, and reference definitions are first-class artifacts with their own indexes (see Built-in
    types and bootstrapping).
 1. Type version resolution via an optional current pointer on TypeDefinition (see Type identity and versioning).
-1. Artifact server API hides branches and transaction mechanics; callers only see conflicts and resolved storage version
-   IDs.
+1. Transaction and snapshot API exposed to the App Layer; internal Storage Layer branch and merge mechanics are hidden.
+   Callers interact with snapshots (immutable read contexts) and transactions (read-write contexts with snapshot isolation),
+   and receive structured conflict responses on commit (Artifact Layer transaction commit, which translates to a merge in
+   the Storage Layer).
 
 ### Non-goals for launch
 
@@ -112,22 +115,25 @@ limit is reached. The retry policy is defined below.
 
 **Idempotency requirements**
 1. Index merge logic must be deterministic and idempotent given the same (base, ours, theirs) inputs.
-1. Artifact writes use test-and-set semantics (see Artifact contract) to prevent lost updates across retries.
+1. Artifact writes within a transaction use snapshot isolation to prevent lost updates. Conflicts may be detected at two
+   points: (a) when a write's sub-branch is merged into the transaction branch (concurrent writes within the same
+   transaction), and (b) when the transaction branch is merged into the canonical branch (Artifact Layer transaction
+   commit). Both merge points use the same retry policy.
 
 **Conflict response payload**
 When retries are aborted or exhausted, return a structured conflict response containing:
-1. conflict_type: one of {INDEX_CONFLICT, PAYLOAD_CONFLICT, VERSION_MISMATCH, REFERENTIAL_INTEGRITY_VIOLATION}.
+1. conflict_type: one of {INDEX_CONFLICT, PAYLOAD_CONFLICT, REFERENTIAL_INTEGRITY_VIOLATION}.
 1. retryable: boolean indicating whether the server would retry (false when exhausted or payload conflict).
 1. attempts: number of attempts performed.
 1. artifacts/indexes involved: artifact_id for payload conflicts; index key (key_type + encoded key) for index conflicts;
-   artifact_id for version mismatches; for referential integrity violations include the target artifact_id, the reference
-   key_type, and the referencing artifact_ids.
-1. version_ids: base, ours, theirs storage version IDs when available; for VERSION_MISMATCH include expected_version_id
-   and current_version_id.
+   for referential integrity violations include the target artifact_id, the reference key_type, and the referencing
+   artifact_ids.
+1. version_ids: base, ours, theirs Storage Layer commit IDs when available.
 
 **Exhaustion behavior**
 1. If the retry limit is reached while resolving index conflicts, return the conflict response with retryable=false.
-1. Callers may re-read state, resolve conflicts at the application level, and retry the operation with updated expected version IDs.
+1. Callers may create a new transaction, re-read state, resolve conflicts at the application level, and retry the
+   operation.
 
 ## Artifact Layer
 
@@ -271,9 +277,11 @@ post-MVP; FetchIndex returns the stored index state only.
    required; partial keys are rejected.
 
 **Execution semantics**
-1. The artifact layer locates the index object for (key_type, encoded key values) and reads its current state from the
-   canonical branch head by default. An optional version specifier (LakeFS commit ID) may be provided to read from a
-   specific point in time, supporting MVCC and consistent reads across multiple fetch calls.
+1. The artifact layer locates the index object for (key_type, encoded key values) and reads its current state. If issued
+   within a snapshot, reads use the snapshot's Storage Layer commit pointer. If issued within a transaction, reads use the
+   transaction's ephemeral branch head (which includes the transaction's own writes and is isolated from concurrent
+   Artifact Layer commits to the canonical branch). If issued without a snapshot or transaction context, reads use the
+   canonical branch head.
 1. Results are returned in the deterministic order defined by the index's order fields. Ordering stability is defined
    by the index definition and does not vary per query.
 1. No query-time filters are applied. The query returns exactly the contents of the index object.
@@ -289,7 +297,7 @@ index-specific protobuf schema.
    unless the index schema explicitly defines such fields.
 1. Empty or tombstoned indexes return an index message with zero entries.
 
-The response may also include the index object’s storage version ID for debugging or consistency checks.
+The response may also include the Storage Layer commit ID used for the read, for debugging or consistency checks.
 
 **Uniqueness**
 1. Unique index responses contain zero or one entry (see Index definition for the uniqueness invariant).
@@ -316,9 +324,10 @@ Object paths are a private implementation detail and must not be exposed to end-
 
 ### Artifacts
 
-Artifacts are stored as opaque payloads defined by Types. Writes use test-and-set via storage version IDs; conflict
-ownership (payload vs. index) is defined in the Conflict retry policy. In the future, we can add application-defined
-merge logic per artifact type.
+Artifacts are stored as opaque payloads defined by Types. Writes occur within transactions and are committed atomically
+(an Artifact Layer transaction commit translates to a Storage Layer merge into the canonical branch). Conflict ownership
+(payload vs. index) is defined in the Conflict retry policy. In the future, we can add application-defined merge logic
+per artifact type.
 
 #### Artifact contract (minimum)
 
@@ -339,10 +348,9 @@ DeleteArtifact are rejected. The artifact layer validates the payload using stan
 the message identified by type_name in the TypeVersionDefinition's descriptor set, and derives index entries from the
 index declarations in the descriptor set's custom options. Artifact validation is limited to proto3 structural checks
 and referential integrity (see below); semantic or business validation is out of scope for launch. Responses return the
-resolved version_id (the
-TypeVersionDefinition artifact_id) and the storage version ID so callers can perform safe updates. Updates and deletes
-require an expected storage version ID to avoid lost updates. Reads return payload bytes plus type_name, version_id, and
-storage version ID. Partial updates are out of scope for launch.
+resolved version_id (the TypeVersionDefinition artifact_id). All writes occur within a transaction; concurrent write
+conflicts are detected at Artifact Layer transaction commit (see Consistency and transaction semantics). Reads return
+payload bytes plus type_name and version_id. Partial updates are out of scope for launch.
 
 The artifact layer stores payload bytes as provided and does not reserialize them. This preserves unknown fields and
 avoids any reliance on canonical protobuf binary encodings. Text/JSON formats are not used for storage.
@@ -400,8 +408,9 @@ derived materializations for reverse lookup and enforcement.
 
 #### Delete semantics and retention
 
-Deletes are logical tombstones. A delete writes a new version at the same artifact key with an empty payload, advances
-the storage version ID, and returns that version to the caller.
+Deletes are logical tombstones. A delete writes a new version at the same artifact key with an empty payload within the
+current transaction. The delete is finalized when the Artifact Layer transaction is committed (merged in the Storage
+Layer).
 
 1. Empty payloads are reserved for tombstones. The artifact layer rejects zero-length payloads for live artifacts; if a
    type needs to represent an "empty" value, include a sentinel field or wrap it in an envelope message.
@@ -412,28 +421,130 @@ the storage version ID, and returns that version to the caller.
 1. Referential integrity: deletes may be rejected (RESTRICT), cascade, or nullify references based on reference field
    options; enforcement occurs in the same internal transaction (see Referential integrity).
 1. Reads treat tombstones as not found for standard Get. There is no public restore or audit API in the MVP; to
-   "undelete" a caller writes a new payload with the tombstone's expected version ID, creating a new version in history.
+   "undelete" a caller writes a new payload for the tombstoned artifact within a transaction, creating a new version in
+   history.
 1. Retention: history is preserved as LakeFS commits but is subject to LakeFS GC/vacuum. To guarantee audit/restore
 windows, pin commits/tags or configure retention accordingly. Hard delete/purge is out of scope for launch.
 
 #### Consistency and transaction semantics
 
-The Artifact Layer presents a single canonical branch to callers; branch and transaction mechanics are internal. The
-internal strategy is branch-per-write: each Create/Update/Delete creates an ephemeral branch from the canonical branch
-head, commits artifact and index changes to that branch, and merges back into the canonical branch. LakeFS merges operate
-on metadata (not data copies), so merge operations are fast even at scale.
+The Artifact Layer exposes snapshot and transaction primitives to the App Layer as the primary concurrency model.
+Storage Layer branch and merge mechanics are hidden; callers interact with snapshots and transactions.
 
-1. Each Create/Update/Delete runs as an internal transaction (ephemeral branch + merge) and is merged before the call
-   returns success.
-1. Delete operations that cascade or nullify references perform all dependent writes in the same internal transaction.
-1. Read-after-write: once a write call succeeds, subsequent reads of that artifact key return the committed version and its storage version ID.
-1. Consistency is per artifact key plus its derived index updates; there are no multi-key or cross-artifact atomic transactions in the MVP.
-1. Concurrent writes may diverge internally; conflict ownership is defined in the Conflict retry policy.
-1. If a write fails mid-transaction (for example, index derivation rejects a NaN float key), the ephemeral branch is
-   abandoned without merging. There is no rollback; the branch simply never reaches the canonical branch. Abandoned
-   branches are cleaned up by the LakeFS Spark GC service, which removes branches that are not recent and not referenced
-   by tags or branch heads.
+**Terminology note**: "commit" in this section has two meanings depending on the layer:
+1. **Storage Layer commit** — a LakeFS commit, an immutable point-in-time state of the repository.
+2. **Artifact Layer transaction commit** — the act of finalizing and persisting a transaction's writes, which translates
+   to a Storage Layer merge of the transaction's ephemeral branch into its parent (or the canonical branch).
+
+##### Snapshots
+
+A snapshot is an immutable, read-only pointer to a Storage Layer commit. Snapshots do not require a Storage Layer branch;
+they reference a commit directly.
+
+1. `CreateSnapshot(parent_id?)` returns a snapshot_id. If parent_id is omitted, the snapshot points to the canonical
+   branch head. If parent_id is a transaction ID, the snapshot points to the transaction's current head Storage Layer
+   commit.
+1. All reads within a snapshot (GetArtifact, BatchGetArtifacts, FetchIndex) are performed against the snapshot's Storage
+   Layer commit, providing a consistent, point-in-time view.
+1. Snapshots are lightweight and immutable. They serve as the read context for callers that need consistent multi-read
+   operations without performing writes.
+
+##### Transactions
+
+A transaction is a mutable, read-write context backed by an ephemeral Storage Layer branch.
+
+1. `CreateTransaction(parent_id?)` returns a transaction_id. If parent_id is omitted, the ephemeral branch is forked from
+   the canonical branch head. If parent_id is a snapshot ID, the branch is forked from that snapshot's Storage Layer
+   commit. If parent_id is a transaction ID, the branch is forked from the parent transaction's current head Storage Layer
+   commit, creating a sub-transaction.
+1. Reads within a transaction use the transaction's ephemeral branch head, which includes the transaction's own writes.
+   This provides read-after-write visibility within the transaction. Snapshot isolation applies relative to other
+   concurrent Artifact Layer transaction commits: reads are isolated from changes that other transactions commit to the
+   canonical branch after this transaction was created. This gives the behavior expected by application developers and
+   avoids subtle bugs where transactional logic sees partially-committed external state.
+1. Each write operation (Create/Update/Delete) within a transaction is executed as a sub-branch of the transaction's
+   ephemeral branch: the Artifact Layer forks a child branch from the transaction branch head, stages the artifact payload
+   and all derived index updates on the child branch, commits them as a single Storage Layer commit, and merges the child
+   branch back into the transaction branch. This ensures that each logical write is atomic (artifact + indexes are committed
+   together) and that concurrent writes within the same transaction do not interfere via a shared staging area. Without this
+   isolation, two concurrent writes on the same transaction branch could race: both stage objects, and whichever calls the
+   Storage Layer commit first would capture the other's uncommitted staged changes. The sub-branch-per-write pattern
+   serializes writes through the merge step.
+1. `CommitTransaction(transaction_id)` finalizes the transaction: the ephemeral branch is merged into its parent. For a
+   top-level transaction, this is a merge into the canonical branch. For a sub-transaction, this is a merge into the
+   parent transaction's ephemeral branch. Conflicts detected during the Storage Layer merge are handled per the Conflict
+   retry policy.
+1. `RollbackTransaction(transaction_id)` abandons the transaction without merging. The ephemeral branch is deleted.
+1. Delete operations that cascade or nullify references perform all dependent writes in the same transaction (same
+   sub-branch), ensuring the artifact deletion and all referential integrity side-effects are committed atomically.
+
+##### Recursive (nested) transactions
+
+Transactions support nesting: a sub-transaction can be created by providing a parent transaction ID to
+`CreateTransaction`. Sub-transactions are independent ephemeral branches forked from the parent transaction's head.
+
+1. Committing a sub-transaction merges its ephemeral branch into the parent transaction's branch (not the canonical
+   branch).
+1. Rolling back a sub-transaction discards its branch without affecting the parent.
+1. The parent transaction can continue to accumulate writes from multiple sub-transactions before committing to the
+   canonical branch.
+1. This model supports patterns such as retryable steps within a larger workflow, parallel sub-tasks that merge into a
+   shared transaction, and long-running processes with staged checkpoints.
+
+##### Implicit transactions
+
+For convenience, single write operations (Create/Update/Delete) that are not issued within an explicit transaction are
+wrapped in an implicit transaction: the Artifact Layer creates an ephemeral branch from the canonical branch head, stages
+the artifact and all derived index updates, commits them as a single Storage Layer commit, and merges the ephemeral
+branch back into the canonical branch before returning success. Since implicit transactions contain exactly one write,
+there is no concurrency on the staging area and no sub-branch is needed. This preserves simple semantics for single
+operations while allowing callers to opt into explicit transactions for multi-write atomicity.
+
+##### General semantics
+
+1. Read-after-write within a transaction: reads within a transaction see the transaction's own writes. Each write is
+   committed to the transaction's ephemeral branch (via the sub-branch-per-write pattern), and subsequent reads use the
+   branch head.
+1. Snapshot isolation from concurrent commits: a transaction is isolated from other transactions' Artifact Layer commits
+   to the canonical branch. The transaction's reads see the canonical branch state as of when the transaction was created,
+   plus the transaction's own writes.
+1. Read-after-commit: once an Artifact Layer transaction commit succeeds, subsequent reads against the canonical branch
+   (or new snapshots/transactions) reflect the committed writes.
+1. Multi-key and cross-artifact atomic writes are supported within a single transaction. All writes in a transaction are
+   merged atomically on Artifact Layer transaction commit.
+1. Concurrent writes within the same transaction: the sub-branch-per-write pattern serializes concurrent writes through
+   the merge step into the transaction branch. Two concurrent writes will each operate on their own sub-branch; the second
+   to merge will see the first's changes in the transaction branch and may conflict if they touch the same objects (for
+   example, the same index). This is handled by the same Conflict retry policy as inter-transaction conflicts.
+1. Concurrent transactions may diverge on separate ephemeral branches; conflict ownership is defined in the Conflict
+   retry policy and conflicts surface at Artifact Layer transaction commit time.
+1. If a write fails mid-transaction (for example, index derivation rejects a NaN float key), the sub-branch for that
+   write is abandoned without merging into the transaction branch. The transaction remains open and the caller may retry
+   the write or roll back the transaction.
 1. Unique index enforcement is described in Index definition and Index merge semantics.
+
+##### Cleanup and TTL for abandoned transactions
+
+If a caller crashes without calling CommitTransaction or RollbackTransaction, the ephemeral branch is orphaned.
+
+1. Ephemeral branches that have not been committed or rolled back within a configurable TTL (default: 7 days) are
+   eligible for cleanup. The artifact layer periodically scans for expired ephemeral branches and deletes them.
+1. The LakeFS Spark vacuum process also removes Storage Layer commits on branches that are not recent and not pinned by a
+   tag or referenced as a branch head, providing a secondary cleanup mechanism.
+
+##### App Layer guidance
+
+1. **Read lifetimes**: Snapshots and transactions provide a consistent read context. Callers should be aware that a
+   snapshot represents a point-in-time view; long-lived snapshots may read stale data. For use cases requiring fresh
+   reads, create a new snapshot or transaction.
+1. **Multiple reads**: When an operation depends on reading multiple artifacts or indexes consistently, perform all reads
+   within a single snapshot or transaction to guarantee they see the same state.
+1. **Multi-write transactions**: When an operation requires multiple writes that must be atomic (or writes that depend on
+   consistent reads), use an explicit transaction. The transaction guarantees that all writes are committed together and
+   that reads within the transaction see a consistent snapshot.
+1. **BatchGetArtifacts limitation**: BatchGetArtifacts returns artifacts by ID but does not follow references. When
+   artifacts contain references to other artifacts, the caller must issue additional reads to resolve references. A
+   reference-aware batch fetch is a planned follow-up.
 
 #### Artifact envelope (optional)
 
@@ -800,50 +911,64 @@ registration time.
 ### Launch API surface (minimum)
 
 The Artifact Layer exposes a minimal API surface for launch and uses gRPC for service-to-service communication. The
-server hides branches and transaction mechanics; callers only see resolved storage version IDs and structured
-conflict responses. Client-to-app-layer transport remains application-specific and will be decided per application.
+server hides Storage Layer branch and merge mechanics; callers interact with snapshots and transactions and receive
+structured conflict responses at Artifact Layer transaction commit time. Client-to-app-layer transport remains
+application-specific and will be decided per application.
+
+#### Snapshot and transaction API
+
+Operations:
+1. CreateSnapshot(parent_id?) -> snapshot_id
+2. CreateTransaction(parent_id?) -> transaction_id
+3. CommitTransaction(transaction_id)
+4. RollbackTransaction(transaction_id)
+
+Semantics are defined in Consistency and transaction semantics. All CRUD and index fetch operations accept an optional
+snapshot_id or transaction_id to scope reads and writes. Writes issued without a transaction context are wrapped in an
+implicit transaction (see Implicit transactions).
 
 #### Artifact CRUD API
 
 Operations (gRPC service-to-service; client-to-app transport is application-specific):
-1. CreateArtifact(type_name, version_id?, payload)
-2. GetArtifact(artifact_id)
-3. BatchGetArtifacts(artifact_ids)
-4. UpdateArtifact(artifact_id, expected_storage_version_id, type_name, version_id?, payload)
-5. DeleteArtifact(artifact_id, expected_storage_version_id)
+1. CreateArtifact(type_name, version_id?, payload, transaction_id?)
+2. GetArtifact(artifact_id, snapshot_id | transaction_id?)
+3. BatchGetArtifacts(artifact_ids, snapshot_id | transaction_id?)
+4. UpdateArtifact(artifact_id, type_name, version_id?, payload, transaction_id?)
+5. DeleteArtifact(artifact_id, transaction_id?)
 
 Request/response expectations:
 1. artifact_id is allocated by the artifact layer via a separate ID service and returned in Create responses.
 1. version_id is an optional uint64 (TypeVersionDefinition artifact_id) for Create/Update; resolution behavior is defined
    in Type identity and versioning. If omitted, the artifact layer resolves to the TypeDefinition's current_version_id.
-1. Update/Delete require an expected storage version ID (test-and-set per Artifact contract); mismatches return a
-   VERSION_MISMATCH conflict. Update/Delete are rejected if the TypeDefinition's `immutable` flag is true.
+1. Update/Delete are rejected if the TypeDefinition's `immutable` flag is true.
 1. Create/Update validate referential integrity for reference fields; deletes may be rejected (RESTRICT) or may cascade
    or nullify references depending on declared `on_delete` behavior.
-1. Reads return payload bytes plus type_name, version_id (the resolved TypeVersionDefinition artifact_id), and storage
-   version ID.
+1. Reads return payload bytes plus type_name and version_id (the resolved TypeVersionDefinition artifact_id).
 1. BatchGetArtifacts returns results in the same order as the input IDs using explicit per-id results (for example, a
    `oneof { artifact, not_found }` wrapper) so missing or tombstoned artifacts preserve positional correlation.
-1. Create/Update/Delete return the resolved version_id and the new storage version ID.
+   BatchGetArtifacts does not follow references; see App Layer guidance for limitations.
+1. Create/Update/Delete return the resolved version_id.
 1. Delete and tombstone behavior is defined in Delete semantics and retention.
+1. Conflicts are surfaced at Artifact Layer transaction commit time (CommitTransaction), not on individual write calls.
+   For implicit transactions, the conflict response is returned from the write call itself.
 
 Conflict/error behavior: conflict types, response payloads, and auto-resolution eligibility are defined in the Conflict
 retry policy (MVP). The conflict response uses conflict_type values INDEX_CONFLICT, PAYLOAD_CONFLICT, and
-VERSION_MISMATCH, and REFERENTIAL_INTEGRITY_VIOLATION.
+REFERENTIAL_INTEGRITY_VIOLATION.
 
 #### Index fetch API
 
 Operation:
-1. FetchIndex(key_type, key)
+1. FetchIndex(key_type, key, snapshot_id | transaction_id?)
 
 Inputs:
 1. key_type identifies the index definition.
 1. key must include the complete set of key fields; partial keys are rejected.
+1. An optional snapshot_id or transaction_id scopes the read (see Index fetch behavior).
 
 Response:
 1. Returns the index object stored for (key_type, encoded key values) in deterministic order.
-1. Response shape and field semantics are defined in Index fetch behavior (MVP), including the generated index message
-   and optional storage version ID.
+1. Response shape and field semantics are defined in Index fetch behavior (MVP), including the generated index message.
 
 #### Type registry API
 
@@ -854,7 +979,7 @@ enforce additional validation rules that the generic CRUD API does not.
 1. RegisterTypeVersion(type_name, proto_source) -> version_id
 1. GetTypeVersion(version_id) -> TypeVersionDefinition
 1. ListTypeVersions(type_name) -> repeated version_id
-1. SetCurrentTypeVersion(type_name, version_id, expected_version_id)
+1. SetCurrentTypeVersion(type_name, version_id, transaction_id?)
 1. ResolveTypeVersion(type_name) -> version_id (current)
 
 **RegisterTypeVersion** compiles the .proto source into a FileDescriptorSet (injecting system protos as well-known
@@ -870,7 +995,8 @@ imports), locates the message identified by type_name in the descriptor set, and
    may allow `IS_SET`). For each reference, checks `reference_key_type_unique`: if a ReferenceDefinition already exists,
    validates compatibility; if not, creates a new ReferenceDefinition artifact.
 5. Creates a TypeVersionDefinition artifact (type_id = TypeDefinition artifact_id, descriptor_set, proto_source).
-6. Derives all index entries for the new artifacts and commits atomically.
+6. Derives all index entries for the new artifacts and commits the Artifact Layer transaction atomically (merging the
+   ephemeral branch into the canonical branch in the Storage Layer).
 7. Returns the new TypeVersionDefinition artifact_id (the version_id).
 
 Schema compatibility rules for launch:
@@ -891,10 +1017,12 @@ Schema compatibility rules for launch:
 **ListTypeVersions** fetches the `type_versions_by_type` index for the TypeDefinition's artifact_id, returning version
 artifact_ids in creation order.
 
-**SetCurrentTypeVersion** updates the TypeDefinition artifact's `current_version_id` field via UpdateArtifact with
-test-and-set semantics. The `expected_version_id` is the current_version_id that the caller expects (use 0 or absent for
-the initial set). The registry validates that the target version_id references a TypeVersionDefinition whose type_id
-matches the TypeDefinition's artifact_id before applying the update.
+**SetCurrentTypeVersion** updates the TypeDefinition artifact's `current_version_id` field via UpdateArtifact. If a
+transaction_id is provided, the update runs within that transaction; otherwise it uses an implicit transaction. Concurrent
+version pointer updates are detected as payload conflicts at Artifact Layer transaction commit time — the caller reads the
+TypeDefinition within a transaction, updates `current_version_id`, and if another transaction committed a change to the
+same TypeDefinition in the interim, the merge produces a conflict. The registry validates that the target version_id
+references a TypeVersionDefinition whose type_id matches the TypeDefinition's artifact_id before applying the update.
 
 RegisterTypeVersion and SetCurrentTypeVersion are separate operations. A registered version that is not yet current is a
 valid state — it can be used explicitly by callers that specify a version_id, but will not be resolved by default. Type
