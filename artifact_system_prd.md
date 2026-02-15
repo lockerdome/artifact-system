@@ -553,8 +553,9 @@ descriptor set at runtime. An artifact type's metadata includes:
    registration; interpretation is an App Layer concern and is not consumed by the artifact layer at launch.
 3. Viewer: a MessageOption defining the default viewer endpoint. Same as Actions — stored but not interpreted at launch.
 4. Custom Instruction: a MessageOption defining LLM instructions for the type.
-5. Referential integrity: a FieldOption (`references`) declaring artifact-to-artifact references.
-6. A FieldOption for single-field indexes may be added later.
+5. Descriptions: MessageOption and FieldOption strings for human- and LLM-readable descriptions.
+6. Referential integrity: a FieldOption (`references`) declaring artifact-to-artifact references.
+7. A FieldOption for single-field indexes may be added later.
 
 #### Protocol buffers as the type definition
 
@@ -579,8 +580,8 @@ supported (see below) and must be retained at runtime so that metadata is availa
 
 Type metadata is defined using protobuf custom options (extensions). In proto3, extensions are permitted only for custom
 options, which aligns with our needs.
-1. Message options: indexes, actions, viewer endpoint, LLM instructions.
-2. Field options: referential integrity (`references`).
+1. Message options: indexes, actions, viewer endpoint, LLM instructions, message descriptions.
+2. Field options: referential integrity (`references`) and field descriptions.
 3. Field options (optional): syntactic sugar for single-field indexes.
 4. Virtual fields (planned): a MessageOption for declaring computed fields; the expression AST schema is to be defined.
 
@@ -695,6 +696,7 @@ message IndexDefinition {
 
 extend google.protobuf.MessageOptions {
   repeated IndexDefinition indexes = 50002;
+  optional string description = 50004;
 }
 
 message ReferenceOption {
@@ -710,6 +712,7 @@ message ReferenceOption {
 
 extend google.protobuf.FieldOptions {
   optional ReferenceOption references = 50003;
+  optional string description = 50005;
 }
 
 // Built-in types: TypeDefinition, TypeVersionDefinition, IndexDefinition, and
