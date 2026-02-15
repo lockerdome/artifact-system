@@ -25,6 +25,7 @@
 #### Post-launch goals
 1. Partial-update APIs that avoid full rewrites; any modification writes a full new object and duplicates unchanged data.
 1. Index sharding and index migrations (backfills/reindexes).
+1. Index where clauses (predicate-based indexing).
 1. Caching layers, triggers, and virtual/computed fields.
 1. Application-defined payload merges (including CRDT-based merges) beyond index-derived merges.
 1. Extended artifact validation beyond proto3 structural checks and referential integrity (semantic/business rules).
@@ -179,14 +180,10 @@ An index definition includes:
    the field type's sort order. The special field name artifact_id refers to the artifact ID (not a payload field) and
    must be included as an order field to make each row uniquely identifiable. In the MVP, artifact_id is required but
    does not need to be the final order field. This is a simplification of a general unique constraint on index rows.
-4. where clause: an optional predicate tree that determines whether a value should be indexed. The WhereClause is a
-   recursive structure: leaf nodes are binary (==, !=, >, <, >=, <=) or unary (IS_SET) predicates; compound nodes are
-   And or Or combinators that contain child clauses. Binary clauses require a field as LHS and a field or constant as
-   RHS. IS_SET checks whether an `optional` field has explicit presence and is the preferred way to gate an index on
-   field presence. The != (NE) binary operator can also serve as a presence gate for `optional` fields (since missing
-   fields evaluate to false for any comparison), but IS_SET is unambiguous and does not depend on choosing a sentinel
-   RHS value. If multiple conditions are needed, wrap them in an And or Or clause; there is no implicit conjunction.
-5. unique: whether the index enforces at most one artifact ID per index key.
+4. unique: whether the index enforces at most one artifact ID per index key.
+
+Where clauses are deferred to post-MVP. When introduced, IndexDefinition will gain an optional predicate expression; the
+expression AST is shared with virtual/computed fields and is a near-term design decision (see Post-MVP notes).
 
 #### Index merge semantics
 
@@ -265,7 +262,8 @@ deterministic serialization (sorted map keys, fixed field order).
 #### Index fetch behavior (MVP)
 
 The index fetch API (FetchIndex) provides a raw fetch of the materialized index results for a specific index key. There is no
-pagination, cursoring, filtering, or query-time predicate evaluation in the MVP.
+pagination, cursoring, filtering, or query-time predicate evaluation in the MVP. Predicate-based indexing (where clauses) is
+post-MVP; FetchIndex returns the stored index state only.
 
 **Inputs**
 1. key_type: identifies which index definition to query.
@@ -279,10 +277,6 @@ pagination, cursoring, filtering, or query-time predicate evaluation in the MVP.
 1. Results are returned in the deterministic order defined by the index's order fields. Ordering stability is defined
    by the index definition and does not vary per query.
 1. No query-time filters are applied. The query returns exactly the contents of the index object.
-
-**Where clauses vs fetch-time behavior**
-1. where clauses are evaluated only at index build/update time against artifact payloads.
-1. Fetch execution never re-evaluates where clauses or artifact payloads; it operates solely on the stored index state.
 
 **Response shape**
 The response payload is the concrete, generated index message for the queried index (for example,
@@ -369,9 +363,9 @@ derived materializations for reverse lookup and enforcement.
    null. Repeated reference fields treat an empty list as null.
 1. `target_type_name` must resolve to an existing TypeDefinition via the `type_name_unique` index.
 1. A covering index is required on the referencing message: exactly one index must exist where the reference field is
-   the **sole key** and the where clause is either absent or a single `IS_SET` on the reference field. The covering index
-   may be unique or non-unique. `IS_SET` is recommended when adding optional reference fields to existing types to avoid
-   indexing unset values. For repeated reference fields, the covering index must have no where clause.
+   the **sole key**. The covering index may be unique or non-unique. In the MVP, the covering index must not include a
+   where clause; post-MVP may allow a single `IS_SET` predicate to gate optional reference fields. For repeated reference
+   fields, the covering index has no where clause.
 1. Multiple reference fields are allowed per message; each is validated independently.
 
 **Write-time validation**
@@ -412,7 +406,7 @@ the storage version ID, and returns that version to the caller.
 1. Empty payloads are reserved for tombstones. The artifact layer rejects zero-length payloads for live artifacts; if a
    type needs to represent an "empty" value, include a sentinel field or wrap it in an envelope message.
 1. Index handling: deleting an artifact removes all derived index entries for that artifact ID (as if the artifact no
-   longer matches any where clauses). Unique indexes free the slot. If an index becomes empty, it is tombstoned by
+   longer qualifies for any index entries). Unique indexes free the slot. If an index becomes empty, it is tombstoned by
    storing an index object with an empty value portion (row_count = 0 and no value entries) so merges can detect
    deletions.
 1. Referential integrity: deletes may be rejected (RESTRICT), cascade, or nullify references based on reference field
@@ -475,9 +469,9 @@ artifact layer binary but are also stored as artifacts so the system is fully se
    `immutable = true`); once registered, a version cannot be modified or deleted. Metadata such as index definitions,
    actions, viewer endpoints, and LLM instructions are attached as custom options within the descriptor set and are not
    denormalized onto the TypeVersionDefinition message (see Custom options as metadata).
-3. **IndexDefinition**: represents a single index. Contains the key_type, key fields, order fields, optional where
-   clause, and unique flag. IndexDefinition is immutable. Each IndexDefinition artifact receives an artifact_id that is
-   used as the key_prefix in index storage paths (see Index physical storage).
+3. **IndexDefinition**: represents a single index. Contains the key_type, key fields, order fields, and unique flag.
+   Where clauses are post-MVP. IndexDefinition is immutable. Each IndexDefinition artifact receives an artifact_id that
+   is used as the key_prefix in index storage paths (see Index physical storage).
 4. **ReferenceDefinition**: represents a single referential integrity declaration. Contains the referencing type, target
    type, reference field, covering index key_type, and on_delete behavior. key_type is a globally unique identifier;
    the recommended format is `{referencing_type_name}.{field_name}`. The unique key_type is used by the registry to
@@ -583,14 +577,15 @@ options, which aligns with our needs.
 1. Message options: indexes, actions, viewer endpoint, LLM instructions, message descriptions.
 2. Field options: referential integrity (`references`) and field descriptions.
 3. Field options (optional): syntactic sugar for single-field indexes.
-4. Virtual fields (planned): a MessageOption for declaring computed fields; the expression AST schema is to be defined.
+4. Virtual fields (planned): a MessageOption for declaring computed fields; the expression AST is shared with index
+   predicates and is a near-term design decision (see Post-MVP notes).
 
 Custom options must use runtime retention (not source-only retention) so they appear in the descriptor set. The registry
 loads the descriptor set with the option extensions so the artifact layer can read metadata deterministically.
 
 The artifact system's own proto definitions (IndexDefinition, ReferenceDefinition, ReferenceOption, OrderDefinition,
-WhereClause, the `indexes` and `references` message extensions, and other system messages) are injected as well-known
-imports at load time rather than stored in each
+the expression AST (post-MVP), the `indexes` and `references` message extensions, and other system messages) are
+injected as well-known imports at load time rather than stored in each
 TypeVersionDefinition's descriptor set. This keeps descriptor sets smaller and ensures that system proto changes do not
 require re-registering all existing types. During compilation, the registry provides these system protos as available
 imports alongside the standard google.protobuf imports.
@@ -602,32 +597,18 @@ defines one index for the enclosing message type.
 
 OrderDefinition.direction is required; the registry rejects index definitions with ORDER_BY_UNSPECIFIED.
 
-WhereClause must set exactly one variant of the `clause` oneof. The op field is required in leaf variants; the registry
-rejects clauses with OP_UNSPECIFIED. For BinaryWhereClause, the LHS must be a field and the RHS must be set (field or
-constant). For UnaryWhereClause, IS_SET is only valid on fields with explicit presence (`optional`); the registry rejects
-IS_SET on implicit-presence scalars. AndWhereClause and OrWhereClause must contain at least two child clauses; the
-registry rejects empty or single-element compound clauses (use the child directly instead). The registry enforces a
-maximum nesting depth to prevent unbounded recursion.
+Index where clauses are post-MVP; see Post-MVP notes for candidate expression AST and validation rules.
 
 ReferenceOption is valid only on `uint64`, `optional uint64`, or `repeated uint64` fields. `on_delete` is required, and
 `SET_NULL` is only valid on `optional` or `repeated` fields. Each reference requires exactly one covering index with the
-reference field as the sole key and a where clause that is either absent or a single `IS_SET` on the reference field; the
-registry rejects missing or ambiguous coverage. Repeated reference fields must not contain duplicate values.
+reference field as the sole key (no where clause in the MVP); the registry rejects missing or ambiguous coverage.
+Repeated reference fields must not contain duplicate values. Post-MVP may allow a single `IS_SET` predicate for optional
+fields.
 
 ```proto
 syntax = "proto3";
 
 import "google/protobuf/descriptor.proto";
-
-message Constant {
-  oneof value {
-    string string_value = 1;
-    int64 int64_value = 2;
-    uint64 uint64_value = 3;
-    bool bool_value = 4;
-    double double_value = 5;
-  }
-}
 
 message OrderDefinition {
   string field = 1;
@@ -639,50 +620,6 @@ message OrderDefinition {
   OrderBy direction = 2;
 }
 
-message BinaryWhereClause {
-  string lhs = 1;
-  enum Op {
-    OP_UNSPECIFIED = 0;
-    GT = 1;
-    LT = 2;
-    LTE = 3;
-    GTE = 4;
-    EQ = 5;
-    NE = 6;
-  }
-  Op op = 2;
-  oneof rhs {
-    string rhs_field = 3;
-    Constant rhs_value = 4;
-  }
-}
-
-message UnaryWhereClause {
-  string field = 1;
-  enum Op {
-    OP_UNSPECIFIED = 0;
-    IS_SET = 1;
-  }
-  Op op = 2;
-}
-
-message AndWhereClause {
-  repeated WhereClause clauses = 1;
-}
-
-message OrWhereClause {
-  repeated WhereClause clauses = 1;
-}
-
-message WhereClause {
-  oneof clause {
-    BinaryWhereClause binary = 1;
-    UnaryWhereClause unary = 2;
-    AndWhereClause and = 3;
-    OrWhereClause or = 4;
-  }
-}
-
 message IndexDefinition {
   option (indexes) = { key_type: "index_key_type_unique" key: ["key_type"] order: { field: "artifact_id" direction: ASCENDING } unique: true };
   option (indexes) = { key_type: "all_index_definitions" key: [] order: { field: "artifact_id" direction: ASCENDING } };
@@ -690,7 +627,7 @@ message IndexDefinition {
   string key_type = 1;
   repeated string key = 2;
   repeated OrderDefinition order = 3;
-  optional WhereClause where = 4;
+  optional WhereClause where = 4; // post-MVP (see Post-MVP notes)
   bool unique = 5;
 }
 
@@ -824,12 +761,12 @@ rejects index payloads where column lengths differ or `row_count` does not match
 
 #### Field presence and indexing semantics
 
-Index and predicate evaluation use protobuf field semantics:
-1. Optional fields have explicit presence; if unset, the field is treated as missing for where clauses and index keys.
-   A missing field causes any where clause comparison involving it to evaluate to false (the artifact is excluded from
-   the index). This is not three-valued logic; there is no "unknown" — missing is simply non-matching.
+Index derivation uses protobuf field semantics:
+1. Optional fields have explicit presence; if unset, the field is treated as missing for index keys/order fields and the
+   artifact contributes no index entry for that index. When predicate-based indexing is added (post-MVP), missing fields
+   evaluate to false in predicate clauses (no three-valued logic).
 2. Implicit-presence scalar fields (proto3 without optional) have no presence; missing is indistinguishable from the
-   default value. For any field used in predicates or index keys, prefer optional.
+   default value. For any field used in index keys/order fields (and future predicates), prefer optional.
 3. Message-typed fields always have presence; they can be indexed only if a specific scalar sub-field is referenced.
 4. Repeated scalar fields generate one index entry per element value. When a repeated field is used as an index key
    field, the artifact appears in a separate index object for each distinct value in the repeated field. For example, if
@@ -929,9 +866,9 @@ imports), locates the message identified by type_name in the descriptor set, and
 3. Extracts index declarations from the message's custom options. For each key_type, checks the `index_key_type_unique`
    index: if an IndexDefinition already exists, validates compatibility; if not, creates a new IndexDefinition artifact.
 4. Extracts reference declarations from field options. For each reference, validates field type, `on_delete`,
-   `target_type_name`, and presence of a covering index (reference field as sole key with a where clause that is either
-   absent or a single `IS_SET` on the reference field). For each reference, checks `reference_key_type_unique`: if a
-   ReferenceDefinition already exists, validates compatibility; if not, creates a new ReferenceDefinition artifact.
+   `target_type_name`, and presence of a covering index (reference field as sole key; no where clause in the MVP; post-MVP
+   may allow `IS_SET`). For each reference, checks `reference_key_type_unique`: if a ReferenceDefinition already exists,
+   validates compatibility; if not, creates a new ReferenceDefinition artifact.
 5. Creates a TypeVersionDefinition artifact (type_id = TypeDefinition artifact_id, descriptor_set, proto_source).
 6. Derives all index entries for the new artifacts and commits atomically.
 7. Returns the new TypeVersionDefinition artifact_id (the version_id).
@@ -942,13 +879,13 @@ Schema compatibility rules for launch:
    permitted; removing `oneof` fields or the `oneof` itself is a breaking change. Changing a field between `optional`,
    `required`, and `repeated` is a type change.
 1. Existing index definitions must not be removed or modified. A modification is any change that would alter what is
-   indexed or the shape of the index payload: changes to key fields, order fields, where clauses, or the unique flag.
-   Such changes require a full index rebuild (backfill), which is post-launch.
+   indexed or the shape of the index payload: changes to key fields, order fields, or the unique flag. Such changes
+   require a full index rebuild (backfill), which is post-launch. Predicate changes (post-MVP) would also require a
+   rebuild.
 1. Existing reference declarations must not be removed or modified. A modification includes changes to target_type_name,
    the reference field, the covering index key_type, or the on_delete behavior. Such changes are post-launch.
 1. New fields, new indexes, and new reference declarations may be added. New indexes apply only to writes after
-   registration (no backfill in the MVP), so index completeness for historical data is not guaranteed. Where clauses
-   should be used to make the index valid for the subset of artifacts it claims to cover.
+   registration (no backfill in the MVP), so index completeness for historical data is not guaranteed.
 1. Field number reassignment is rejected.
 
 **ListTypeVersions** fetches the `type_versions_by_type` index for the TypeDefinition's artifact_id, returning version
@@ -967,3 +904,97 @@ registration and current-pointer updates are low-concurrency administrative oper
 
 The App Layer applies domain-specific rules, permissions, and workflows on top of the Artifact Layer. Its design is out
 of scope for this document and will be covered in a separate PRD. An example App Layer service is an Artifact Viewer.
+
+## Post-MVP notes
+
+### Index where clauses and expression AST
+
+Index where clauses are deferred from the MVP. When introduced, they gate index entry derivation only; FetchIndex never
+re-evaluates predicates and returns the stored index state.
+
+We will explore an AST structure that can handle both complex where clauses and virtual/computed fields. The scratch below
+is a candidate shape and will be refined.
+
+**Candidate semantics**
+1. The predicate tree is recursive: leaf nodes are binary (==, !=, >, <, >=, <=) or unary (IS_SET) predicates; compound
+   nodes are And or Or combinators that contain child clauses.
+2. Binary clauses require a field as LHS and a field or constant as RHS.
+3. IS_SET checks whether an `optional` field has explicit presence and is the preferred way to gate an index on
+   presence. The != (NE) binary operator can also serve as a presence gate for `optional` fields (since missing fields
+   evaluate to false for any comparison), but IS_SET is unambiguous and does not depend on choosing a sentinel RHS value.
+4. If multiple conditions are needed, wrap them in an And or Or clause; there is no implicit conjunction.
+
+**Validation (candidate)**
+1. WhereClause must set exactly one variant of the `clause` oneof; the op field is required in leaf variants and
+   OP_UNSPECIFIED is rejected.
+2. For BinaryWhereClause, the LHS must be a field and the RHS must be set (field or constant).
+3. For UnaryWhereClause, IS_SET is valid only on fields with explicit presence (`optional`); reject IS_SET on
+   implicit-presence scalars.
+4. AndWhereClause and OrWhereClause must contain at least two child clauses; reject empty or single-element compounds
+   (use the child directly instead).
+5. Enforce a maximum nesting depth to prevent unbounded recursion.
+
+**Proto scratch (candidate)**
+```proto
+message Constant {
+  oneof value {
+    string string_value = 1;
+    int64 int64_value = 2;
+    uint64 uint64_value = 3;
+    bool bool_value = 4;
+    double double_value = 5;
+  }
+}
+
+message BinaryWhereClause {
+  string lhs = 1;
+  enum Op {
+    OP_UNSPECIFIED = 0;
+    GT = 1;
+    LT = 2;
+    LTE = 3;
+    GTE = 4;
+    EQ = 5;
+    NE = 6;
+  }
+  Op op = 2;
+  oneof rhs {
+    string rhs_field = 3;
+    Constant rhs_value = 4;
+  }
+}
+
+message UnaryWhereClause {
+  string field = 1;
+  enum Op {
+    OP_UNSPECIFIED = 0;
+    IS_SET = 1;
+  }
+  Op op = 2;
+}
+
+message AndWhereClause {
+  repeated WhereClause clauses = 1;
+}
+
+message OrWhereClause {
+  repeated WhereClause clauses = 1;
+}
+
+message WhereClause {
+  oneof clause {
+    BinaryWhereClause binary = 1;
+    UnaryWhereClause unary = 2;
+    AndWhereClause and = 3;
+    OrWhereClause or = 4;
+  }
+}
+
+message IndexDefinition {
+  string key_type = 1;
+  repeated string key = 2;
+  repeated OrderDefinition order = 3;
+  optional WhereClause where = 4;
+  bool unique = 5;
+}
+```
