@@ -352,6 +352,13 @@ resolved version_id (the TypeVersionDefinition artifact_id). All writes occur wi
 conflicts are detected at Artifact Layer transaction commit (see Consistency and transaction semantics). Reads return
 payload bytes plus type_name and version_id. Partial updates are out of scope for launch.
 
+**Internal mutability**: Certain artifact layer operations require updating immutable artifacts as part of their internal
+logic. For example, RegisterTypeVersion updates the tail TypeVersionDefinition's `next_version_id` pointer even though
+TypeVersionDefinition is immutable. These internal updates bypass the public immutability check and are limited to
+specific fields managed by the artifact layer itself. External callers cannot trigger internal-mutability updates through
+the public CRUD API. This is a stopgap mechanism; post-MVP field-level mutability will provide a principled way to
+declare which fields are mutable on otherwise-immutable types (see Post-MVP notes).
+
 The artifact layer stores payload bytes as provided and does not reserialize them. This preserves unknown fields and
 avoids any reliance on canonical protobuf binary encodings. Text/JSON formats are not used for storage.
 
@@ -575,11 +582,15 @@ artifact layer binary but are also stored as artifacts so the system is fully se
    TypeVersionDefinition. Also carries an `immutable` flag: when true, UpdateArtifact and DeleteArtifact are rejected for
    artifacts of this type (Create is still permitted through the registry API).
 2. **TypeVersionDefinition**: represents a specific version of a type. Contains the type_id (artifact_id of the parent
-   TypeDefinition), the compiled FileDescriptorSet, and the original .proto source. Multiple TypeVersionDefinition
+   TypeDefinition), the compiled FileDescriptorSet, the original .proto source, and optional `previous_version_id` /
+   `next_version_id` pointers that form a doubly-linked list of versions per type. Multiple TypeVersionDefinition
    artifacts may exist for a single TypeDefinition. TypeVersionDefinition is immutable (its TypeDefinition has
-   `immutable = true`); once registered, a version cannot be modified or deleted. Metadata such as index definitions,
-   actions, viewer endpoints, and LLM instructions are attached as custom options within the descriptor set and are not
-   denormalized onto the TypeVersionDefinition message (see Custom options as metadata).
+   `immutable = true`); once registered, a version cannot be modified or deleted through the public API. The
+   `next_version_id` pointer is an exception: it is internally mutable — the artifact layer updates the tail version's
+   `next_version_id` when a new version is registered (see RegisterTypeVersion). This internal mutability is limited to
+   the `next_version_id` field and is a stopgap until field-level mutability support is added post-MVP. Metadata such
+   as index definitions, actions, viewer endpoints, and LLM instructions are attached as custom options within the
+   descriptor set and are not denormalized onto the TypeVersionDefinition message (see Custom options as metadata).
 3. **IndexDefinition**: represents a single index. Contains the key_type, key fields, order fields, and unique flag.
    Where clauses are post-MVP. IndexDefinition is immutable. Each IndexDefinition artifact receives an artifact_id that
    is used as the key_prefix in index storage paths (see Index physical storage).
@@ -643,6 +654,9 @@ The genesis commit creates artifacts in the following dependency order:
     `TypeVersionDefinition.type_id` -> `TypeDefinition`, `TypeDefinition.current_version_id` -> `TypeVersionDefinition`).
 11. **All derived index entries**: populate every bootstrap index with entries for all artifacts created above.
 12. **Atomic commit**: the entire genesis state is committed as a single transaction to the canonical branch.
+
+Each built-in type has exactly one TypeVersionDefinition at genesis, so `previous_version_id` and `next_version_id` are
+both unset. Subsequent versions registered via the standard RegisterTypeVersion path will link to the genesis version.
 
 After the genesis commit, the system is self-describing and all subsequent operations (including user type registrations)
 use the standard RegisterTypeVersion code path. The genesis commit is idempotent — if the canonical branch already
@@ -782,6 +796,8 @@ message TypeVersionDefinition {
   uint64 type_id = 1;
   google.protobuf.FileDescriptorSet descriptor_set = 2;
   string proto_source = 3;
+  optional uint64 previous_version_id = 4;
+  optional uint64 next_version_id = 5;
 }
 
 message ReferenceDefinition {
@@ -908,6 +924,15 @@ Versions are identified by their artifact_id (a uint64), not by a human-readable
 artifact_id). Callers that need a specific non-current version must reference it by artifact_id, which is returned at
 registration time.
 
+Type versions form an explicit doubly-linked list per type via `previous_version_id` and `next_version_id` pointers on
+TypeVersionDefinition. The first version for a type has `previous_version_id` unset; the most recent (tail) version has
+`next_version_id` unset. When a new version is registered, the artifact layer sets the new version's
+`previous_version_id` to the current tail and updates the tail's `next_version_id` to the new version's artifact_id.
+This linked-list structure enforces explicit serialization of version registration: if two transactions concurrently
+register versions for the same type, both attempt to update the same tail version's `next_version_id`, producing an
+artifact payload conflict that is never auto-resolved (see Conflict retry policy). This forces concurrent registrations
+to be retried sequentially, preventing ambiguous version ordering.
+
 ### Launch API surface (minimum)
 
 The Artifact Layer exposes a minimal API surface for launch and uses gRPC for service-to-service communication. The
@@ -986,15 +1011,21 @@ enforce additional validation rules that the generic CRUD API does not.
 imports), locates the message identified by type_name in the descriptor set, and validates the schema. It then:
 1. Looks up the TypeDefinition via the `type_name_unique` index. If not found, creates a new TypeDefinition artifact
    (`type_name`, `current_version_id` unset, `immutable = false` for user types).
-2. If a prior TypeVersionDefinition exists for this type (checked via `type_versions_by_type` index), validates schema
-   compatibility against the most recent version.
+2. If a prior TypeVersionDefinition exists for this type (checked via `type_versions_by_type` index), identifies the
+   tail version (the version whose `next_version_id` is unset) and validates schema compatibility against it.
 3. Extracts index declarations from the message's custom options. For each key_type, checks the `index_key_type_unique`
    index: if an IndexDefinition already exists, validates compatibility; if not, creates a new IndexDefinition artifact.
 4. Extracts reference declarations from field options. For each reference, validates field type, `on_delete`,
    `target_type_name`, and presence of a covering index (reference field as sole key; no where clause in the MVP; post-MVP
    may allow `IS_SET`). For each reference, checks `reference_key_type_unique`: if a ReferenceDefinition already exists,
    validates compatibility; if not, creates a new ReferenceDefinition artifact.
-5. Creates a TypeVersionDefinition artifact (type_id = TypeDefinition artifact_id, descriptor_set, proto_source).
+5. Creates a TypeVersionDefinition artifact (type_id = TypeDefinition artifact_id, descriptor_set, proto_source,
+   `previous_version_id` = tail version's artifact_id if a prior version exists, `next_version_id` unset). If a tail
+   version exists, updates the tail version's `next_version_id` to the new version's artifact_id. This update uses an
+   internal bypass of the immutability check (see Built-in types and bootstrapping for the immutability model). The
+   update to the tail version is the mechanism that enforces serialization of concurrent registrations: if two
+   transactions both attempt to set `next_version_id` on the same tail, the second to commit produces an artifact
+   payload conflict (see Conflict retry policy).
 6. Derives all index entries for the new artifacts and commits the Artifact Layer transaction atomically (merging the
    ephemeral branch into the canonical branch in the Storage Layer).
 7. Returns the new TypeVersionDefinition artifact_id (the version_id).
@@ -1017,12 +1048,15 @@ Schema compatibility rules for launch:
 **ListTypeVersions** fetches the `type_versions_by_type` index for the TypeDefinition's artifact_id, returning version
 artifact_ids in creation order.
 
-**SetCurrentTypeVersion** updates the TypeDefinition artifact's `current_version_id` field via UpdateArtifact. If a
-transaction_id is provided, the update runs within that transaction; otherwise it uses an implicit transaction. Concurrent
-version pointer updates are detected as payload conflicts at Artifact Layer transaction commit time — the caller reads the
-TypeDefinition within a transaction, updates `current_version_id`, and if another transaction committed a change to the
-same TypeDefinition in the interim, the merge produces a conflict. The registry validates that the target version_id
-references a TypeVersionDefinition whose type_id matches the TypeDefinition's artifact_id before applying the update.
+**SetCurrentTypeVersion** updates the TypeDefinition artifact's `current_version_id` field. TypeDefinition is not
+immutable, so this uses a standard internal update. However, `SetCurrentTypeVersion` is not exposed as a general-purpose
+UpdateArtifact call — it is a dedicated registry operation that enforces additional validation. If a transaction_id is
+provided, the update runs within that transaction; otherwise it uses an implicit transaction. Concurrent version pointer
+updates are detected as payload conflicts at Artifact Layer transaction commit time — the caller reads the TypeDefinition
+within a transaction, updates `current_version_id`, and if another transaction committed a change to the same
+TypeDefinition in the interim, the merge produces a conflict. The registry validates that the target version_id
+references a TypeVersionDefinition whose type_id matches the TypeDefinition's artifact_id and that the version exists in
+the type's version chain (reachable via the linked-list pointers) before applying the update.
 
 RegisterTypeVersion and SetCurrentTypeVersion are separate operations. A registered version that is not yet current is a
 valid state — it can be used explicitly by callers that specify a version_id, but will not be resolved by default. Type
