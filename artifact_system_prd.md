@@ -242,14 +242,16 @@ To produce the hash pre-image, concatenate key field encodings in the declared o
 1. uint64, fixed64: 8-byte unsigned little-endian.
 1. bool: 1 byte (0x00 or 0x01).
 1. enum: 4-byte signed little-endian (int32 encoding).
-1. float: IEEE 754 binary32, little-endian; double: IEEE 754 binary64, little-endian. NaN values are rejected and -0 is
-   normalized to +0 during index derivation. Because artifact writes and index derivation occur within the same
-   transaction, a NaN in an indexed float field rejects the entire write (artifact payload and all derived indexes).
+1. float: IEEE 754 binary32, little-endian; double: IEEE 754 binary64, little-endian. NaN values are rejected
+   (`NAN_IN_INDEXED_FIELD`) and -0 is normalized to +0 during index derivation. Because artifact writes and index
+   derivation occur within the same transaction, a NaN in an indexed float field rejects the entire write (artifact
+   payload and all derived indexes).
 1. string: UTF-8 bytes prefixed by an unsigned varint length (base-128, LSB-first, minimal encoding).
 1. bytes: raw bytes prefixed by an unsigned varint length (base-128, LSB-first, minimal encoding).
 
 Varint length prefixes must use minimal encoding: the shortest base-128 representation with no leading zero groups. This
-is required for deterministic encoding; non-minimal varints must be rejected during index derivation.
+is required for deterministic encoding; non-minimal varints must be rejected during index derivation
+(`NON_MINIMAL_VARINT`).
 
 1. If a key field references a scalar sub-field of a message, encode the referenced scalar using the same rules.
 
@@ -344,12 +346,14 @@ The artifact_id is metadata and does not need to be duplicated in the payload. I
 artifact layer should validate that it matches the artifact_id.
 
 On create/update/delete, the artifact layer checks the TypeDefinition's mutation-restriction flags. If `deny_create` is
-true, CreateArtifact is rejected. If `deny_update` is true, UpdateArtifact is rejected. If `deny_delete` is true,
-DeleteArtifact is rejected. The artifact layer validates the payload using standard proto3 structural validation against
-the message
-identified by type_name in the TypeVersionDefinition's descriptor set, and derives index entries from the index
-declarations in the descriptor set's custom options. Artifact validation is limited to proto3 structural checks and
-referential integrity (see below); semantic or business validation is out of scope for launch. Responses return the
+true, CreateArtifact is rejected (`MUTATION_DENIED`). If `deny_update` is true, UpdateArtifact is rejected
+(`MUTATION_DENIED`). If `deny_delete` is true, DeleteArtifact is rejected (`MUTATION_DENIED`). The artifact layer
+validates the payload using standard proto3 structural validation against the message identified by type_name in the
+TypeVersionDefinition's descriptor set (`PAYLOAD_VALIDATION_FAILURE` on failure), and derives index entries from the
+index declarations in the descriptor set's custom options. Artifact validation is limited to proto3 structural checks
+and referential integrity (see below); semantic or business validation is out of scope for launch. All CRUD write-time
+validation failures return gRPC status `INVALID_ARGUMENT` with an `ArtifactWriteError` detail message; see CRUD write
+error response for the full specification. Responses return the
 resolved version_id (the TypeVersionDefinition artifact_id). All writes occur within a transaction; concurrent write
 conflicts are detected at Artifact Layer transaction commit (see Consistency and transaction semantics). Reads return
 payload bytes plus type_name and version_id. Partial updates are out of scope for launch.
@@ -390,10 +394,11 @@ derived materializations for reverse lookup and enforcement.
 
 **Write-time validation**
 1. On Create/Update, if a reference field is set, the artifact layer reads the referenced artifact by artifact_id and
-   verifies it exists, is not tombstoned, and its type_name matches `target_type_name`.
+   verifies it exists (`REFERENCE_TARGET_NOT_FOUND`), is not tombstoned (`REFERENCE_TARGET_TOMBSTONED`), and its
+   type_name matches `target_type_name` (`REFERENCE_TARGET_WRONG_TYPE`).
 1. If a reference field is unset (optional), it is treated as null and does not require validation.
 1. For repeated reference fields, each value is validated and the list must not contain duplicates; duplicate values are
-   rejected on Create/Update.
+   rejected on Create/Update (`REFERENCE_DUPLICATE_VALUE`).
 1. References are enforced on create/update; existing stored artifacts are not revalidated until they are updated.
 
 **Delete-time enforcement**
@@ -402,8 +407,8 @@ derived materializations for reverse lookup and enforcement.
 1. For each ReferenceDefinition, it fetches the covering index with key = deleted artifact_id to list referencing
    artifacts.
 1. Enforcement by `on_delete`:
-   1. **RESTRICT**: reject the delete if any referencing artifacts exist that are not already scheduled for delete in the
-      current transaction.
+   1. **RESTRICT**: reject the delete (`REFERENCE_DELETE_RESTRICTED`) if any referencing artifacts exist that are not
+      already scheduled for delete in the current transaction.
    1. **CASCADE**: delete each referencing artifact (recursively applying referential integrity).
    1. **SET_NULL**: update each referencing artifact to clear the reference field (for repeated fields, remove the
       referenced value from the list).
@@ -424,14 +429,16 @@ Deletes are logical tombstones. A delete writes a new version at the same artifa
 current transaction. The delete is finalized when the Artifact Layer transaction is committed (merged in the Storage
 Layer).
 
-1. Empty payloads are reserved for tombstones. The artifact layer rejects zero-length payloads for live artifacts; if a
-   type needs to represent an "empty" value, include a sentinel field or wrap it in an envelope message.
+1. Empty payloads are reserved for tombstones. The artifact layer rejects zero-length payloads for live artifacts
+   (`EMPTY_PAYLOAD`); if a type needs to represent an "empty" value, include a sentinel field or wrap it in an envelope
+   message.
 1. Index handling: deleting an artifact removes all derived index entries for that artifact ID (as if the artifact no
    longer qualifies for any index entries). Unique indexes free the slot. If an index becomes empty, it is tombstoned by
    storing an index object with an empty value portion (row_count = 0 and no value entries) so merges can detect
    deletions.
-1. Referential integrity: deletes may be rejected (RESTRICT), cascade, or nullify references based on reference field
-   options; enforcement occurs in the same internal transaction (see Referential integrity).
+1. Referential integrity: deletes may be rejected (`REFERENCE_DELETE_RESTRICTED` for RESTRICT), cascade, or nullify
+   references based on reference field options; enforcement occurs in the same internal transaction (see Referential
+   integrity and CRUD write error response).
 1. Reads treat tombstones as not found for standard Get. There is no public restore or audit API in the MVP; to
    "undelete" a caller writes a new payload for the tombstoned artifact within a transaction, creating a new version in
    history.
@@ -530,9 +537,10 @@ operations while allowing callers to opt into explicit transactions for multi-wr
    example, the same index). This is handled by the same Conflict retry policy as inter-transaction conflicts.
 1. Concurrent transactions may diverge on separate ephemeral branches; conflict ownership is defined in the Conflict
    retry policy and conflicts surface at Artifact Layer transaction commit time.
-1. If a write fails mid-transaction (for example, index derivation rejects a NaN float key), the sub-branch for that
-   write is abandoned without merging into the transaction branch. The transaction remains open and the caller may retry
-   the write or roll back the transaction.
+1. If a write fails mid-transaction (for example, index derivation rejects a NaN float key — `NAN_IN_INDEXED_FIELD`),
+   the sub-branch for that write is abandoned without merging into the transaction branch. The transaction remains open
+   and the caller may retry the write or roll back the transaction. See CRUD write error response for the full error
+   specification.
 1. Unique index enforcement is described in Index definition and Index merge semantics.
 
 ##### Cleanup and TTL for abandoned transactions
@@ -585,8 +593,8 @@ artifact layer binary but are also stored as artifacts so the system is fully se
 1. **TypeDefinition**: represents a logical artifact type. One TypeDefinition artifact exists per type_name. Contains the
    type_name (which is the fully-qualified proto message name) and an optional current_version_id pointer to the default
    TypeVersionDefinition. Also carries three mutation-restriction flags: `deny_create` (when true, CreateArtifact is
-   rejected for artifacts of this type), `deny_update` (when true, UpdateArtifact is rejected), and `deny_delete` (when
-   true, DeleteArtifact is rejected). All default to false. These flags may be set at type registration time and may
+   rejected with `MUTATION_DENIED`), `deny_update` (when true, UpdateArtifact is rejected with `MUTATION_DENIED`), and
+   `deny_delete` (when true, DeleteArtifact is rejected with `MUTATION_DENIED`); see CRUD write error response. All default to false. These flags may be set at type registration time and may
    only be tightened (false to true) on subsequent registrations, never loosened (see RegisterTypeVersion). Built-in
    definition types (TypeDefinition, TypeVersionDefinition, IndexDefinition, ReferenceDefinition) set `deny_create`
    to true because their artifacts are created exclusively through dedicated registry operations (e.g.,
@@ -988,10 +996,12 @@ Request/response expectations:
 1. artifact_id is allocated by the artifact layer via a separate ID service and returned in Create responses.
 1. version_id is an optional uint64 (TypeVersionDefinition artifact_id) for Create/Update; resolution behavior is defined
    in Type identity and versioning. If omitted, the artifact layer resolves to the TypeDefinition's current_version_id.
-1. CreateArtifact is rejected if the TypeDefinition's `deny_create` flag is true; UpdateArtifact is rejected if
-   `deny_update` is true; DeleteArtifact is rejected if `deny_delete` is true.
-1. Create/Update validate referential integrity for reference fields; deletes may be rejected (RESTRICT) or may cascade
-   or nullify references depending on declared `on_delete` behavior.
+1. CreateArtifact is rejected (`MUTATION_DENIED`) if the TypeDefinition's `deny_create` flag is true; UpdateArtifact is
+   rejected if `deny_update` is true; DeleteArtifact is rejected if `deny_delete` is true. See CRUD write error response
+   for all write-time validation error categories and their gRPC status codes.
+1. Create/Update validate referential integrity for reference fields (see CRUD write error response for violation
+   categories); deletes may be rejected (`REFERENCE_DELETE_RESTRICTED` for RESTRICT) or may cascade or nullify
+   references depending on declared `on_delete` behavior.
 1. Reads return payload bytes plus type_name and version_id (the resolved TypeVersionDefinition artifact_id).
 1. BatchGetArtifacts returns results in the same order as the input IDs using explicit per-id results (for example, a
    `oneof { artifact, not_found }` wrapper) so missing or tombstoned artifacts preserve positional correlation.
@@ -1004,6 +1014,113 @@ Request/response expectations:
 Conflict/error behavior: conflict types, response payloads, and auto-resolution eligibility are defined in the Conflict
 retry policy (MVP). The conflict response uses conflict_type values INDEX_CONFLICT, PAYLOAD_CONFLICT, and
 REFERENTIAL_INTEGRITY_VIOLATION.
+
+#### CRUD write error response
+
+Write-time validation failures on CreateArtifact, UpdateArtifact, and DeleteArtifact return gRPC status
+`INVALID_ARGUMENT` with an `ArtifactWriteError` detail message. The error contains one or more
+`ArtifactWriteViolation` entries so callers can diagnose and fix all issues in a single pass. All applicable
+validations run to completion and their violations are collected together before the error is returned (the write is
+not applied). For implicit transactions the error is returned from the write call itself; for explicit transactions the
+error is returned from the individual write call within the transaction (not deferred to CommitTransaction), and the
+sub-branch for that write is abandoned without merging into the transaction branch (the transaction remains open).
+
+Each violation includes:
+1. category: one of the `ArtifactWriteViolation.Category` values below.
+2. description: human-readable string explaining the specific failure (for example, "CreateArtifact denied: type
+   'IndexDefinition' has deny_create = true").
+3. subject: a short identifier for the entity involved — a type_name (for example, "type: IndexDefinition"), a field
+   name (for example, "field: created_by"), an artifact_id (for example, "artifact_id: 42"), or an index key_type (for
+   example, "index: by_owner"). The subject is a simple string to allow the format to evolve without breaking consumers.
+
+Violation categories:
+
+1. `MUTATION_DENIED` — the write is rejected because the TypeDefinition's mutation-restriction flag is set.
+   `deny_create = true` rejects CreateArtifact, `deny_update = true` rejects UpdateArtifact, `deny_delete = true`
+   rejects DeleteArtifact. The description identifies which flag triggered the rejection and the type_name. The subject
+   is the type_name. This is the only violation returned when triggered (the flag check runs before payload validation).
+2. `PAYLOAD_VALIDATION_FAILURE` — the payload fails proto3 structural validation against the message identified by
+   type_name in the resolved TypeVersionDefinition's descriptor set. Covers: wire-format parse errors, unknown fields
+   that violate the schema, type mismatches on known fields, and any other structural check that the proto3 runtime
+   rejects. The description includes the proto3 validation error text. The subject is the type_name. This category
+   does not cover semantic or business validation (out of scope for launch).
+3. `EMPTY_PAYLOAD` — CreateArtifact or UpdateArtifact received a zero-length payload. Empty payloads are reserved for
+   tombstones (see Delete semantics and retention). The description is "empty payload: zero-length payloads are
+   reserved for tombstones". The subject is the type_name. The empty-payload check runs before proto3 structural
+   validation; if the payload is zero-length, this is the only violation returned.
+4. `NAN_IN_INDEXED_FIELD` — a float or double field used as an index key contains a NaN value. NaN values are
+   non-deterministic for encoding and incomparable for ordering, so they are rejected during index derivation (see Index
+   key encoding). Because artifact writes and index derivation occur within the same transaction, a NaN in any indexed
+   float field rejects the entire write. The description identifies the field name and the index key_type. The subject
+   is the field name (for example, "field: score"). Multiple violations may be returned if NaN values appear in
+   multiple indexed fields.
+5. `NON_MINIMAL_VARINT` — a string or bytes field used as an index key produced a non-minimal varint length prefix
+   during index key encoding. Varint length prefixes must use minimal encoding (the shortest base-128 representation
+   with no leading zero groups) for deterministic hashing (see Index key encoding). The description identifies the field
+   name and the index key_type. The subject is the field name. In practice this category guards against implementation
+   bugs in the encoding layer rather than user input errors, since the artifact layer itself encodes varints; it is
+   included for completeness and defensive correctness.
+6. `REFERENCE_TARGET_NOT_FOUND` — a reference field points to an artifact_id that does not exist. The description
+   identifies the reference field, the target artifact_id, and the expected target_type_name. The subject is the field
+   name.
+7. `REFERENCE_TARGET_TOMBSTONED` — a reference field points to an artifact_id that exists but is tombstoned (logically
+   deleted). The description identifies the reference field, the target artifact_id, and the expected target_type_name.
+   The subject is the field name.
+8. `REFERENCE_TARGET_WRONG_TYPE` — a reference field points to an artifact_id that exists and is live, but its
+   type_name does not match the declared `target_type_name`. The description identifies the reference field, the target
+   artifact_id, the expected target_type_name, and the actual type_name. The subject is the field name.
+9. `REFERENCE_DUPLICATE_VALUE` — a repeated reference field contains duplicate artifact_id values. The description
+   identifies the reference field and the duplicated artifact_id(s). The subject is the field name.
+10. `REFERENCE_DELETE_RESTRICTED` — a DeleteArtifact is rejected because one or more referencing artifacts exist with
+    `on_delete = RESTRICT` and are not scheduled for deletion in the current transaction. The description identifies the
+    ReferenceDefinition key_type and the referencing artifact_ids. The subject is the ReferenceDefinition key_type (for
+    example, "reference: DataFrameArtifact.created_by").
+
+**Validation order and short-circuiting**
+
+Validations are applied in the following order. A category marked "short-circuit" means that if any violation of that
+category is produced, subsequent validation phases are skipped (because later phases depend on earlier ones succeeding).
+
+1. `MUTATION_DENIED` — checked first. Short-circuit: if denied, no further validation is performed.
+2. `EMPTY_PAYLOAD` — checked before parsing. Short-circuit: if empty, no further validation is performed. (Applies to
+   Create/Update only; Delete payloads are always empty by definition.)
+3. `PAYLOAD_VALIDATION_FAILURE` — proto3 structural parse/validation. Short-circuit: if the payload cannot be parsed,
+   field-level validations (referential integrity, index derivation) cannot proceed.
+4. `NAN_IN_INDEXED_FIELD`, `NON_MINIMAL_VARINT` — index derivation checks. These run for all indexed fields and all
+   violations are collected.
+5. `REFERENCE_TARGET_NOT_FOUND`, `REFERENCE_TARGET_TOMBSTONED`, `REFERENCE_TARGET_WRONG_TYPE`,
+   `REFERENCE_DUPLICATE_VALUE` — referential integrity checks on Create/Update. All reference fields are validated and
+   all violations are collected.
+6. `REFERENCE_DELETE_RESTRICTED` — referential integrity check on Delete. All RESTRICT references are checked and all
+   violations are collected.
+
+Phases 4 and 5 run independently and their violations are collected together. Within each phase, all applicable checks
+run to completion.
+
+```proto
+message ArtifactWriteError {
+  repeated ArtifactWriteViolation violations = 1;
+}
+
+message ArtifactWriteViolation {
+  enum Category {
+    CATEGORY_UNSPECIFIED = 0;
+    MUTATION_DENIED = 1;
+    PAYLOAD_VALIDATION_FAILURE = 2;
+    EMPTY_PAYLOAD = 3;
+    NAN_IN_INDEXED_FIELD = 4;
+    NON_MINIMAL_VARINT = 5;
+    REFERENCE_TARGET_NOT_FOUND = 6;
+    REFERENCE_TARGET_TOMBSTONED = 7;
+    REFERENCE_TARGET_WRONG_TYPE = 8;
+    REFERENCE_DUPLICATE_VALUE = 9;
+    REFERENCE_DELETE_RESTRICTED = 10;
+  }
+  Category category = 1;
+  string description = 2;
+  string subject = 3;
+}
+```
 
 #### Index fetch API
 
