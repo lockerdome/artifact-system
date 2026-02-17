@@ -343,21 +343,25 @@ Artifacts are defined by (artifact_id, type_name, version_id, payload).
 The artifact_id is metadata and does not need to be duplicated in the payload. If a type schema includes an id field, the
 artifact layer should validate that it matches the artifact_id.
 
-On create/update, the artifact layer checks the TypeDefinition's `immutable` flag; if true, UpdateArtifact and
-DeleteArtifact are rejected. The artifact layer validates the payload using standard proto3 structural validation against
-the message identified by type_name in the TypeVersionDefinition's descriptor set, and derives index entries from the
-index declarations in the descriptor set's custom options. Artifact validation is limited to proto3 structural checks
-and referential integrity (see below); semantic or business validation is out of scope for launch. Responses return the
+On create/update/delete, the artifact layer checks the TypeDefinition's mutation-restriction flags. If `deny_create` is
+true, CreateArtifact is rejected. If `deny_update` is true, UpdateArtifact is rejected. If `deny_delete` is true,
+DeleteArtifact is rejected. The artifact layer validates the payload using standard proto3 structural validation against
+the message
+identified by type_name in the TypeVersionDefinition's descriptor set, and derives index entries from the index
+declarations in the descriptor set's custom options. Artifact validation is limited to proto3 structural checks and
+referential integrity (see below); semantic or business validation is out of scope for launch. Responses return the
 resolved version_id (the TypeVersionDefinition artifact_id). All writes occur within a transaction; concurrent write
 conflicts are detected at Artifact Layer transaction commit (see Consistency and transaction semantics). Reads return
 payload bytes plus type_name and version_id. Partial updates are out of scope for launch.
 
-**Internal mutability**: Certain artifact layer operations require updating immutable artifacts as part of their internal
-logic. For example, RegisterTypeVersion updates the tail TypeVersionDefinition's `next_version_id` pointer even though
-TypeVersionDefinition is immutable. These internal updates bypass the public immutability check and are limited to
-specific fields managed by the artifact layer itself. External callers cannot trigger internal-mutability updates through
-the public CRUD API. This is a stopgap mechanism; post-MVP field-level mutability will provide a principled way to
-declare which fields are mutable on otherwise-immutable types (see Post-MVP notes).
+**Internal bypass of mutation restrictions**: Certain artifact layer operations require creating, updating, or deleting
+artifacts whose types have `deny_create`, `deny_update`, or `deny_delete` set, as part of their internal logic. For
+example, RegisterTypeVersion creates TypeVersionDefinition and IndexDefinition artifacts (bypassing `deny_create`) and
+updates the tail TypeVersionDefinition's `next_version_id` pointer (bypassing `deny_update`). These internal operations
+bypass the public mutation-restriction checks. Internal bypasses are limited to system-managed bookkeeping performed by
+the artifact layer itself; external callers cannot trigger them through the public CRUD API. This is a stopgap
+mechanism; post-MVP field-level mutability will provide a principled way to declare which fields are mutable on
+otherwise-restricted types (see Post-MVP notes).
 
 The artifact layer stores payload bytes as provided and does not reserialize them. This preserves unknown fields and
 avoids any reliance on canonical protobuf binary encodings. Text/JSON formats are not used for storage.
@@ -579,26 +583,39 @@ artifact layer binary but are also stored as artifacts so the system is fully se
 
 1. **TypeDefinition**: represents a logical artifact type. One TypeDefinition artifact exists per type_name. Contains the
    type_name (which is the fully-qualified proto message name) and an optional current_version_id pointer to the default
-   TypeVersionDefinition. Also carries an `immutable` flag: when true, UpdateArtifact and DeleteArtifact are rejected for
-   artifacts of this type (Create is still permitted through the registry API).
+   TypeVersionDefinition. Also carries three mutation-restriction flags: `deny_create` (when true, CreateArtifact is
+   rejected for artifacts of this type), `deny_update` (when true, UpdateArtifact is rejected), and `deny_delete` (when
+   true, DeleteArtifact is rejected). All default to false. These flags may be set at type registration time and may
+   only be tightened (false to true) on subsequent registrations, never loosened (see RegisterTypeVersion). Built-in
+   definition types (TypeDefinition, TypeVersionDefinition, IndexDefinition, ReferenceDefinition) set `deny_create`
+   to true because their artifacts are created exclusively through dedicated registry operations (e.g.,
+   RegisterTypeVersion), not through the public CreateArtifact API. TypeDefinition's own TypeDefinition has
+   `deny_create = true, deny_update = false, deny_delete = true`; `deny_update` is false because
+   SetCurrentTypeVersion and RegisterTypeVersion (when tightening flags) update TypeDefinition artifacts through
+   standard internal updates without requiring a bypass.
 2. **TypeVersionDefinition**: represents a specific version of a type. Contains the type_id (artifact_id of the parent
    TypeDefinition), the compiled FileDescriptorSet, the original .proto source, and optional `previous_version_id` /
    `next_version_id` pointers that form a doubly-linked list of versions per type. Multiple TypeVersionDefinition
-   artifacts may exist for a single TypeDefinition. TypeVersionDefinition is immutable (its TypeDefinition has
-   `immutable = true`); once registered, a version cannot be modified or deleted through the public API. The
-   `next_version_id` pointer is an exception: it is internally mutable — the artifact layer updates the tail version's
-   `next_version_id` when a new version is registered (see RegisterTypeVersion). This internal mutability is limited to
-   the `next_version_id` field and is a stopgap until field-level mutability support is added post-MVP. Metadata such
-   as index definitions, actions, viewer endpoints, and LLM instructions are attached as custom options within the
-   descriptor set and are not denormalized onto the TypeVersionDefinition message (see Custom options as metadata).
+   artifacts may exist for a single TypeDefinition. TypeVersionDefinition has `deny_create = true, deny_update = true,
+   deny_delete = true` on its TypeDefinition; artifacts cannot be created, modified, or deleted through the public
+   CRUD API (creation is handled by RegisterTypeVersion). The
+   `next_version_id` pointer is an exception managed via an internal bypass: the artifact layer updates the tail
+   version's `next_version_id` when a new version is registered (see RegisterTypeVersion and Internal bypass of
+   mutation restrictions). Metadata such as index definitions, actions, viewer endpoints, and LLM instructions are
+   attached as custom options within the descriptor set and are not denormalized onto the TypeVersionDefinition message
+   (see Custom options as metadata).
 3. **IndexDefinition**: represents a single index. Contains the key_type, key fields, order fields, and unique flag.
-   Where clauses are post-MVP. IndexDefinition is immutable. Each IndexDefinition artifact receives an artifact_id that
-   is used as the key_prefix in index storage paths (see Index physical storage).
+   Where clauses are post-MVP. IndexDefinition has `deny_create = true, deny_update = true, deny_delete = true` on its
+   TypeDefinition; artifacts cannot be created, modified, or deleted through the public CRUD API (creation is handled
+   by RegisterTypeVersion). Each IndexDefinition
+   artifact receives an artifact_id that is used as the key_prefix in index storage paths (see Index physical storage).
 4. **ReferenceDefinition**: represents a single referential integrity declaration. Contains the referencing type, target
    type, reference field, covering index key_type, and on_delete behavior. key_type is a globally unique identifier;
    the recommended format is `{referencing_type_name}.{field_name}`. The unique key_type is used by the registry to
-   detect duplicates across type versions without scanning all reference definitions. ReferenceDefinition is immutable
-   and is created during RegisterTypeVersion when reference field options are detected.
+   detect duplicates across type versions without scanning all reference definitions. ReferenceDefinition has
+   `deny_create = true, deny_update = true, deny_delete = true` on its TypeDefinition; artifacts cannot be created,
+   modified, or deleted through the public CRUD API (creation is handled by RegisterTypeVersion when reference field
+   options are detected).
 
 All types (including user-defined artifact types) are stored in LakeFS so they are tied to the repo state. This enables
 migration transactions (post-launch): a new branch can add an index, backfill it for existing data, and merge only when
@@ -787,7 +804,9 @@ message TypeDefinition {
 
   string type_name = 1;
   optional uint64 current_version_id = 2;
-  bool immutable = 3;
+  bool deny_create = 3;
+  bool deny_update = 4;
+  bool deny_delete = 5;
 }
 
 message TypeVersionDefinition {
@@ -910,8 +929,9 @@ Index derivation uses protobuf field semantics:
 
 A logical type is represented by a TypeDefinition artifact identified by type_name (the fully-qualified proto message
 name). Type versions are represented by TypeVersionDefinition artifacts, each linked to its parent TypeDefinition via the
-type_id field. Type versions are immutable once registered; any schema or metadata change creates a new
-TypeVersionDefinition artifact.
+type_id field. Type versions cannot be created, updated, or deleted through the public CRUD API once registered (the
+TypeVersionDefinition type has `deny_create = true, deny_update = true, deny_delete = true`); any schema or metadata
+change creates a new TypeVersionDefinition artifact via RegisterTypeVersion.
 
 The TypeDefinition artifact contains an optional `current_version_id` field pointing to the default
 TypeVersionDefinition artifact_id. If a CRUD request omits the version_id, the artifact layer resolves to the
@@ -965,7 +985,8 @@ Request/response expectations:
 1. artifact_id is allocated by the artifact layer via a separate ID service and returned in Create responses.
 1. version_id is an optional uint64 (TypeVersionDefinition artifact_id) for Create/Update; resolution behavior is defined
    in Type identity and versioning. If omitted, the artifact layer resolves to the TypeDefinition's current_version_id.
-1. Update/Delete are rejected if the TypeDefinition's `immutable` flag is true.
+1. CreateArtifact is rejected if the TypeDefinition's `deny_create` flag is true; UpdateArtifact is rejected if
+   `deny_update` is true; DeleteArtifact is rejected if `deny_delete` is true.
 1. Create/Update validate referential integrity for reference fields; deletes may be rejected (RESTRICT) or may cascade
    or nullify references depending on declared `on_delete` behavior.
 1. Reads return payload bytes plus type_name and version_id (the resolved TypeVersionDefinition artifact_id).
@@ -1001,7 +1022,7 @@ The registry supports registering and resolving type versions. All registry oper
 TypeVersionDefinition, IndexDefinition, and ReferenceDefinition artifacts via the standard artifact storage path, but
 enforce additional validation rules that the generic CRUD API does not.
 
-1. RegisterTypeVersion(type_name, proto_source) -> version_id
+1. RegisterTypeVersion(type_name, proto_source, deny_create?, deny_update?, deny_delete?) -> version_id
 1. GetTypeVersion(version_id) -> TypeVersionDefinition
 1. ListTypeVersions(type_name) -> repeated version_id
 1. SetCurrentTypeVersion(type_name, version_id, transaction_id?)
@@ -1010,7 +1031,12 @@ enforce additional validation rules that the generic CRUD API does not.
 **RegisterTypeVersion** compiles the .proto source into a FileDescriptorSet (injecting system protos as well-known
 imports), locates the message identified by type_name in the descriptor set, and validates the schema. It then:
 1. Looks up the TypeDefinition via the `type_name_unique` index. If not found, creates a new TypeDefinition artifact
-   (`type_name`, `current_version_id` unset, `immutable = false` for user types).
+   (`type_name`, `current_version_id` unset, `deny_create`, `deny_update`, and `deny_delete` set to the
+   caller-provided values or false if omitted). If the TypeDefinition already exists and the caller provides
+   `deny_create`, `deny_update`, or `deny_delete` values, the registry enforces the tighten-only rule: each flag may
+   be changed from false to true but never from true
+   to false. A request that attempts to loosen a restriction (true to false) is rejected. If the caller omits the
+   flags on a subsequent registration, the existing values are preserved unchanged.
 2. If a prior TypeVersionDefinition exists for this type (checked via `type_versions_by_type` index), identifies the
    tail version (the version whose `next_version_id` is unset) and validates schema compatibility against it.
 3. Extracts index declarations from the message's custom options. For each key_type, checks the `index_key_type_unique`
@@ -1022,10 +1048,10 @@ imports), locates the message identified by type_name in the descriptor set, and
 5. Creates a TypeVersionDefinition artifact (type_id = TypeDefinition artifact_id, descriptor_set, proto_source,
    `previous_version_id` = tail version's artifact_id if a prior version exists, `next_version_id` unset). If a tail
    version exists, updates the tail version's `next_version_id` to the new version's artifact_id. This update uses an
-   internal bypass of the immutability check (see Built-in types and bootstrapping for the immutability model). The
-   update to the tail version is the mechanism that enforces serialization of concurrent registrations: if two
-   transactions both attempt to set `next_version_id` on the same tail, the second to commit produces an artifact
-   payload conflict (see Conflict retry policy).
+   internal bypass of the `deny_update` restriction (see Internal bypass of mutation restrictions). The update to the
+   tail version is the mechanism that enforces serialization of concurrent registrations: if two transactions both
+   attempt to set `next_version_id` on the same tail, the second to commit produces an artifact payload conflict (see
+   Conflict retry policy).
 6. Derives all index entries for the new artifacts and commits the Artifact Layer transaction atomically (merging the
    ephemeral branch into the canonical branch in the Storage Layer).
 7. Returns the new TypeVersionDefinition artifact_id (the version_id).
@@ -1044,12 +1070,16 @@ Schema compatibility rules for launch:
 1. New fields, new indexes, and new reference declarations may be added. New indexes apply only to writes after
    registration (no backfill in the MVP), so index completeness for historical data is not guaranteed.
 1. Field number reassignment is rejected.
+1. Mutation-restriction flags (`deny_create`, `deny_update`, `deny_delete`) may only be tightened: a flag that is true on the existing
+   TypeDefinition cannot be set to false. A registration that omits the flags preserves the existing values. See step 1
+   of RegisterTypeVersion above.
 
 **ListTypeVersions** fetches the `type_versions_by_type` index for the TypeDefinition's artifact_id, returning version
 artifact_ids in creation order.
 
-**SetCurrentTypeVersion** updates the TypeDefinition artifact's `current_version_id` field. TypeDefinition is not
-immutable, so this uses a standard internal update. However, `SetCurrentTypeVersion` is not exposed as a general-purpose
+**SetCurrentTypeVersion** updates the TypeDefinition artifact's `current_version_id` field. TypeDefinition does not have
+`deny_update` set (its own TypeDefinition has `deny_update = false`), so this uses a standard internal update. However,
+`SetCurrentTypeVersion` is not exposed as a general-purpose
 UpdateArtifact call — it is a dedicated registry operation that enforces additional validation. If a transaction_id is
 provided, the update runs within that transaction; otherwise it uses an implicit transaction. Concurrent version pointer
 updates are detected as payload conflicts at Artifact Layer transaction commit time — the caller reads the TypeDefinition
