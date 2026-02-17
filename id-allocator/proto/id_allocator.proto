@@ -1,0 +1,65 @@
+syntax = "proto3";
+
+package id_allocator;
+
+service IdAllocator {
+  // Allocates a block of IDs from a partition.
+  // Returns a half-open range [range_start, range_end) of unique IDs.
+  rpc AllocateBlock(AllocateBlockRequest) returns (AllocateBlockResponse);
+}
+
+service IdAllocatorAdmin {
+  // Creates a new partition with the given configuration.
+  rpc CreatePartition(CreatePartitionRequest) returns (CreatePartitionResponse);
+
+  // Returns the configuration for an existing partition.
+  rpc GetPartition(GetPartitionRequest) returns (GetPartitionResponse);
+
+  // Deletes a partition. In-flight blocks remain valid but no new blocks can be allocated.
+  rpc DeletePartition(DeletePartitionRequest) returns (DeletePartitionResponse);
+}
+
+// AllocateBlock
+
+message AllocateBlockRequest {
+  string partition_id = 1;
+}
+
+message AllocateBlockResponse {
+  uint64 range_start = 1; // first usable ID (inclusive)
+  uint64 range_end = 2;   // last usable ID (exclusive)
+}
+
+// CreatePartition
+
+message CreatePartitionRequest {
+  string partition_id = 1;
+  uint32 num_buckets = 2;
+  uint32 bucket_size_bits = 3;
+  uint32 super_block_size = 4;
+  uint32 block_size = 5;
+}
+
+message CreatePartitionResponse {}
+
+// GetPartition
+
+message GetPartitionRequest {
+  string partition_id = 1;
+}
+
+message GetPartitionResponse {
+  string partition_id = 1;
+  uint32 num_buckets = 2;
+  uint32 bucket_size_bits = 3;
+  uint32 super_block_size = 4;
+  uint32 block_size = 5;
+}
+
+// DeletePartition
+
+message DeletePartitionRequest {
+  string partition_id = 1;
+}
+
+message DeletePartitionResponse {}
