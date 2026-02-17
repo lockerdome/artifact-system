@@ -375,9 +375,10 @@ derived materializations for reverse lookup and enforcement.
 
 **Declaration and registration rules**
 1. The references option is valid only on `uint64`, `optional uint64`, or `repeated uint64` fields. The registry rejects
-   references on any other field type.
-1. `on_delete` is required; `ON_DELETE_UNSPECIFIED` is rejected.
-1. `SET_NULL` is valid on `optional` or `repeated` fields; it is rejected on implicit-presence scalars.
+   references on any other field type (`INVALID_REFERENCE_DECLARATION`).
+1. `on_delete` is required; `ON_DELETE_UNSPECIFIED` is rejected (`INVALID_REFERENCE_DECLARATION`).
+1. `SET_NULL` is valid on `optional` or `repeated` fields; it is rejected on implicit-presence scalars
+   (`INVALID_REFERENCE_DECLARATION`).
 1. Implicit-presence scalar reference fields always validate their value (including defaults); use `optional` to allow
    null. Repeated reference fields treat an empty list as null.
 1. `target_type_name` must resolve to an existing TypeDefinition via the `type_name_unique` index.
@@ -707,8 +708,8 @@ The type_name on the parent TypeDefinition is the fully-qualified proto message 
 locate the artifact payload message within the descriptor set. This means the external API identifier for a type is the
 same as the proto message name, ensuring a single unambiguous mapping between types and their schemas.
 
-Standard protobuf validation for registration is: compile with protoc, reject parse/descriptor errors, and only accept
-proto3 syntax for launch. Runtime compilation should enforce resource limits (maximum input file size, compilation
+Standard protobuf validation for registration is: compile with protoc, reject parse/descriptor errors
+(`PROTO_COMPILATION_FAILURE`), and only accept proto3 syntax for launch. Runtime compilation should enforce resource limits (maximum input file size, compilation
 timeout, nesting depth) to prevent resource exhaustion from malformed or adversarial schemas. Custom options are
 supported (see below) and must be retained at runtime so that metadata is available via descriptors.
 
@@ -737,13 +738,15 @@ imports alongside the standard google.protobuf imports.
 The type-level option indexes is a repeated list of IndexDefinition objects. Each `option (indexes) = { ... }` entry
 defines one index for the enclosing message type.
 
-OrderDefinition.direction is required; the registry rejects index definitions with ORDER_BY_UNSPECIFIED.
+OrderDefinition.direction is required; the registry rejects index definitions with ORDER_BY_UNSPECIFIED
+(`INVALID_INDEX_DEFINITION`).
 
 Index where clauses are post-MVP; see Post-MVP notes for candidate expression AST and validation rules.
 
 ReferenceOption is valid only on `uint64`, `optional uint64`, or `repeated uint64` fields. `on_delete` is required, and
 `SET_NULL` is only valid on `optional` or `repeated` fields. Each reference requires exactly one covering index with the
-reference field as the sole key (no where clause in the MVP); the registry rejects missing or ambiguous coverage.
+reference field as the sole key (no where clause in the MVP); the registry rejects missing or ambiguous coverage
+(`INVALID_REFERENCE_DECLARATION`).
 Repeated reference fields must not contain duplicate values. Post-MVP may allow a single `IS_SET` predicate for optional
 fields.
 
@@ -922,7 +925,7 @@ Index derivation uses protobuf field semantics:
    (for example, deterministic keyword extraction) where a single artifact maps to multiple index keys. Repeated message
    fields require a scalar sub-field to be referenced. For launch, at most one repeated field is permitted per index
    definition (across key and order fields combined) to avoid cartesian-product fan-out during writes and merges. The
-   registry rejects index definitions that reference more than one repeated field.
+   registry rejects index definitions that reference more than one repeated field (`INVALID_INDEX_DEFINITION`).
 5. Map fields are not indexable for launch; model indexable map-like data as repeated entry messages.
 
 #### Type identity and versioning
@@ -1035,16 +1038,19 @@ imports), locates the message identified by type_name in the descriptor set, and
    caller-provided values or false if omitted). If the TypeDefinition already exists and the caller provides
    `deny_create`, `deny_update`, or `deny_delete` values, the registry enforces the tighten-only rule: each flag may
    be changed from false to true but never from true
-   to false. A request that attempts to loosen a restriction (true to false) is rejected. If the caller omits the
+   to false. A request that attempts to loosen a restriction (true to false) is rejected (`TIGHTEN_ONLY_VIOLATION`). If the caller omits the
    flags on a subsequent registration, the existing values are preserved unchanged.
 2. If a prior TypeVersionDefinition exists for this type (checked via `type_versions_by_type` index), identifies the
-   tail version (the version whose `next_version_id` is unset) and validates schema compatibility against it.
+   tail version (the version whose `next_version_id` is unset) and validates schema compatibility against it
+   (`SCHEMA_INCOMPATIBILITY` for field/type changes; see schema compatibility rules below).
 3. Extracts index declarations from the message's custom options. For each key_type, checks the `index_key_type_unique`
-   index: if an IndexDefinition already exists, validates compatibility; if not, creates a new IndexDefinition artifact.
+   index: if an IndexDefinition already exists, validates compatibility (`INDEX_INCOMPATIBILITY`); if not, validates
+   the new definition (`INVALID_INDEX_DEFINITION`) and creates a new IndexDefinition artifact.
 4. Extracts reference declarations from field options. For each reference, validates field type, `on_delete`,
    `target_type_name`, and presence of a covering index (reference field as sole key; no where clause in the MVP; post-MVP
-   may allow `IS_SET`). For each reference, checks `reference_key_type_unique`: if a ReferenceDefinition already exists,
-   validates compatibility; if not, creates a new ReferenceDefinition artifact.
+   may allow `IS_SET`) (`INVALID_REFERENCE_DECLARATION`). For each reference, checks `reference_key_type_unique`: if a
+   ReferenceDefinition already exists, validates compatibility (`REFERENCE_INCOMPATIBILITY`); if not, creates a new
+   ReferenceDefinition artifact.
 5. Creates a TypeVersionDefinition artifact (type_id = TypeDefinition artifact_id, descriptor_set, proto_source,
    `previous_version_id` = tail version's artifact_id if a prior version exists, `next_version_id` unset). If a tail
    version exists, updates the tail version's `next_version_id` to the new version's artifact_id. This update uses an
@@ -1056,23 +1062,86 @@ imports), locates the message identified by type_name in the descriptor set, and
    ephemeral branch into the canonical branch in the Storage Layer).
 7. Returns the new TypeVersionDefinition artifact_id (the version_id).
 
-Schema compatibility rules for launch:
-1. Existing fields must not be removed or have their type changed. These rules apply recursively to nested message
-   types: removing or changing a field in a nested message is a breaking change. Adding fields to a `oneof` is
-   permitted; removing `oneof` fields or the `oneof` itself is a breaking change. Changing a field between `optional`,
-   `required`, and `repeated` is a type change.
-1. Existing index definitions must not be removed or modified. A modification is any change that would alter what is
-   indexed or the shape of the index payload: changes to key fields, order fields, or the unique flag. Such changes
-   require a full index rebuild (backfill), which is post-launch. Predicate changes (post-MVP) would also require a
-   rebuild.
-1. Existing reference declarations must not be removed or modified. A modification includes changes to target_type_name,
-   the reference field, the covering index key_type, or the on_delete behavior. Such changes are post-launch.
+Schema compatibility rules for launch (violations return the indicated category; see RegisterTypeVersion error response):
+1. Existing fields must not be removed or have their type changed (`SCHEMA_INCOMPATIBILITY`). These rules apply
+   recursively to nested message types: removing or changing a field in a nested message is a breaking change. Adding
+   fields to a `oneof` is permitted; removing `oneof` fields or the `oneof` itself is a breaking change. Changing a
+   field between `optional`, `required`, and `repeated` is a type change.
+1. Existing index definitions must not be removed or modified (`INDEX_INCOMPATIBILITY`). A modification is any change
+   that would alter what is indexed or the shape of the index payload: changes to key fields, order fields, or the
+   unique flag. Such changes require a full index rebuild (backfill), which is post-launch. Predicate changes (post-MVP)
+   would also require a rebuild.
+1. Existing reference declarations must not be removed or modified (`REFERENCE_INCOMPATIBILITY`). A modification includes
+   changes to target_type_name, the reference field, the covering index key_type, or the on_delete behavior. Such
+   changes are post-launch.
 1. New fields, new indexes, and new reference declarations may be added. New indexes apply only to writes after
    registration (no backfill in the MVP), so index completeness for historical data is not guaranteed.
-1. Field number reassignment is rejected.
-1. Mutation-restriction flags (`deny_create`, `deny_update`, `deny_delete`) may only be tightened: a flag that is true on the existing
-   TypeDefinition cannot be set to false. A registration that omits the flags preserves the existing values. See step 1
-   of RegisterTypeVersion above.
+1. Field number reassignment is rejected (`SCHEMA_INCOMPATIBILITY`).
+1. Mutation-restriction flags (`deny_create`, `deny_update`, `deny_delete`) may only be tightened
+   (`TIGHTEN_ONLY_VIOLATION`): a flag that is true on the existing TypeDefinition cannot be set to false. A registration
+   that omits the flags preserves the existing values. See step 1 of RegisterTypeVersion above.
+
+**RegisterTypeVersion error response**
+
+RegisterTypeVersion validation failures return gRPC status `INVALID_ARGUMENT` with a `RegisterTypeVersionError` detail
+message. The error contains one or more `TypeRegistrationViolation` entries so callers can fix all issues in a single
+pass. If proto compilation itself fails, that is the only violation returned (subsequent validations depend on a
+successfully compiled descriptor set). All other validation checks run to completion and their violations are collected
+together.
+
+Each violation includes:
+1. category: one of the `TypeRegistrationViolation.Category` values below.
+2. description: human-readable string explaining the specific failure (for example, "field 'created_by' changed type from
+   uint64 to string").
+3. subject: a short identifier for the entity involved — a field name or number (for example, "field: created_by" or
+   "field_number: 3"), an index key_type (for example, "index: by_owner"), a reference key_type (for example,
+   "reference: DataFrameArtifact.created_by"), or a flag name (for example, "flag: deny_delete"). The subject is a
+   simple string to allow the format to evolve without breaking consumers.
+
+Violation categories:
+
+1. `PROTO_COMPILATION_FAILURE` — the .proto source failed to compile, uses non-proto3 syntax, or the type_name does not
+   resolve to a message in the resulting descriptor set. This category is fatal: if present, no further validations are
+   performed and this is the only violation in the response.
+2. `SCHEMA_INCOMPATIBILITY` — the new schema is incompatible with the prior type version. Covers: existing field removed,
+   existing field type changed (including changes between `optional`/`required`/`repeated`), nested message field
+   removed or type-changed, `oneof` removed or field removed from a `oneof`, and field number reassignment (a field
+   number reused for a different field name).
+3. `INVALID_INDEX_DEFINITION` — a newly declared index definition is structurally invalid. Covers: `ORDER_BY_UNSPECIFIED`
+   on an order field, more than one repeated field referenced across key and order fields, and other structural violations
+   of the IndexDefinition schema.
+4. `INDEX_INCOMPATIBILITY` — an existing index definition was removed or modified. A modification is any change to key
+   fields, order fields, or the unique flag. Such changes require an index rebuild (post-launch).
+5. `INVALID_REFERENCE_DECLARATION` — a newly declared reference is structurally invalid. Covers: `references` option on a
+   non-`uint64`/`optional uint64`/`repeated uint64` field, `ON_DELETE_UNSPECIFIED`, `SET_NULL` on an implicit-presence
+   scalar, `target_type_name` that does not resolve to an existing TypeDefinition, and missing or ambiguous covering
+   index (no index with the reference field as the sole key, or multiple such indexes).
+6. `REFERENCE_INCOMPATIBILITY` — an existing reference declaration was removed or modified. A modification includes
+   changes to `target_type_name`, the reference field, the covering index `key_type`, or the `on_delete` behavior.
+7. `TIGHTEN_ONLY_VIOLATION` — a mutation-restriction flag (`deny_create`, `deny_update`, or `deny_delete`) was set to
+   false when the existing TypeDefinition has it set to true.
+
+```proto
+message RegisterTypeVersionError {
+  repeated TypeRegistrationViolation violations = 1;
+}
+
+message TypeRegistrationViolation {
+  enum Category {
+    CATEGORY_UNSPECIFIED = 0;
+    PROTO_COMPILATION_FAILURE = 1;
+    SCHEMA_INCOMPATIBILITY = 2;
+    INVALID_INDEX_DEFINITION = 3;
+    INDEX_INCOMPATIBILITY = 4;
+    INVALID_REFERENCE_DECLARATION = 5;
+    REFERENCE_INCOMPATIBILITY = 6;
+    TIGHTEN_ONLY_VIOLATION = 7;
+  }
+  Category category = 1;
+  string description = 2;
+  string subject = 3;
+}
+```
 
 **ListTypeVersions** fetches the `type_versions_by_type` index for the TypeDefinition's artifact_id, returning version
 artifact_ids in creation order.
