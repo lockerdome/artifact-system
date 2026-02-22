@@ -50,7 +50,10 @@
 1. ID allocation is handled by a separate service. IDs are pre-allocated in large batches using a double-buffer
    approach: once the front buffer crosses a high-water mark, the back buffer is filled asynchronously. When the front
    buffer is exhausted, front and back swap. This ensures CreateArtifact calls do not block on the ID service under
-   normal load. If both buffers are exhausted (ID service prolonged outage), CreateArtifact returns an unavailable error.
+   normal load. If both buffers are exhausted (ID service prolonged outage), CreateArtifact returns gRPC status
+   `UNAVAILABLE` with a human-readable message indicating that the ID allocation service is temporarily unreachable.
+   No structured error detail message is attached; the gRPC status and message are sufficient for callers to implement
+   retry logic (standard gRPC `UNAVAILABLE` retry semantics apply).
    IDs are opaque uint64 values; gaps are expected (for example, if the server crashes after allocating an ID but before
    committing the artifact) and are benign.
 1. GCS enforces a 1024-byte maximum object name (UTF-8 encoded). The full GCS path includes the lakeFS installation
@@ -719,9 +722,14 @@ locate the artifact payload message within the descriptor set. This means the ex
 same as the proto message name, ensuring a single unambiguous mapping between types and their schemas.
 
 Standard protobuf validation for registration is: compile with protoc, reject parse/descriptor errors
-(`PROTO_COMPILATION_FAILURE`), and only accept proto3 syntax for launch. Runtime compilation should enforce resource limits (maximum input file size, compilation
-timeout, nesting depth) to prevent resource exhaustion from malformed or adversarial schemas. Custom options are
-supported (see below) and must be retained at runtime so that metadata is available via descriptors.
+(`PROTO_COMPILATION_FAILURE`), and only accept proto3 syntax for launch. Runtime compilation must enforce resource limits
+(maximum input file size, compilation timeout, nesting depth) to prevent resource exhaustion from malformed or
+adversarial schemas; violations of these limits are reported as `PROTO_COMPILATION_FAILURE` (see RegisterTypeVersion
+error response). A separate error category is not needed because resource exhaustion prevents compilation from
+completing, making it semantically equivalent to a compilation failure — the description field distinguishes the specific
+cause (for example, "proto compilation failed: input file exceeds maximum size of 1 MB" or "proto compilation failed:
+nesting depth exceeds limit of 64"). Custom options are supported (see below) and must be retained at runtime so that
+metadata is available via descriptors.
 
 #### Custom options as metadata
 
@@ -985,6 +993,44 @@ Semantics are defined in Consistency and transaction semantics. All CRUD and ind
 snapshot_id or transaction_id to scope reads and writes. Writes issued without a transaction context are wrapped in an
 implicit transaction (see Implicit transactions).
 
+Error responses:
+
+1. **Invalid parent_id on CreateSnapshot**: if parent_id is provided but does not resolve to a valid transaction ID,
+   return gRPC status `NOT_FOUND` with a `SnapshotTransactionError` detail message (category `PARENT_NOT_FOUND`). The
+   description identifies the unrecognized parent_id.
+2. **Invalid parent_id on CreateTransaction**: if parent_id is provided but does not resolve to a valid snapshot ID or
+   transaction ID, return gRPC status `NOT_FOUND` with a `SnapshotTransactionError` detail message (category
+   `PARENT_NOT_FOUND`). The description identifies the unrecognized parent_id.
+3. **Invalid transaction_id on CommitTransaction**: if transaction_id does not resolve to an open transaction, return
+   gRPC status `NOT_FOUND` with a `SnapshotTransactionError` detail message (category `TRANSACTION_NOT_FOUND`). This
+   covers non-existent IDs, already-committed transactions, and already-rolled-back transactions.
+4. **Invalid transaction_id on RollbackTransaction**: if transaction_id does not resolve to an open transaction, return
+   gRPC status `NOT_FOUND` with a `SnapshotTransactionError` detail message (category `TRANSACTION_NOT_FOUND`). Same
+   semantics as CommitTransaction — rolling back an already-finalized transaction is a no-op-safe error (idempotent
+   rollback is acceptable; the operation returns `NOT_FOUND` but callers may treat this as success if they only care
+   that the transaction is no longer active).
+5. **Invalid snapshot_id or transaction_id on CRUD/FetchIndex reads**: if a snapshot_id or transaction_id is provided on
+   a read or write operation but does not resolve to a valid snapshot or open transaction, return gRPC status `NOT_FOUND`
+   with a `SnapshotTransactionError` detail message (category `SNAPSHOT_NOT_FOUND` or `TRANSACTION_NOT_FOUND`
+   respectively).
+6. **Expired transaction**: if a transaction's ephemeral branch has been cleaned up by TTL (see Cleanup and TTL for
+   abandoned transactions), all operations referencing that transaction_id return `NOT_FOUND` with category
+   `TRANSACTION_NOT_FOUND`. The description notes that the transaction expired.
+
+```proto
+message SnapshotTransactionError {
+  enum Category {
+    CATEGORY_UNSPECIFIED = 0;
+    PARENT_NOT_FOUND = 1;
+    TRANSACTION_NOT_FOUND = 2;
+    SNAPSHOT_NOT_FOUND = 3;
+  }
+  Category category = 1;
+  string description = 2;
+  string id = 3;
+}
+```
+
 #### Artifact CRUD API
 
 Operations (gRPC service-to-service; client-to-app transport is application-specific):
@@ -995,7 +1041,9 @@ Operations (gRPC service-to-service; client-to-app transport is application-spec
 5. DeleteArtifact(artifact_id, transaction_id?)
 
 Request/response expectations:
-1. artifact_id is allocated by the artifact layer via a separate ID service and returned in Create responses.
+1. artifact_id is allocated by the artifact layer via a separate ID service and returned in Create responses. If the
+   ID service is unavailable (both allocation buffers exhausted), CreateArtifact returns gRPC status `UNAVAILABLE` (see
+   Dependencies and constraints). Standard gRPC `UNAVAILABLE` retry semantics apply.
 1. version_id is a required uint64 (TypeVersionDefinition artifact_id) for Create/Update. The specified
    TypeVersionDefinition must belong to the TypeDefinition identified by type_name (matching type_id). Callers obtain
    version_id from RegisterTypeVersion responses or by reading the TypeDefinition's `current_version_id` field.
@@ -1017,6 +1065,30 @@ Request/response expectations:
 Conflict/error behavior: conflict types, response payloads, and auto-resolution eligibility are defined in the Conflict
 retry policy (MVP). The conflict response uses conflict_type values INDEX_CONFLICT, PAYLOAD_CONFLICT, and
 REFERENTIAL_INTEGRITY_VIOLATION.
+
+#### CRUD read error response
+
+GetArtifact and BatchGetArtifacts return gRPC status `NOT_FOUND` when an artifact does not exist or is tombstoned
+(logically deleted). The error includes an `ArtifactNotFoundError` detail message so callers can distinguish the two
+cases without changing control flow (both are "not found" from the caller's perspective, consistent with the rule that
+reads treat tombstones as not found — see Delete semantics and retention).
+
+The detail message includes:
+1. artifact_id: the requested artifact_id.
+2. tombstoned: boolean. `true` if the artifact exists but is tombstoned; `false` if the artifact_id was never created or
+   is not present at the read pointer (snapshot, transaction, or canonical branch head).
+
+For BatchGetArtifacts, each per-id result in the response carries its own status: either the artifact payload or an
+`ArtifactNotFoundError`. The overall RPC returns gRPC status `OK`; individual not-found entries are expressed via the
+per-id `oneof { artifact, not_found_error }` wrapper (see Request/response expectations above). This preserves
+positional correlation and allows the caller to handle each ID independently.
+
+```proto
+message ArtifactNotFoundError {
+  uint64 artifact_id = 1;
+  bool tombstoned = 2;
+}
+```
 
 #### CRUD write error response
 
@@ -1139,6 +1211,36 @@ Response:
 1. Returns the index object stored for (key_type, encoded key values) in deterministic order.
 1. Response shape and field semantics are defined in Index fetch behavior (MVP), including the generated index message.
 
+Error responses:
+
+1. **Unknown key_type**: if key_type does not resolve to a registered IndexDefinition (via the `index_key_type_unique`
+   index), return gRPC status `NOT_FOUND` with a `FetchIndexError` detail message (category `INDEX_NOT_FOUND`). The
+   description identifies the unrecognized key_type.
+2. **Incomplete key**: if the key fields provided do not match the complete set of key fields declared by the
+   IndexDefinition, return gRPC status `INVALID_ARGUMENT` with a `FetchIndexError` detail message (category
+   `INCOMPLETE_KEY`). The description lists the expected key fields and identifies which are missing or extraneous.
+3. **Key type mismatch**: if a provided key field value has the wrong type (for example, a string where a uint64 is
+   expected), return gRPC status `INVALID_ARGUMENT` with a `FetchIndexError` detail message (category
+   `KEY_TYPE_MISMATCH`). The description identifies the field name, expected type, and actual type.
+
+If no index object exists for the resolved (key_type, encoded key values) — that is, the key combination has never been
+written to — return a successful response with an empty index message (zero entries), consistent with the rule that
+empty or tombstoned indexes return an index message with zero entries (see Index fetch behavior).
+
+```proto
+message FetchIndexError {
+  enum Category {
+    CATEGORY_UNSPECIFIED = 0;
+    INDEX_NOT_FOUND = 1;
+    INCOMPLETE_KEY = 2;
+    KEY_TYPE_MISMATCH = 3;
+  }
+  Category category = 1;
+  string description = 2;
+  string key_type = 3;
+}
+```
+
 #### Type registry API
 
 The registry supports registering and querying type versions. All registry operations create or modify TypeDefinition,
@@ -1226,9 +1328,10 @@ Each violation includes:
 
 Violation categories:
 
-1. `PROTO_COMPILATION_FAILURE` — the .proto source failed to compile, uses non-proto3 syntax, or the type_name does not
-   resolve to a message in the resulting descriptor set. This category is fatal: if present, no further validations are
-   performed and this is the only violation in the response.
+1. `PROTO_COMPILATION_FAILURE` — the .proto source failed to compile, uses non-proto3 syntax, the type_name does not
+   resolve to a message in the resulting descriptor set, or runtime resource limits were exceeded during compilation
+   (maximum input file size, compilation timeout, or nesting depth — see Protocol buffers as the type definition). This
+   category is fatal: if present, no further validations are performed and this is the only violation in the response.
 2. `SCHEMA_INCOMPATIBILITY` — the new schema is incompatible with the prior type version. Covers: existing field removed,
    existing field type changed (including changes between `optional`/`required`/`repeated`), nested message field
    removed or type-changed, `oneof` removed or field removed from a `oneof`, and field number reassignment (a field
