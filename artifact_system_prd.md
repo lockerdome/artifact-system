@@ -17,7 +17,7 @@
    retained custom options including LLM instruction/description annotations at message and field levels. Types, type
    versions, index definitions, and reference definitions are first-class artifacts with their own indexes (see Built-in
    types and bootstrapping).
-1. Type version resolution via an optional current pointer on TypeDefinition (see Type identity and versioning).
+1. Type version resolution via the current pointer on TypeDefinition, automatically set by RegisterTypeVersion (see Type identity and versioning).
 1. Transaction and snapshot API exposed to the App Layer; internal Storage Layer branch and merge mechanics are hidden.
    Callers interact with snapshots (immutable read contexts) and transactions (read-write contexts with snapshot isolation),
    and receive structured conflict responses on commit (Artifact Layer transaction commit, which translates to a merge in
@@ -360,8 +360,9 @@ payload bytes plus type_name and version_id. Partial updates are out of scope fo
 
 **Internal bypass of mutation restrictions**: Certain artifact layer operations require creating, updating, or deleting
 artifacts whose types have `deny_create`, `deny_update`, or `deny_delete` set, as part of their internal logic. For
-example, RegisterTypeVersion creates TypeVersionDefinition and IndexDefinition artifacts (bypassing `deny_create`) and
-updates the tail TypeVersionDefinition's `next_version_id` pointer (bypassing `deny_update`). These internal operations
+example, RegisterTypeVersion creates TypeVersionDefinition and IndexDefinition artifacts (bypassing `deny_create`),
+updates the tail TypeVersionDefinition's `next_version_id` pointer (bypassing `deny_update`), and updates the
+TypeDefinition's `current_version_id` and mutation-restriction flags (bypassing `deny_update`). These internal operations
 bypass the public mutation-restriction checks. Internal bypasses are limited to system-managed bookkeeping performed by
 the artifact layer itself; external callers cannot trigger them through the public CRUD API. This is a stopgap
 mechanism; post-MVP field-level mutability will provide a principled way to declare which fields are mutable on
@@ -599,9 +600,9 @@ artifact layer binary but are also stored as artifacts so the system is fully se
    definition types (TypeDefinition, TypeVersionDefinition, IndexDefinition, ReferenceDefinition) set `deny_create`
    to true because their artifacts are created exclusively through dedicated registry operations (e.g.,
    RegisterTypeVersion), not through the public CreateArtifact API. TypeDefinition's own TypeDefinition has
-   `deny_create = true, deny_update = false, deny_delete = true`; `deny_update` is false because
-   SetCurrentTypeVersion and RegisterTypeVersion (when tightening flags) update TypeDefinition artifacts through
-   standard internal updates without requiring a bypass.
+   `deny_create = true, deny_update = true, deny_delete = true`; updates to TypeDefinition artifacts (setting
+   `current_version_id` and tightening mutation-restriction flags) are performed exclusively by RegisterTypeVersion
+   using an internal bypass of the `deny_update` restriction (see Internal bypass of mutation restrictions).
 2. **TypeVersionDefinition**: represents a specific version of a type. Contains the type_id (artifact_id of the parent
    TypeDefinition), the compiled FileDescriptorSet, the original .proto source, and optional `previous_version_id` /
    `next_version_id` pointers that form a doubly-linked list of versions per type. Multiple TypeVersionDefinition
@@ -944,11 +945,11 @@ type_id field. Type versions cannot be created, updated, or deleted through the 
 TypeVersionDefinition type has `deny_create = true, deny_update = true, deny_delete = true`); any schema or metadata
 change creates a new TypeVersionDefinition artifact via RegisterTypeVersion.
 
-The TypeDefinition artifact contains an optional `current_version_id` field pointing to the default
-TypeVersionDefinition artifact_id. If a CRUD request omits the version_id, the artifact layer resolves to the
-current_version_id at request time and returns the resolved version artifact_id in the response for reproducibility. A
-TypeDefinition with no current_version_id set is a valid state — versions can be used explicitly by callers that specify
-a version_id, but no default resolution is available.
+The TypeDefinition artifact contains a `current_version_id` field pointing to the default TypeVersionDefinition
+artifact_id. RegisterTypeVersion automatically sets `current_version_id` to the newly created version, so it always
+points to the most recently registered version for a type. If a CRUD request omits the version_id, the artifact layer
+resolves to the current_version_id at request time and returns the resolved version artifact_id in the response for
+reproducibility.
 
 Versions are identified by their artifact_id (a uint64), not by a human-readable version string. The
 `type_versions_by_type` index lists all version artifact_ids for a given type_id in creation order (ascending
@@ -1145,14 +1146,14 @@ enforce additional validation rules that the generic CRUD API does not.
 1. RegisterTypeVersion(type_name, proto_source, deny_create?, deny_update?, deny_delete?) -> version_id
 1. GetTypeVersion(version_id) -> TypeVersionDefinition
 1. ListTypeVersions(type_name) -> repeated version_id
-1. SetCurrentTypeVersion(type_name, version_id, transaction_id?)
 1. ResolveTypeVersion(type_name) -> version_id (current)
 
 **RegisterTypeVersion** compiles the .proto source into a FileDescriptorSet (injecting system protos as well-known
 imports), locates the message identified by type_name in the descriptor set, and validates the schema. It then:
 1. Looks up the TypeDefinition via the `type_name_unique` index. If not found, creates a new TypeDefinition artifact
-   (`type_name`, `current_version_id` unset, `deny_create`, `deny_update`, and `deny_delete` set to the
-   caller-provided values or false if omitted). If the TypeDefinition already exists and the caller provides
+   (`type_name`, `current_version_id` set to the new TypeVersionDefinition's artifact_id — see step 6, `deny_create`,
+   `deny_update`, and `deny_delete` set to the caller-provided values or false if omitted). If the TypeDefinition
+   already exists and the caller provides
    `deny_create`, `deny_update`, or `deny_delete` values, the registry enforces the tighten-only rule: each flag may
    be changed from false to true but never from true
    to false. A request that attempts to loosen a restriction (true to false) is rejected (`TIGHTEN_ONLY_VIOLATION`). If the caller omits the
@@ -1175,9 +1176,16 @@ imports), locates the message identified by type_name in the descriptor set, and
    tail version is the mechanism that enforces serialization of concurrent registrations: if two transactions both
    attempt to set `next_version_id` on the same tail, the second to commit produces an artifact payload conflict (see
    Conflict retry policy).
-6. Derives all index entries for the new artifacts and commits the Artifact Layer transaction atomically (merging the
+6. Updates the TypeDefinition artifact's `current_version_id` to the new TypeVersionDefinition's artifact_id. This
+   uses an internal bypass of the `deny_update` restriction (TypeDefinition has `deny_update = true`; see Internal
+   bypass of mutation restrictions). For a new TypeDefinition (created in step 1), `current_version_id` is set as part
+   of the initial creation. For an existing TypeDefinition, this is an update within the same transaction. Because the
+   TypeDefinition is also updated when tightening mutation-restriction flags (step 1), and the tail
+   TypeVersionDefinition is updated in step 5, concurrent registrations for the same type will produce payload
+   conflicts on both the tail version and the TypeDefinition, reinforcing serialization.
+7. Derives all index entries for the new artifacts and commits the Artifact Layer transaction atomically (merging the
    ephemeral branch into the canonical branch in the Storage Layer).
-7. Returns the new TypeVersionDefinition artifact_id (the version_id).
+8. Returns the new TypeVersionDefinition artifact_id (the version_id).
 
 Schema compatibility rules for launch (violations return the indicated category; see RegisterTypeVersion error response):
 1. Existing fields must not be removed or have their type changed (`SCHEMA_INCOMPATIBILITY`). These rules apply
@@ -1263,20 +1271,11 @@ message TypeRegistrationViolation {
 **ListTypeVersions** fetches the `type_versions_by_type` index for the TypeDefinition's artifact_id, returning version
 artifact_ids in creation order.
 
-**SetCurrentTypeVersion** updates the TypeDefinition artifact's `current_version_id` field. TypeDefinition does not have
-`deny_update` set (its own TypeDefinition has `deny_update = false`), so this uses a standard internal update. However,
-`SetCurrentTypeVersion` is not exposed as a general-purpose
-UpdateArtifact call — it is a dedicated registry operation that enforces additional validation. If a transaction_id is
-provided, the update runs within that transaction; otherwise it uses an implicit transaction. Concurrent version pointer
-updates are detected as payload conflicts at Artifact Layer transaction commit time — the caller reads the TypeDefinition
-within a transaction, updates `current_version_id`, and if another transaction committed a change to the same
-TypeDefinition in the interim, the merge produces a conflict. The registry validates that the target version_id
-references a TypeVersionDefinition whose type_id matches the TypeDefinition's artifact_id and that the version exists in
-the type's version chain (reachable via the linked-list pointers) before applying the update.
-
-RegisterTypeVersion and SetCurrentTypeVersion are separate operations. A registered version that is not yet current is a
-valid state — it can be used explicitly by callers that specify a version_id, but will not be resolved by default. Type
-registration and current-pointer updates are low-concurrency administrative operations; contention is not expected.
+RegisterTypeVersion automatically sets `current_version_id` to the newly created version (see step 6 of
+RegisterTypeVersion). There is no separate operation to change the current version pointer. The `current_version_id`
+always points to the most recently registered version for a type. Callers that need a specific non-current version
+reference it by artifact_id (version_id) on CRUD calls. Type registration is a low-concurrency administrative operation;
+contention is not expected.
 
 ## App Layer
 
