@@ -17,7 +17,9 @@
    retained custom options including LLM instruction/description annotations at message and field levels. Types, type
    versions, index definitions, and reference definitions are first-class artifacts with their own indexes (see Built-in
    types and bootstrapping).
-1. Type version resolution via the current pointer on TypeDefinition, automatically set by RegisterTypeVersion (see Type identity and versioning).
+1. Type versioning with explicit version_id required on CRUD operations. The current pointer on TypeDefinition is
+   automatically set by RegisterTypeVersion and serves as a convenience for callers to discover the latest version (see
+   Type identity and versioning).
 1. Transaction and snapshot API exposed to the App Layer; internal Storage Layer branch and merge mechanics are hidden.
    Callers interact with snapshots (immutable read contexts) and transactions (read-write contexts with snapshot isolation),
    and receive structured conflict responses on commit (Artifact Layer transaction commit, which translates to a merge in
@@ -337,8 +339,7 @@ Artifacts are defined by (artifact_id, type_name, version_id, payload).
 1. artifact_id: opaque uint64 allocated by a separate ID allocation service.
 2. type_name: the fully-qualified proto message name. Must resolve to a registered TypeDefinition artifact via the
    `type_name_unique` index.
-3. version_id: optional uint64 artifact_id of a TypeVersionDefinition. If omitted, the artifact layer resolves to the
-   TypeDefinition's current_version_id (see Type identity and versioning). The resolved TypeVersionDefinition must have a
+3. version_id: required uint64 artifact_id of a TypeVersionDefinition. The specified TypeVersionDefinition must have a
    type_id matching the TypeDefinition's artifact_id.
 4. payload: serialized protobuf message (binary wire format) for the resolved type version.
 
@@ -354,7 +355,7 @@ index declarations in the descriptor set's custom options. Artifact validation i
 and referential integrity (see below); semantic or business validation is out of scope for launch. All CRUD write-time
 validation failures return gRPC status `INVALID_ARGUMENT` with an `ArtifactWriteError` detail message; see CRUD write
 error response for the full specification. Responses return the
-resolved version_id (the TypeVersionDefinition artifact_id). All writes occur within a transaction; concurrent write
+version_id (the TypeVersionDefinition artifact_id). All writes occur within a transaction; concurrent write
 conflicts are detected at Artifact Layer transaction commit (see Consistency and transaction semantics). Reads return
 payload bytes plus type_name and version_id. Partial updates are out of scope for launch.
 
@@ -945,11 +946,11 @@ type_id field. Type versions cannot be created, updated, or deleted through the 
 TypeVersionDefinition type has `deny_create = true, deny_update = true, deny_delete = true`); any schema or metadata
 change creates a new TypeVersionDefinition artifact via RegisterTypeVersion.
 
-The TypeDefinition artifact contains a `current_version_id` field pointing to the default TypeVersionDefinition
-artifact_id. RegisterTypeVersion automatically sets `current_version_id` to the newly created version, so it always
-points to the most recently registered version for a type. If a CRUD request omits the version_id, the artifact layer
-resolves to the current_version_id at request time and returns the resolved version artifact_id in the response for
-reproducibility.
+The TypeDefinition artifact contains a `current_version_id` field pointing to the most recently registered
+TypeVersionDefinition artifact_id. RegisterTypeVersion automatically sets `current_version_id` to the newly created
+version, so it always points to the most recently registered version for a type. CRUD operations require an explicit
+version_id; there is no automatic resolution to `current_version_id`. Callers that want the latest version read
+`current_version_id` from the TypeDefinition artifact and pass it explicitly.
 
 Versions are identified by their artifact_id (a uint64), not by a human-readable version string. The
 `type_versions_by_type` index lists all version artifact_ids for a given type_id in creation order (ascending
@@ -987,27 +988,28 @@ implicit transaction (see Implicit transactions).
 #### Artifact CRUD API
 
 Operations (gRPC service-to-service; client-to-app transport is application-specific):
-1. CreateArtifact(type_name, version_id?, payload, transaction_id?)
+1. CreateArtifact(type_name, version_id, payload, transaction_id?)
 2. GetArtifact(artifact_id, snapshot_id | transaction_id?)
 3. BatchGetArtifacts(artifact_ids, snapshot_id | transaction_id?)
-4. UpdateArtifact(artifact_id, type_name, version_id?, payload, transaction_id?)
+4. UpdateArtifact(artifact_id, type_name, version_id, payload, transaction_id?)
 5. DeleteArtifact(artifact_id, transaction_id?)
 
 Request/response expectations:
 1. artifact_id is allocated by the artifact layer via a separate ID service and returned in Create responses.
-1. version_id is an optional uint64 (TypeVersionDefinition artifact_id) for Create/Update; resolution behavior is defined
-   in Type identity and versioning. If omitted, the artifact layer resolves to the TypeDefinition's current_version_id.
+1. version_id is a required uint64 (TypeVersionDefinition artifact_id) for Create/Update. The specified
+   TypeVersionDefinition must belong to the TypeDefinition identified by type_name (matching type_id). Callers obtain
+   version_id from RegisterTypeVersion responses or by reading the TypeDefinition's `current_version_id` field.
 1. CreateArtifact is rejected (`MUTATION_DENIED`) if the TypeDefinition's `deny_create` flag is true; UpdateArtifact is
    rejected if `deny_update` is true; DeleteArtifact is rejected if `deny_delete` is true. See CRUD write error response
    for all write-time validation error categories and their gRPC status codes.
 1. Create/Update validate referential integrity for reference fields (see CRUD write error response for violation
    categories); deletes may be rejected (`REFERENCE_DELETE_RESTRICTED` for RESTRICT) or may cascade or nullify
    references depending on declared `on_delete` behavior.
-1. Reads return payload bytes plus type_name and version_id (the resolved TypeVersionDefinition artifact_id).
+1. Reads return payload bytes plus type_name and version_id (the TypeVersionDefinition artifact_id stored with the artifact).
 1. BatchGetArtifacts returns results in the same order as the input IDs using explicit per-id results (for example, a
    `oneof { artifact, not_found }` wrapper) so missing or tombstoned artifacts preserve positional correlation.
    BatchGetArtifacts does not follow references; see App Layer guidance for limitations.
-1. Create/Update/Delete return the resolved version_id.
+1. Create/Update/Delete return the version_id.
 1. Delete and tombstone behavior is defined in Delete semantics and retention.
 1. Conflicts are surfaced at Artifact Layer transaction commit time (CommitTransaction), not on individual write calls.
    For implicit transactions, the conflict response is returned from the write call itself.
@@ -1139,14 +1141,13 @@ Response:
 
 #### Type registry API
 
-The registry supports registering and resolving type versions. All registry operations create or modify TypeDefinition,
+The registry supports registering and querying type versions. All registry operations create or modify TypeDefinition,
 TypeVersionDefinition, IndexDefinition, and ReferenceDefinition artifacts via the standard artifact storage path, but
 enforce additional validation rules that the generic CRUD API does not.
 
 1. RegisterTypeVersion(type_name, proto_source, deny_create?, deny_update?, deny_delete?) -> version_id
 1. GetTypeVersion(version_id) -> TypeVersionDefinition
 1. ListTypeVersions(type_name) -> repeated version_id
-1. ResolveTypeVersion(type_name) -> version_id (current)
 
 **RegisterTypeVersion** compiles the .proto source into a FileDescriptorSet (injecting system protos as well-known
 imports), locates the message identified by type_name in the descriptor set, and validates the schema. It then:
@@ -1273,9 +1274,9 @@ artifact_ids in creation order.
 
 RegisterTypeVersion automatically sets `current_version_id` to the newly created version (see step 6 of
 RegisterTypeVersion). There is no separate operation to change the current version pointer. The `current_version_id`
-always points to the most recently registered version for a type. Callers that need a specific non-current version
-reference it by artifact_id (version_id) on CRUD calls. Type registration is a low-concurrency administrative operation;
-contention is not expected.
+always points to the most recently registered version for a type and serves as a convenience for callers that want the
+latest version; callers read `current_version_id` from the TypeDefinition artifact and pass it as the required
+version_id on CRUD calls. Type registration is a low-concurrency administrative operation; contention is not expected.
 
 ## App Layer
 
