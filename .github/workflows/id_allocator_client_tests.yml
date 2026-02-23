@@ -1,0 +1,21 @@
+name: ID Allocator Client Tests
+on:
+  pull_request:
+    paths:
+      - 'id-allocator/id-allocator-client/**'
+      - '.github/workflows/id_allocator_client_tests.yml'
+
+jobs:
+  run-id-allocator-client-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Install node modules
+        working-directory: id-allocator/id-allocator-client
+        run: npm install
+      - name: Run tests
+        working-directory: id-allocator/id-allocator-client
+        run: npm test
