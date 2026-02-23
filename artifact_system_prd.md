@@ -126,14 +126,52 @@ limit is reached. The retry policy is defined below.
    commit). Both merge points use the same retry policy.
 
 **Conflict response payload**
-When retries are aborted or exhausted, return a structured conflict response containing:
-1. conflict_type: one of {INDEX_CONFLICT, PAYLOAD_CONFLICT, REFERENTIAL_INTEGRITY_VIOLATION}.
-1. retryable: boolean indicating whether the server would retry (false when exhausted or payload conflict).
-1. attempts: number of attempts performed.
-1. artifacts/indexes involved: artifact_id for payload conflicts; index key (key_type + encoded key) for index conflicts;
-   for referential integrity violations include the target artifact_id, the reference key_type, and the referencing
-   artifact_ids.
-1. version_ids: base, ours, theirs Storage Layer commit IDs when available.
+When retries are aborted or exhausted, CommitTransaction returns gRPC status `ABORTED` with a `CommitConflict` detail
+message. For implicit transactions, the conflict is returned from the write call itself with the same gRPC status and
+detail.
+
+```proto
+message CommitConflict {
+  enum ConflictType {
+    CONFLICT_TYPE_UNSPECIFIED = 0;
+    INDEX_CONFLICT = 1;
+    PAYLOAD_CONFLICT = 2;
+    REFERENTIAL_INTEGRITY_VIOLATION = 3;
+  }
+
+  ConflictType conflict_type = 1;
+  bool retryable = 2;                    // false when retries exhausted or payload conflict
+  uint32 attempts = 3;                   // number of merge attempts performed
+
+  // Artifacts/indexes involved in the conflict. Exactly one of the following
+  // detail messages is populated, corresponding to the conflict_type.
+  oneof detail {
+    PayloadConflictDetail payload_detail = 4;
+    IndexConflictDetail index_detail = 5;
+    ReferentialIntegrityConflictDetail referential_integrity_detail = 6;
+  }
+
+  // Storage Layer commit IDs when available (for debugging).
+  optional string base_commit_id = 7;
+  optional string ours_commit_id = 8;
+  optional string theirs_commit_id = 9;
+}
+
+message PayloadConflictDetail {
+  uint64 artifact_id = 1;
+}
+
+message IndexConflictDetail {
+  string key_type = 1;
+  bytes encoded_key = 2;
+}
+
+message ReferentialIntegrityConflictDetail {
+  uint64 target_artifact_id = 1;
+  string reference_key_type = 2;
+  repeated uint64 referencing_artifact_ids = 3;
+}
+```
 
 **Exhaustion behavior**
 1. If the retry limit is reached while resolving index conflicts, return the conflict response with retryable=false.
@@ -280,8 +318,8 @@ post-MVP; FetchIndex returns the stored index state only.
 
 **Inputs**
 1. key_type: identifies which index definition to query.
-1. key values: the complete set of key fields defined by the index, provided as typed values. All key fields are
-   required; partial keys are rejected.
+1. key: the serialized `IndexKey_*` message for the queried index, containing the complete set of key fields. All key
+   fields are required; partial keys are rejected.
 
 **Execution semantics**
 1. The artifact layer locates the index object for (key_type, encoded key values) and reads its current state. If issued
@@ -985,11 +1023,45 @@ application-specific and will be decided per application.
 
 #### Snapshot and transaction API
 
-Operations:
-1. CreateSnapshot(parent_id?) -> snapshot_id
-2. CreateTransaction(parent_id?) -> transaction_id
-3. CommitTransaction(transaction_id)
-4. RollbackTransaction(transaction_id)
+```proto
+service SnapshotTransactionService {
+  rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
+  rpc CreateTransaction(CreateTransactionRequest) returns (CreateTransactionResponse);
+  rpc CommitTransaction(CommitTransactionRequest) returns (CommitTransactionResponse);
+  rpc RollbackTransaction(RollbackTransactionRequest) returns (RollbackTransactionResponse);
+}
+
+message CreateSnapshotRequest {
+  optional uint64 parent_id = 1; // transaction_id; omit to snapshot the canonical branch head
+}
+
+message CreateSnapshotResponse {
+  uint64 snapshot_id = 1;
+}
+
+message CreateTransactionRequest {
+  optional uint64 parent_id = 1; // snapshot_id or transaction_id; omit to fork from canonical branch head
+}
+
+message CreateTransactionResponse {
+  uint64 transaction_id = 1;
+}
+
+message CommitTransactionRequest {
+  uint64 transaction_id = 1;
+}
+
+message CommitTransactionResponse {
+  // Empty on success. Conflict details are returned via gRPC error status
+  // with a CommitConflict detail message (see Conflict retry policy).
+}
+
+message RollbackTransactionRequest {
+  uint64 transaction_id = 1;
+}
+
+message RollbackTransactionResponse {}
+```
 
 Semantics are defined in Consistency and transaction semantics. All CRUD and index fetch operations accept an optional
 snapshot_id or transaction_id to scope reads and writes. Writes issued without a transaction context are wrapped in an
@@ -1005,7 +1077,8 @@ Error responses:
    `PARENT_NOT_FOUND`). The description identifies the unrecognized parent_id.
 3. **Invalid transaction_id on CommitTransaction**: if transaction_id does not resolve to an open transaction, return
    gRPC status `NOT_FOUND` with a `SnapshotTransactionError` detail message (category `TRANSACTION_NOT_FOUND`). This
-   covers non-existent IDs, already-committed transactions, and already-rolled-back transactions.
+   covers non-existent IDs, already-committed transactions, and already-rolled-back transactions. On conflict, return
+   gRPC status `ABORTED` with a `CommitConflict` detail message (see Conflict retry policy).
 4. **Invalid transaction_id on RollbackTransaction**: if transaction_id does not resolve to an open transaction, return
    gRPC status `NOT_FOUND` with a `SnapshotTransactionError` detail message (category `TRANSACTION_NOT_FOUND`). Same
    semantics as CommitTransaction — rolling back an already-finalized transaction is a no-op-safe error (idempotent
@@ -1035,17 +1108,92 @@ message SnapshotTransactionError {
 
 #### Artifact CRUD API
 
-Operations (gRPC service-to-service; client-to-app transport is application-specific):
-1. CreateArtifact(version_id, payload, transaction_id?)
-2. GetArtifact(artifact_id, snapshot_id | transaction_id?)
-3. BatchGetArtifacts(artifact_ids, snapshot_id | transaction_id?)
-4. UpdateArtifact(artifact_id, version_id, payload, transaction_id?)
-5. DeleteArtifact(artifact_id, transaction_id?)
+This service handles artifact CRUD operations. gRPC is used for service-to-service communication;
+client-to-app-layer transport is application-specific.
 
-Request/response expectations:
-1. artifact_id is allocated by the artifact layer via a separate ID service and returned in Create responses. If the
-   ID service is unavailable (both allocation buffers exhausted), CreateArtifact returns gRPC status `UNAVAILABLE` (see
-   Dependencies and constraints). Standard gRPC `UNAVAILABLE` retry semantics apply.
+```proto
+service ArtifactService {
+  rpc CreateArtifact(CreateArtifactRequest) returns (CreateArtifactResponse);
+  rpc GetArtifact(GetArtifactRequest) returns (GetArtifactResponse);
+  rpc BatchGetArtifacts(BatchGetArtifactsRequest) returns (BatchGetArtifactsResponse);
+  rpc UpdateArtifact(UpdateArtifactRequest) returns (UpdateArtifactResponse);
+  rpc DeleteArtifact(DeleteArtifactRequest) returns (DeleteArtifactResponse);
+}
+
+// --- Read context (shared across services) ---
+
+// Used by read and write operations to scope reads/writes to a snapshot or transaction.
+// At most one field may be set. If neither is set, reads use the canonical branch head
+// and writes are wrapped in an implicit transaction (see Implicit transactions).
+message ReadContext {
+  oneof context {
+    uint64 snapshot_id = 1;
+    uint64 transaction_id = 2;
+  }
+}
+
+// --- CRUD messages ---
+
+message CreateArtifactRequest {
+  uint64 version_id = 1;       // TypeVersionDefinition artifact_id (required)
+  bytes payload = 2;            // serialized protobuf message for the resolved type version
+  optional uint64 transaction_id = 3; // omit for implicit transaction
+}
+
+message CreateArtifactResponse {
+  uint64 artifact_id = 1;      // allocated by the ID service
+}
+
+message GetArtifactRequest {
+  uint64 artifact_id = 1;
+  ReadContext context = 2;
+}
+
+message GetArtifactResponse {
+  uint64 artifact_id = 1;
+  string type_name = 2;        // fully-qualified proto message name
+  uint64 version_id = 3;       // TypeVersionDefinition artifact_id stored with the artifact
+  bytes payload = 4;            // serialized protobuf message
+}
+
+message BatchGetArtifactsRequest {
+  repeated uint64 artifact_ids = 1;
+  ReadContext context = 2;
+}
+
+message BatchGetArtifactsResponse {
+  // Results are in the same order as the input artifact_ids.
+  repeated ArtifactResult results = 1;
+}
+
+message ArtifactResult {
+  oneof result {
+    GetArtifactResponse artifact = 1;
+    ArtifactNotFoundError not_found = 2;
+  }
+}
+
+message UpdateArtifactRequest {
+  uint64 artifact_id = 1;
+  uint64 version_id = 2;       // TypeVersionDefinition artifact_id (required)
+  bytes payload = 3;            // serialized protobuf message for the resolved type version
+  optional uint64 transaction_id = 4; // omit for implicit transaction
+}
+
+message UpdateArtifactResponse {}
+
+message DeleteArtifactRequest {
+  uint64 artifact_id = 1;
+  optional uint64 transaction_id = 2; // omit for implicit transaction
+}
+
+message DeleteArtifactResponse {}
+```
+
+**Request/response semantics:**
+1. artifact_id is allocated by the artifact layer via a separate ID service and returned in CreateArtifactResponse. If
+   the ID service is unavailable (both allocation buffers exhausted), CreateArtifact returns gRPC status `UNAVAILABLE`
+   (see Dependencies and constraints). Standard gRPC `UNAVAILABLE` retry semantics apply.
 1. version_id is a required uint64 (TypeVersionDefinition artifact_id) for Create/Update. The artifact layer resolves
    the parent TypeDefinition via the TypeVersionDefinition's type_id field; callers do not provide type_name. Callers
    obtain version_id from RegisterTypeVersion responses or by reading the TypeDefinition's `current_version_id` field.
@@ -1056,11 +1204,9 @@ Request/response expectations:
 1. Create/Update validate referential integrity for reference fields (see CRUD write error response for violation
    categories); deletes may be rejected (`REFERENCE_DELETE_RESTRICTED` for RESTRICT) or may cascade or nullify
    references depending on declared `on_delete` behavior.
-1. Reads return payload bytes plus type_name and version_id (the TypeVersionDefinition artifact_id stored with the artifact).
-1. BatchGetArtifacts returns results in the same order as the input IDs using explicit per-id results (for example, a
-   `oneof { artifact, not_found }` wrapper) so missing or tombstoned artifacts preserve positional correlation.
-   BatchGetArtifacts does not follow references; see App Layer guidance for limitations.
-1. Create/Update/Delete return the version_id.
+1. BatchGetArtifacts returns results in the same order as the input IDs using per-id `ArtifactResult` entries so missing
+   or tombstoned artifacts preserve positional correlation. BatchGetArtifacts does not follow references; see App Layer
+   guidance for limitations.
 1. Delete and tombstone behavior is defined in Delete semantics and retention.
 1. Conflicts are surfaced at Artifact Layer transaction commit time (CommitTransaction), not on individual write calls.
    For implicit transactions, the conflict response is returned from the write call itself.
@@ -1083,8 +1229,8 @@ The detail message includes:
 
 For BatchGetArtifacts, each per-id result in the response carries its own status: either the artifact payload or an
 `ArtifactNotFoundError`. The overall RPC returns gRPC status `OK`; individual not-found entries are expressed via the
-per-id `oneof { artifact, not_found_error }` wrapper (see Request/response expectations above). This preserves
-positional correlation and allows the caller to handle each ID independently.
+per-id `ArtifactResult` oneof (see ArtifactService proto definition above). This preserves positional correlation and
+allows the caller to handle each ID independently.
 
 ```proto
 message ArtifactNotFoundError {
@@ -1211,29 +1357,44 @@ message ArtifactWriteViolation {
 
 #### Index fetch API
 
-Operation:
-1. FetchIndex(key_type, key, snapshot_id | transaction_id?)
+This service handles index lookups. Execution semantics and response shape are defined in Index fetch behavior (MVP).
 
-Inputs:
-1. key_type identifies the index definition.
-1. key must include the complete set of key fields; partial keys are rejected.
-1. An optional snapshot_id or transaction_id scopes the read (see Index fetch behavior).
+```proto
+service IndexService {
+  rpc FetchIndex(FetchIndexRequest) returns (FetchIndexResponse);
+}
 
-Response:
-1. Returns the index object stored for (key_type, encoded key values) in deterministic order.
-1. Response shape and field semantics are defined in Index fetch behavior (MVP), including the generated index message.
+message FetchIndexRequest {
+  string key_type = 1;   // identifies which index definition to query
+  bytes key = 2;          // serialized IndexKey_* message for the queried index (e.g.,
+                          // IndexKey_DataFrameArtifact_by_repo_created_by); the server
+                          // deserializes using the key schema from the IndexDefinition.
+                          // All key fields are required; partial keys are rejected.
+  ReadContext context = 3; // shared ReadContext (see ArtifactService)
+}
+
+message FetchIndexResponse {
+  // The concrete, generated index message for the queried index (for example,
+  // Index_DataFrameArtifact_by_repo_created_by), serialized as bytes. The caller
+  // deserializes using the index-specific protobuf schema. Empty or tombstoned
+  // indexes return a message with zero entries.
+  bytes index_payload = 1;
+  string index_message_name = 2; // fully-qualified name of the index message for deserialization
+}
+```
 
 Error responses:
 
 1. **Unknown key_type**: if key_type does not resolve to a registered IndexDefinition (via the `index_key_type_unique`
    index), return gRPC status `NOT_FOUND` with a `FetchIndexError` detail message (category `INDEX_NOT_FOUND`). The
    description identifies the unrecognized key_type.
-2. **Incomplete key**: if the key fields provided do not match the complete set of key fields declared by the
-   IndexDefinition, return gRPC status `INVALID_ARGUMENT` with a `FetchIndexError` detail message (category
-   `INCOMPLETE_KEY`). The description lists the expected key fields and identifies which are missing or extraneous.
-3. **Key type mismatch**: if a provided key field value has the wrong type (for example, a string where a uint64 is
-   expected), return gRPC status `INVALID_ARGUMENT` with a `FetchIndexError` detail message (category
-   `KEY_TYPE_MISMATCH`). The description identifies the field name, expected type, and actual type.
+2. **Incomplete key**: if the key bytes, when deserialized against the `IndexKey_*` schema for the resolved
+   IndexDefinition, are missing required key fields or contain extraneous fields, return gRPC status `INVALID_ARGUMENT`
+   with a `FetchIndexError` detail message (category `INCOMPLETE_KEY`). The description lists the expected key fields
+   and identifies which are missing or extraneous.
+3. **Key parse failure**: if the key bytes cannot be deserialized against the `IndexKey_*` schema (for example, wire
+   format errors or type mismatches), return gRPC status `INVALID_ARGUMENT` with a `FetchIndexError` detail message
+   (category `KEY_PARSE_FAILURE`). The description includes the parse error text.
 
 If no index object exists for the resolved (key_type, encoded key values) — that is, the key combination has never been
 written to — return a successful response with an empty index message (zero entries), consistent with the rule that
@@ -1245,7 +1406,7 @@ message FetchIndexError {
     CATEGORY_UNSPECIFIED = 0;
     INDEX_NOT_FOUND = 1;
     INCOMPLETE_KEY = 2;
-    KEY_TYPE_MISMATCH = 3;
+    KEY_PARSE_FAILURE = 3;
   }
   Category category = 1;
   string description = 2;
@@ -1259,9 +1420,46 @@ The registry supports registering and querying type versions. All registry opera
 TypeVersionDefinition, IndexDefinition, and ReferenceDefinition artifacts via the standard artifact storage path, but
 enforce additional validation rules that the generic CRUD API does not.
 
-1. RegisterTypeVersion(type_name, proto_source, deny_create?, deny_update?, deny_delete?) -> version_id
-1. GetTypeVersion(version_id) -> TypeVersionDefinition
-1. ListTypeVersions(type_name) -> repeated version_id
+```proto
+service TypeRegistryService {
+  rpc RegisterTypeVersion(RegisterTypeVersionRequest) returns (RegisterTypeVersionResponse);
+  rpc GetTypeVersion(GetTypeVersionRequest) returns (GetTypeVersionResponse);
+  rpc ListTypeVersions(ListTypeVersionsRequest) returns (ListTypeVersionsResponse);
+}
+
+message RegisterTypeVersionRequest {
+  string type_name = 1;              // fully-qualified proto message name
+  string proto_source = 2;           // .proto source text
+  optional bool deny_create = 3;     // tighten-only; omit to preserve existing value
+  optional bool deny_update = 4;     // tighten-only; omit to preserve existing value
+  optional bool deny_delete = 5;     // tighten-only; omit to preserve existing value
+}
+
+message RegisterTypeVersionResponse {
+  uint64 version_id = 1;             // artifact_id of the new TypeVersionDefinition
+}
+
+message GetTypeVersionRequest {
+  uint64 version_id = 1;             // TypeVersionDefinition artifact_id
+}
+
+message GetTypeVersionResponse {
+  uint64 version_id = 1;             // TypeVersionDefinition artifact_id
+  uint64 type_id = 2;                // parent TypeDefinition artifact_id
+  google.protobuf.FileDescriptorSet descriptor_set = 3;
+  string proto_source = 4;
+  optional uint64 previous_version_id = 5;
+  optional uint64 next_version_id = 6;
+}
+
+message ListTypeVersionsRequest {
+  string type_name = 1;              // fully-qualified proto message name
+}
+
+message ListTypeVersionsResponse {
+  repeated uint64 version_ids = 1;   // in creation order (ascending artifact_id)
+}
+```
 
 **RegisterTypeVersion** compiles the .proto source into a FileDescriptorSet (injecting system protos as well-known
 imports), locates the message identified by type_name in the descriptor set, and validates the schema. It then:
