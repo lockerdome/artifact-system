@@ -340,27 +340,29 @@ per artifact type.
 
 Artifacts are defined by (artifact_id, type_name, version_id, payload).
 1. artifact_id: opaque uint64 allocated by a separate ID allocation service.
-2. type_name: the fully-qualified proto message name. Must resolve to a registered TypeDefinition artifact via the
-   `type_name_unique` index.
-3. version_id: required uint64 artifact_id of a TypeVersionDefinition. The specified TypeVersionDefinition must have a
-   type_id matching the TypeDefinition's artifact_id.
+2. type_name: the fully-qualified proto message name, resolved by the artifact layer from the version_id
+   (version_id → TypeVersionDefinition.type_id → TypeDefinition.type_name). Callers do not provide type_name on
+   Create/Update; it is derived and stored automatically.
+3. version_id: required uint64 artifact_id of a TypeVersionDefinition. The artifact layer resolves the parent
+   TypeDefinition via the TypeVersionDefinition's type_id field.
 4. payload: serialized protobuf message (binary wire format) for the resolved type version.
 
 The artifact_id is metadata and does not need to be duplicated in the payload. If a type schema includes an id field, the
 artifact layer should validate that it matches the artifact_id.
 
-On create/update/delete, the artifact layer checks the TypeDefinition's mutation-restriction flags. If `deny_create` is
-true, CreateArtifact is rejected (`MUTATION_DENIED`). If `deny_update` is true, UpdateArtifact is rejected
+On create/update/delete, the artifact layer resolves the TypeDefinition from the caller-provided version_id (via
+TypeVersionDefinition.type_id) and checks the TypeDefinition's mutation-restriction flags. If `deny_create` is true,
+CreateArtifact is rejected (`MUTATION_DENIED`). If `deny_update` is true, UpdateArtifact is rejected
 (`MUTATION_DENIED`). If `deny_delete` is true, DeleteArtifact is rejected (`MUTATION_DENIED`). The artifact layer
-validates the payload using standard proto3 structural validation against the message identified by type_name in the
-TypeVersionDefinition's descriptor set (`PAYLOAD_VALIDATION_FAILURE` on failure), and derives index entries from the
-index declarations in the descriptor set's custom options. Artifact validation is limited to proto3 structural checks
-and referential integrity (see below); semantic or business validation is out of scope for launch. All CRUD write-time
-validation failures return gRPC status `INVALID_ARGUMENT` with an `ArtifactWriteError` detail message; see CRUD write
-error response for the full specification. Responses return the
-version_id (the TypeVersionDefinition artifact_id). All writes occur within a transaction; concurrent write
-conflicts are detected at Artifact Layer transaction commit (see Consistency and transaction semantics). Reads return
-payload bytes plus type_name and version_id. Partial updates are out of scope for launch.
+validates the payload using standard proto3 structural validation against the message identified by the resolved
+type_name in the TypeVersionDefinition's descriptor set (`PAYLOAD_VALIDATION_FAILURE` on failure), and derives index
+entries from the index declarations in the descriptor set's custom options. Artifact validation is limited to proto3
+structural checks and referential integrity (see below); semantic or business validation is out of scope for launch. All
+CRUD write-time validation failures return gRPC status `INVALID_ARGUMENT` with an `ArtifactWriteError` detail message;
+see CRUD write error response for the full specification. Responses return the version_id (the TypeVersionDefinition
+artifact_id). All writes occur within a transaction; concurrent write conflicts are detected at Artifact Layer
+transaction commit (see Consistency and transaction semantics). Reads return payload bytes plus type_name and version_id.
+Partial updates are out of scope for launch.
 
 **Internal bypass of mutation restrictions**: Certain artifact layer operations require creating, updating, or deleting
 artifacts whose types have `deny_create`, `deny_update`, or `deny_delete` set, as part of their internal logic. For
@@ -1034,19 +1036,20 @@ message SnapshotTransactionError {
 #### Artifact CRUD API
 
 Operations (gRPC service-to-service; client-to-app transport is application-specific):
-1. CreateArtifact(type_name, version_id, payload, transaction_id?)
+1. CreateArtifact(version_id, payload, transaction_id?)
 2. GetArtifact(artifact_id, snapshot_id | transaction_id?)
 3. BatchGetArtifacts(artifact_ids, snapshot_id | transaction_id?)
-4. UpdateArtifact(artifact_id, type_name, version_id, payload, transaction_id?)
+4. UpdateArtifact(artifact_id, version_id, payload, transaction_id?)
 5. DeleteArtifact(artifact_id, transaction_id?)
 
 Request/response expectations:
 1. artifact_id is allocated by the artifact layer via a separate ID service and returned in Create responses. If the
    ID service is unavailable (both allocation buffers exhausted), CreateArtifact returns gRPC status `UNAVAILABLE` (see
    Dependencies and constraints). Standard gRPC `UNAVAILABLE` retry semantics apply.
-1. version_id is a required uint64 (TypeVersionDefinition artifact_id) for Create/Update. The specified
-   TypeVersionDefinition must belong to the TypeDefinition identified by type_name (matching type_id). Callers obtain
-   version_id from RegisterTypeVersion responses or by reading the TypeDefinition's `current_version_id` field.
+1. version_id is a required uint64 (TypeVersionDefinition artifact_id) for Create/Update. The artifact layer resolves
+   the parent TypeDefinition via the TypeVersionDefinition's type_id field; callers do not provide type_name. Callers
+   obtain version_id from RegisterTypeVersion responses or by reading the TypeDefinition's `current_version_id` field.
+   If version_id does not resolve to a valid TypeVersionDefinition, the write is rejected (`INVALID_VERSION_ID`).
 1. CreateArtifact is rejected (`MUTATION_DENIED`) if the TypeDefinition's `deny_create` flag is true; UpdateArtifact is
    rejected if `deny_update` is true; DeleteArtifact is rejected if `deny_delete` is true. See CRUD write error response
    for all write-time validation error categories and their gRPC status codes.
@@ -1110,7 +1113,12 @@ Each violation includes:
 
 Violation categories:
 
-1. `MUTATION_DENIED` — the write is rejected because the TypeDefinition's mutation-restriction flag is set.
+1. `INVALID_VERSION_ID` — the version_id does not resolve to an existing TypeVersionDefinition artifact, or the resolved
+   TypeVersionDefinition's type_id does not point to an existing TypeDefinition. On Update, the resolved type_name must
+   match the existing artifact's type_name (type changes via Update are not supported). The description identifies the
+   unresolvable version_id or the type mismatch. The subject is the version_id. This is the only violation returned when
+   triggered (all subsequent phases depend on a resolved TypeDefinition and TypeVersionDefinition).
+2. `MUTATION_DENIED` — the write is rejected because the TypeDefinition's mutation-restriction flag is set.
    `deny_create = true` rejects CreateArtifact, `deny_update = true` rejects UpdateArtifact, `deny_delete = true`
    rejects DeleteArtifact. The description identifies which flag triggered the rejection and the type_name. The subject
    is the type_name. This is the only violation returned when triggered (the flag check runs before payload validation).
@@ -1156,17 +1164,20 @@ Violation categories:
 Validations are applied in the following order. A category marked "short-circuit" means that if any violation of that
 category is produced, subsequent validation phases are skipped (because later phases depend on earlier ones succeeding).
 
-1. `MUTATION_DENIED` — checked first. Short-circuit: if denied, no further validation is performed.
-2. `EMPTY_PAYLOAD` — checked before parsing. Short-circuit: if empty, no further validation is performed. (Applies to
+1. `INVALID_VERSION_ID` — version_id resolution (Create/Update only; Delete does not take a version_id). Short-circuit:
+   if version_id is invalid, the TypeDefinition and descriptor set cannot be resolved. On Update, also validates that
+   the resolved type_name matches the existing artifact's type_name.
+2. `MUTATION_DENIED` — checked after type resolution. Short-circuit: if denied, no further validation is performed.
+3. `EMPTY_PAYLOAD` — checked before parsing. Short-circuit: if empty, no further validation is performed. (Applies to
    Create/Update only; Delete payloads are always empty by definition.)
-3. `PAYLOAD_VALIDATION_FAILURE` — proto3 structural parse/validation. Short-circuit: if the payload cannot be parsed,
+4. `PAYLOAD_VALIDATION_FAILURE` — proto3 structural parse/validation. Short-circuit: if the payload cannot be parsed,
    field-level validations (referential integrity, index derivation) cannot proceed.
-4. `NAN_IN_INDEXED_FIELD`, `NON_MINIMAL_VARINT` — index derivation checks. These run for all indexed fields and all
+5. `NAN_IN_INDEXED_FIELD`, `NON_MINIMAL_VARINT` — index derivation checks. These run for all indexed fields and all
    violations are collected.
-5. `REFERENCE_TARGET_NOT_FOUND`, `REFERENCE_TARGET_TOMBSTONED`, `REFERENCE_TARGET_WRONG_TYPE`,
+6. `REFERENCE_TARGET_NOT_FOUND`, `REFERENCE_TARGET_TOMBSTONED`, `REFERENCE_TARGET_WRONG_TYPE`,
    `REFERENCE_DUPLICATE_VALUE` — referential integrity checks on Create/Update. All reference fields are validated and
    all violations are collected.
-6. `REFERENCE_DELETE_RESTRICTED` — referential integrity check on Delete. All RESTRICT references are checked and all
+7. `REFERENCE_DELETE_RESTRICTED` — referential integrity check on Delete. All RESTRICT references are checked and all
    violations are collected.
 
 Phases 4 and 5 run independently and their violations are collected together. Within each phase, all applicable checks
@@ -1180,16 +1191,17 @@ message ArtifactWriteError {
 message ArtifactWriteViolation {
   enum Category {
     CATEGORY_UNSPECIFIED = 0;
-    MUTATION_DENIED = 1;
-    PAYLOAD_VALIDATION_FAILURE = 2;
-    EMPTY_PAYLOAD = 3;
-    NAN_IN_INDEXED_FIELD = 4;
-    NON_MINIMAL_VARINT = 5;
-    REFERENCE_TARGET_NOT_FOUND = 6;
-    REFERENCE_TARGET_TOMBSTONED = 7;
-    REFERENCE_TARGET_WRONG_TYPE = 8;
-    REFERENCE_DUPLICATE_VALUE = 9;
-    REFERENCE_DELETE_RESTRICTED = 10;
+    INVALID_VERSION_ID = 1;
+    MUTATION_DENIED = 2;
+    PAYLOAD_VALIDATION_FAILURE = 3;
+    EMPTY_PAYLOAD = 4;
+    NAN_IN_INDEXED_FIELD = 5;
+    NON_MINIMAL_VARINT = 6;
+    REFERENCE_TARGET_NOT_FOUND = 7;
+    REFERENCE_TARGET_TOMBSTONED = 8;
+    REFERENCE_TARGET_WRONG_TYPE = 9;
+    REFERENCE_DUPLICATE_VALUE = 10;
+    REFERENCE_DELETE_RESTRICTED = 11;
   }
   Category category = 1;
   string description = 2;
