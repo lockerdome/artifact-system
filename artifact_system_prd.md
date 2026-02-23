@@ -1358,6 +1358,7 @@ message ArtifactWriteViolation {
 #### Index fetch API
 
 This service handles index lookups. Execution semantics and response shape are defined in Index fetch behavior (MVP).
+Index schema introspection (GetIndexSchema) is in the TypeRegistryService.
 
 ```proto
 service IndexService {
@@ -1416,16 +1417,21 @@ message FetchIndexError {
 
 #### Type registry API
 
-The registry supports registering and querying type versions. All registry operations create or modify TypeDefinition,
-TypeVersionDefinition, IndexDefinition, and ReferenceDefinition artifacts via the standard artifact storage path, but
-enforce additional validation rules that the generic CRUD API does not.
+The registry supports registering and querying type versions and index schemas. Registry operations that mutate state
+create or modify TypeDefinition, TypeVersionDefinition, IndexDefinition, and ReferenceDefinition artifacts via the
+standard artifact storage path, but enforce additional validation rules that the generic CRUD API does not. Read
+operations (GetTypeVersion, ListTypeVersions, GetIndexSchema) provide metadata introspection for callers that need
+schema information to interact with the ArtifactService and IndexService.
 
 ```proto
 service TypeRegistryService {
   rpc RegisterTypeVersion(RegisterTypeVersionRequest) returns (RegisterTypeVersionResponse);
   rpc GetTypeVersion(GetTypeVersionRequest) returns (GetTypeVersionResponse);
   rpc ListTypeVersions(ListTypeVersionsRequest) returns (ListTypeVersionsResponse);
+  rpc GetIndexSchema(GetIndexSchemaRequest) returns (GetIndexSchemaResponse);
 }
+
+// --- Type version messages ---
 
 message RegisterTypeVersionRequest {
   string type_name = 1;              // fully-qualified proto message name
@@ -1459,7 +1465,41 @@ message ListTypeVersionsRequest {
 message ListTypeVersionsResponse {
   repeated uint64 version_ids = 1;   // in creation order (ascending artifact_id)
 }
+
+// --- Index schema messages ---
+
+message GetIndexSchemaRequest {
+  string key_type = 1;               // identifies which index definition to query
+}
+
+message GetIndexSchemaResponse {
+  // The IndexDefinition artifact for this key_type.
+  uint64 index_definition_id = 1;       // IndexDefinition artifact_id
+  string key_type = 2;
+  repeated string key_fields = 3;
+  repeated OrderDefinition order_fields = 4;
+  bool unique = 5;
+
+  // Generated proto schema for this index's key, value, and full index messages.
+  // Contains the IndexKey_*, IndexValue_*, and Index_* message definitions.
+  // Callers use this to serialize keys for FetchIndex and deserialize responses.
+  google.protobuf.FileDescriptorSet index_descriptor_set = 6;
+
+  // Fully-qualified message names for convenience (resolvable within index_descriptor_set).
+  string key_message_name = 7;    // e.g., "IndexKey_DataFrameArtifact_by_repo_created_by"
+  string value_message_name = 8;  // e.g., "IndexValue_DataFrameArtifact_by_repo_created_by"
+  string index_message_name = 9;  // e.g., "Index_DataFrameArtifact_by_repo_created_by"
+}
 ```
+
+**GetIndexSchema** resolves the `key_type` via the `index_key_type_unique` index, reads the IndexDefinition artifact,
+and returns the index metadata along with the generated `FileDescriptorSet` containing the `IndexKey_*`,
+`IndexValue_*`, and `Index_*` message definitions. Callers use this schema to construct serialized keys for
+`FetchIndex` requests and to deserialize `FetchIndexResponse` payloads. The response is suitable for caching — index
+schemas do not change once registered (modifications require a new index, which is post-launch).
+
+If `key_type` does not resolve to a registered IndexDefinition, return gRPC status `NOT_FOUND` with a
+`FetchIndexError` detail message (category `INDEX_NOT_FOUND`).
 
 **RegisterTypeVersion** compiles the .proto source into a FileDescriptorSet (injecting system protos as well-known
 imports), locates the message identified by type_name in the descriptor set, and validates the schema. It then:
