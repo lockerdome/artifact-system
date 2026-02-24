@@ -18,25 +18,18 @@ namespace id_allocator {
 ///   - counter < (1 << bucket_size_bits)
 ///   - bucket_index fits in the remaining bits
 ///   - The resulting ID is within [0, 2^53) for JS safe integer compatibility.
-[[nodiscard]] constexpr uint64_t compose_id(
-    uint32_t bucket_index,
-    uint32_t bucket_size_bits,
-    uint64_t counter) {
-    return (static_cast<uint64_t>(bucket_index) << bucket_size_bits) + counter;
+[[nodiscard]] constexpr uint64_t compose_id(uint32_t bucket_index, uint32_t bucket_size_bits, uint64_t counter) {
+  return (static_cast<uint64_t>(bucket_index) << bucket_size_bits) + counter;
 }
 
 /// Extract the bucket index from an ID.
-[[nodiscard]] constexpr uint32_t extract_bucket_index(
-    uint64_t id,
-    uint32_t bucket_size_bits) {
-    return static_cast<uint32_t>(id >> bucket_size_bits);
+[[nodiscard]] constexpr uint32_t extract_bucket_index(uint64_t id, uint32_t bucket_size_bits) {
+  return static_cast<uint32_t>(id >> bucket_size_bits);
 }
 
 /// Extract the sequential counter from an ID.
-[[nodiscard]] constexpr uint64_t extract_counter(
-    uint64_t id,
-    uint32_t bucket_size_bits) {
-    return id & ((uint64_t{1} << bucket_size_bits) - 1);
+[[nodiscard]] constexpr uint64_t extract_counter(uint64_t id, uint32_t bucket_size_bits) {
+  return id & ((uint64_t{1} << bucket_size_bits) - 1);
 }
 
-}  // namespace id_allocator
+} // namespace id_allocator
