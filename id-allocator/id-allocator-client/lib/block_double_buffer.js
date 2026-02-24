@@ -12,8 +12,8 @@ const { Block } = require('./block');
  * - When the front block is exhausted, front and back are swapped.
  * - If both blocks are exhausted, allocate_id throws.
  *
- * The fetch_block callback is provided by the caller (IdAllocatorClient) and
- * returns a Promise resolving to { range_start, range_end }.
+ * The fetch_block callback is provided by the caller and returns a Promise
+ * resolving to { range_start, range_end }.
  */
 class BlockDoubleBuffer {
   /**
