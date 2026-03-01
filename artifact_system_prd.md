@@ -573,7 +573,9 @@ operations while allowing callers to opt into explicit transactions for multi-wr
    to the canonical branch. The transaction's reads see the canonical branch state as of when the transaction was created,
    plus the transaction's own writes.
 1. Read-after-commit: once an Artifact Layer transaction commit succeeds, subsequent reads against the canonical branch
-   (or new snapshots/transactions) reflect the committed writes.
+   (or new snapshots/transactions) reflect the committed writes. The snapshot_id returned in CommitTransactionResponse
+   (and in implicit transaction write responses) provides a ready-made read pointer for this purpose; callers do not
+   need to create a separate snapshot to read-after-commit.
 1. Multi-key and cross-artifact atomic writes are supported within a single transaction. All writes in a transaction are
    merged atomically on Artifact Layer transaction commit.
 1. Concurrent writes within the same transaction: the sub-branch-per-write pattern serializes concurrent writes through
@@ -1052,8 +1054,9 @@ message CommitTransactionRequest {
 }
 
 message CommitTransactionResponse {
-  // Empty on success. Conflict details are returned via gRPC error status
+  // Conflict details are returned via gRPC error status
   // with a CommitConflict detail message (see Conflict retry policy).
+  uint64 snapshot_id = 1;      // snapshot of the canonical branch state after the merge (see Snapshot ID on write responses)
 }
 
 message RollbackTransactionRequest {
@@ -1142,6 +1145,7 @@ message CreateArtifactRequest {
 
 message CreateArtifactResponse {
   uint64 artifact_id = 1;      // allocated by the ID service
+  uint64 snapshot_id = 2;      // snapshot of the state after the write (see Snapshot ID on write responses)
 }
 
 message GetArtifactRequest {
@@ -1180,14 +1184,18 @@ message UpdateArtifactRequest {
   optional uint64 transaction_id = 4; // omit for implicit transaction
 }
 
-message UpdateArtifactResponse {}
+message UpdateArtifactResponse {
+  uint64 snapshot_id = 1;      // snapshot of the state after the write (see Snapshot ID on write responses)
+}
 
 message DeleteArtifactRequest {
   uint64 artifact_id = 1;
   optional uint64 transaction_id = 2; // omit for implicit transaction
 }
 
-message DeleteArtifactResponse {}
+message DeleteArtifactResponse {
+  uint64 snapshot_id = 1;      // snapshot of the state after the write (see Snapshot ID on write responses)
+}
 ```
 
 **Request/response semantics:**
@@ -1210,6 +1218,26 @@ message DeleteArtifactResponse {}
 1. Delete and tombstone behavior is defined in Delete semantics and retention.
 1. Conflicts are surfaced at Artifact Layer transaction commit time (CommitTransaction), not on individual write calls.
    For implicit transactions, the conflict response is returned from the write call itself.
+
+##### Snapshot ID on write responses
+
+All write responses (CreateArtifactResponse, UpdateArtifactResponse, DeleteArtifactResponse) and CommitTransactionResponse
+return a `snapshot_id` that callers can use for subsequent consistent reads.
+
+1. **Implicit transactions**: the snapshot_id points to the Storage Layer commit on the canonical branch that resulted
+   from the implicit transaction's merge. Callers can pass this snapshot_id to read operations (GetArtifact,
+   BatchGetArtifacts, FetchIndex) to get a consistent view that includes the write they just performed.
+1. **Explicit transactions**: the snapshot_id points to the Storage Layer commit on the transaction's ephemeral branch
+   head after the write. This reflects the transaction's own writes (including the one that just completed) but not
+   concurrent commits to the canonical branch. Callers can use this snapshot_id for reads that are guaranteed to see
+   the write, without needing to issue reads against the transaction_id directly.
+1. **CommitTransaction**: the snapshot_id points to the Storage Layer commit on the canonical branch after the
+   transaction's ephemeral branch has been merged. This is the post-merge state and includes both the transaction's
+   writes and any writes that were already on the canonical branch.
+1. The snapshot_id is a lightweight, immutable read pointer (identical in semantics to snapshots created via
+   CreateSnapshot). It does not require explicit cleanup or lifecycle management.
+1. The snapshot_id is always set on successful responses. On error (gRPC non-OK status), the snapshot_id is not
+   meaningful and should be ignored.
 
 Conflict/error behavior: conflict types, response payloads, and auto-resolution eligibility are defined in the Conflict
 retry policy (MVP). The conflict response uses conflict_type values INDEX_CONFLICT, PAYLOAD_CONFLICT, and
