@@ -270,13 +270,14 @@ straightforward to add new implementations if needed in the future.
 
 ### Behavior
 
-The client library provides a single function to application code:
+The client library provides a single method to application code:
 
 ```
-allocate_id(partition_id) -> uint64
+allocate_id() -> uint64
 ```
 
-Internally, the client maintains a **double buffer of blocks per partition**:
+Each client instance is bound to a single partition (specified at construction time).
+Internally, the client maintains a **double buffer of blocks**:
 
 - **Front block**: The active block from which IDs are allocated.
 - **Back block**: A prefetched block ready to swap in when the front is exhausted.
@@ -300,7 +301,11 @@ service are masked from application code in the common case.
 |----------------------|----------|------------------------------------------------------|
 | `service_address`    | string   | gRPC endpoint of the ID Allocator Service.           |
 | `partition_id`       | string   | Which partition to allocate from.                    |
-| `high_water_mark`    | uint32   | Remaining IDs in front block that triggers prefetch. |
+| `high_water_mark`    | uint32   | Remaining IDs in front block that triggers prefetch. Default `1000`. |
+| `retry.max_retries`  | uint32   | Maximum number of retry attempts for gRPC calls. Default `5`. |
+| `retry.base_delay_ms`| uint32   | Initial backoff delay in milliseconds. Default `100`. |
+| `retry.max_delay_ms` | uint32   | Maximum backoff delay in milliseconds. Default `10000`. |
+| `channel_credentials`| object   | gRPC channel credentials. Defaults to insecure.      |
 
 ### Node.js Client
 
@@ -315,8 +320,9 @@ const client = new IdAllocatorClient({
   high_water_mark: 1000,
 });
 
-await client.initialize();     // fetches the first block
-const id = client.allocate_id(); // synchronous, from local buffer
+await client.initialize();        // connects and fetches the first block
+const id = client.allocate_id();  // synchronous, from local buffer
+client.close();                   // tears down the gRPC channel
 ```
 
 `allocate_id()` is synchronous — it reads from the local buffer. The asynchronous gRPC calls
