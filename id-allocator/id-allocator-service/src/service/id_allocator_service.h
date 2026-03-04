@@ -9,15 +9,12 @@ namespace id_allocator {
 
 class IdAllocatorServiceImpl final : public IdAllocator::Service {
 public:
-    explicit IdAllocatorServiceImpl(PartitionManager& partition_manager);
+  explicit IdAllocatorServiceImpl(PartitionManager& partition_manager);
 
-    grpc::Status AllocateBlock(
-        grpc::ServerContext* context,
-        const AllocateBlockRequest* request,
-        AllocateBlockResponse* response) override;
+  grpc::Status AllocateBlock(grpc::ServerContext* context, const AllocateBlockRequest* request, AllocateBlockResponse* response) override;
 
 private:
-    PartitionManager& partition_manager_;
+  PartitionManager& partition_manager_;
 };
 
-}  // namespace id_allocator
+} // namespace id_allocator
