@@ -19,6 +19,15 @@ cmake --build --preset debug
 ctest --preset debug
 ```
 
+## Dockerized workflow
+
+Use the same C++ toolchain container flow as `id-allocator-service`:
+
+```bash
+make toolchain
+make test PRESET=debug
+```
+
 ## Example
 
 ```cpp
