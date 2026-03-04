@@ -1,0 +1,35 @@
+name: ID Allocator C++ Client Tests
+on:
+  pull_request:
+    paths:
+      - 'id-allocator/id-allocator-client-cpp/**'
+      - 'id-allocator/proto/**'
+      - 'id-allocator/id-allocator-service/cmake/dependencies.cmake'
+      - '.github/workflows/id_allocator_client_cpp_tests.yml'
+
+jobs:
+  run-tests:
+    runs-on: ubuntu-24.04
+    env:
+      CC: gcc-14
+      CXX: g++-14
+    defaults:
+      run:
+        working-directory: id-allocator/id-allocator-client-cpp
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build build-essential pkg-config libssl-dev gcc-14 g++-14
+      - name: Cache build dependencies
+        uses: actions/cache@v4
+        with:
+          path: id-allocator/id-allocator-client-cpp/build/release/_deps
+          key: ${{ runner.os }}-id-allocator-client-cpp-${{ hashFiles('id-allocator/id-allocator-client-cpp/CMakeLists.txt', 'id-allocator/id-allocator-client-cpp/cmake/dependencies.cmake', 'id-allocator/id-allocator-service/cmake/dependencies.cmake', 'id-allocator/id-allocator-client-cpp/CMakePresets.json') }}
+          restore-keys: |
+            ${{ runner.os }}-id-allocator-client-cpp-
+      - name: Configure
+        run: cmake --preset release
+      - name: Build
+        run: cmake --build --preset release
+      - name: Test
+        run: ctest --preset release
