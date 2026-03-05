@@ -1,8 +1,8 @@
 #!/bin/bash
-set -e  # Exit immediately if a command exits with a non-zero status
+set -eux
 
 cleanup() {
-    rm -f lakefs-signer.json build-script.sh runtime-startup.sh batch-request.json admin-creds.json
+    rm -f lakefs-signer.json build-script.sh runtime-startup.sh batch-request.json
     echo ">>> Cleanup complete."
 }
 trap cleanup EXIT
@@ -21,9 +21,6 @@ export DB_INSTANCE_NAME="lakefs-db"
 export LB_PREFIX="lakefs-lb"
 export ACCESS_KEY_ID="e4f3c46f902cce3b13da679b"
 
-# Set the project context
-gcloud config set project "$PROJECT_ID"
-
 echo ">>> Starting Part 1: Foundation setup for Project: $PROJECT_ID in $REGION"
 
 # 1. Enable APIs
@@ -34,14 +31,17 @@ gcloud services enable \
     servicenetworking.googleapis.com \
     secretmanager.googleapis.com \
     dataproc.googleapis.com \
-    iap.googleapis.com
+    iap.googleapis.com \
+    cloudscheduler.googleapis.com \
+    --project="$PROJECT_ID"
 
 # 2. Create VPC and Subnet
 if ! gcloud compute networks describe "$VPC_NAME" --project="$PROJECT_ID" &>/dev/null; then
     echo ">>> Creating VPC: $VPC_NAME..."
     gcloud compute networks create "$VPC_NAME" \
         --subnet-mode=custom \
-        --bgp-routing-mode=regional
+        --bgp-routing-mode=regional \
+        --project="$PROJECT_ID"
 else
     echo ">>> VPC $VPC_NAME already exists."
 fi
@@ -50,7 +50,8 @@ if ! gcloud compute routers describe lakefs-router --region="$REGION" --project=
     echo ">>> Creating Cloud Router..."
     gcloud compute routers create lakefs-router \
         --network="$VPC_NAME" \
-        --region="$REGION"
+        --region="$REGION" \
+        --project="$PROJECT_ID"
 else
     echo ">>> Cloud Router lakefs-router already exists."
 fi
@@ -61,7 +62,8 @@ if ! gcloud compute routers nats describe lakefs-nat --region="$REGION" --router
         --router=lakefs-router \
         --region="$REGION" \
         --auto-allocate-nat-external-ips \
-        --nat-all-subnet-ip-ranges
+        --nat-all-subnet-ip-ranges \
+        --project="$PROJECT_ID"
 else
     echo ">>> Cloud NAT lakefs-nat already exists."
 fi
@@ -72,7 +74,8 @@ if ! gcloud compute networks subnets describe "$SUBNET_NAME" --region="$REGION" 
         --network="$VPC_NAME" \
         --region="$REGION" \
         --range="$SUBNET_RANGE" \
-        --enable-private-ip-google-access
+        --enable-private-ip-google-access \
+        --project="$PROJECT_ID"
 else
     echo ">>> Subnet $SUBNET_NAME already exists."
 fi
@@ -85,7 +88,8 @@ if ! gcloud compute addresses describe google-managed-services-"$VPC_NAME" --glo
         --purpose=VPC_PEERING \
         --addresses="${PSA_RANGE%/*}" \
         --prefix-length="${PSA_RANGE#*/}" \
-        --network="$VPC_NAME"
+        --network="$VPC_NAME" \
+        --project="$PROJECT_ID"
 else
     echo ">>> PSA Address Range already allocated."
 fi
@@ -126,7 +130,7 @@ fi
 # 5. Create Database and User
 if ! gcloud sql databases describe lakefs --instance="$DB_INSTANCE_NAME" --project="$PROJECT_ID" &>/dev/null; then
     echo ">>> Creating Database 'lakefs'..."
-    gcloud sql databases create lakefs --instance="$DB_INSTANCE_NAME"
+    gcloud sql databases create lakefs --instance="$DB_INSTANCE_NAME" --project="$PROJECT_ID"
 else
     echo ">>> Database 'lakefs' already exists."
 fi
@@ -137,7 +141,8 @@ if [[ -z "$USER_EXISTS" ]]; then
     echo ">>> Creating Database User 'lakefs'..."
     gcloud sql users create lakefs \
         --instance="$DB_INSTANCE_NAME" \
-        --password="temporary-password-to-be-changed"
+        --password="temporary-password-to-be-changed" \
+        --project="$PROJECT_ID"
 else
     echo ">>> Database User 'lakefs' already exists."
 fi
@@ -154,7 +159,7 @@ export SA_SIGNER_EMAIL="${SA_SIGNER_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 echo ">>> Starting Part 2: Identity & Secrets setup..."
 
 # 1. Create the GCS Bucket
-if ! gcloud storage buckets describe "gs://${BUCKET_NAME}" &>/dev/null; then
+if ! gcloud storage buckets describe "gs://${BUCKET_NAME}" --project="$PROJECT_ID" &>/dev/null; then
     echo ">>> Creating Bucket gs://${BUCKET_NAME}..."
     gcloud storage buckets create "gs://${BUCKET_NAME}" \
         --project="$PROJECT_ID" \
@@ -187,24 +192,25 @@ echo ">>> Waiting 20s for Service Account propagation..."
 sleep 20
 
 # 3. Handle Signer Key
-echo ">>> Updating Signer Key (Rotating)..."
-# We allow this to run every time to ensure we have a valid key in the secret
-gcloud iam service-accounts keys create lakefs-signer.json \
-    --iam-account="$SA_SIGNER_EMAIL" \
-    --project="$PROJECT_ID"
-
 if ! gcloud secrets describe lakefs-signer-key --project="$PROJECT_ID" &>/dev/null; then
+    echo ">>> Creating Signer Key..."
+    gcloud iam service-accounts keys create lakefs-signer.json \
+        --iam-account="$SA_SIGNER_EMAIL" \
+        --project="$PROJECT_ID"
+
     echo ">>> Creating Secret: lakefs-signer-key..."
     gcloud secrets create lakefs-signer-key \
         --replication-policy="automatic" \
         --project="$PROJECT_ID"
-fi
 
-echo ">>> Uploading new key version..."
-gcloud secrets versions add lakefs-signer-key \
-    --data-file="lakefs-signer.json" \
-    --project="$PROJECT_ID"
-rm lakefs-signer.json
+    echo ">>> Uploading key version..."
+    gcloud secrets versions add lakefs-signer-key \
+        --data-file="lakefs-signer.json" \
+        --project="$PROJECT_ID"
+    rm lakefs-signer.json
+else
+    echo ">>> Secret lakefs-signer-key already exists. Reusing existing key."
+fi
 
 # 4. Handle DB Password
 # We check if password secret exists. If it does, we assume it's set to avoid resetting DB password causing downtime.
@@ -245,15 +251,18 @@ echo ">>> Ensuring IAM Roles..."
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
     --member="serviceAccount:${SA_VM_EMAIL}" \
     --role="roles/secretmanager.secretAccessor" \
-    --condition=None >/dev/null
+    --condition=None \
+    --project="$PROJECT_ID" >/dev/null
 
 gcloud storage buckets add-iam-policy-binding "gs://${BUCKET_NAME}" \
     --member="serviceAccount:${SA_VM_EMAIL}" \
-    --role="roles/storage.objectAdmin" >/dev/null
+    --role="roles/storage.objectAdmin" \
+    --project="$PROJECT_ID" >/dev/null
 
 gcloud storage buckets add-iam-policy-binding "gs://${BUCKET_NAME}" \
     --member="serviceAccount:${SA_SIGNER_EMAIL}" \
-    --role="roles/storage.objectAdmin" >/dev/null
+    --role="roles/storage.objectAdmin" \
+    --project="$PROJECT_ID" >/dev/null
 
 # 6. Create authorization key
 if ! gcloud secrets describe lakefs-secret-key --project="$PROJECT_ID" &>/dev/null; then
@@ -306,7 +315,7 @@ else
     # CLEANUP STALE BUILDER IF EXISTS
     if gcloud compute instances describe "$BUILDER_VM_NAME" --zone="$ZONE" --project="$PROJECT_ID" &>/dev/null; then
         echo ">>> Found stale Builder VM. Deleting..."
-        gcloud compute instances delete "$BUILDER_VM_NAME" --zone="$ZONE" --quiet
+        gcloud compute instances delete "$BUILDER_VM_NAME" --zone="$ZONE" --project="$PROJECT_ID" --quiet
     fi
 
     # 2. Define Build Script
@@ -314,7 +323,12 @@ else
 #!/bin/bash
 set -e
 echo ">>> [BUILD] Starting installation..."
-apt-get update && apt-get install -y curl
+apt-get update
+apt-get install -y curl ca-certificates gnupg apt-transport-https
+curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" > /etc/apt/sources.list.d/google-cloud-sdk.list
+apt-get update
+apt-get install -y google-cloud-cli
 echo ">>> [BUILD] Downloading LakeFS v${LAKEFS_VERSION}..."
 curl -L --fail https://github.com/treeverse/lakefs/releases/download/v${LAKEFS_VERSION}/lakefs_${LAKEFS_VERSION}_Linux_x86_64.tar.gz -o lakefs.tar.gz
 tar -xzf lakefs.tar.gz
@@ -377,7 +391,7 @@ EOF
             fi
 
             # Fetch serial output; ignore errors if API is busy
-            output=$(gcloud compute instances get-serial-port-output "$BUILDER_VM_NAME" --zone="$ZONE" 2>/dev/null)
+            output=$(gcloud compute instances get-serial-port-output "$BUILDER_VM_NAME" --zone="$ZONE" --project="$PROJECT_ID" 2>/dev/null)
 
             if echo "$output" | grep -q "BUILD_COMPLETE"; then
                 echo ">>> Build signal received!"
@@ -390,7 +404,7 @@ EOF
         echo ""
 
     echo ">>> Stopping Builder VM..."
-    gcloud compute instances stop "$BUILDER_VM_NAME" --zone="$ZONE"
+    gcloud compute instances stop "$BUILDER_VM_NAME" --zone="$ZONE" --project="$PROJECT_ID"
 
     echo ">>> Creating Custom Image: $IMAGE_NAME..."
     gcloud compute images create "$IMAGE_NAME" \
@@ -400,7 +414,7 @@ EOF
         --family="lakefs-server"
 
     echo ">>> Deleting Builder VM..."
-    gcloud compute instances delete "$BUILDER_VM_NAME" --zone="$ZONE" --quiet
+    gcloud compute instances delete "$BUILDER_VM_NAME" --zone="$ZONE" --project="$PROJECT_ID" --quiet
     rm build-script.sh
 fi
 
@@ -549,7 +563,8 @@ if ! gcloud compute health-checks describe lakefs-health-check --region="$REGION
         --check-interval=5s \
         --timeout=5s \
         --unhealthy-threshold=2 \
-        --healthy-threshold=2
+        --healthy-threshold=2 \
+        --project="$PROJECT_ID"
 else
     echo ">>> Health check already exists."
 fi
@@ -592,13 +607,15 @@ fi
 echo ">>> Configuring Autohealing and Named Ports..."
 gcloud compute instance-groups managed set-named-ports "$MIG_NAME" \
     --named-ports="http:8000" \
-    --region="$REGION"
+    --region="$REGION" \
+    --project="$PROJECT_ID"
 
 echo ">>> Updating Autohealing Policy..."
 gcloud beta compute instance-groups managed update "$MIG_NAME" \
     --region="$REGION" \
     --health-check="https://www.googleapis.com/compute/v1/projects/${PROJECT_ID}/regions/${REGION}/healthChecks/lakefs-health-check" \
-    --initial-delay=300
+    --initial-delay=300 \
+    --project="$PROJECT_ID"
 
 rm runtime-startup.sh
 echo ">>> Part 3B Complete."
@@ -612,7 +629,8 @@ if ! gcloud compute networks subnets describe "${PROXY_SUBNET_NAME}" --region="$
         --role=ACTIVE \
         --region="$REGION" \
         --network="$VPC_NAME" \
-        --range="$LB_RANGE"
+        --range="$LB_RANGE" \
+        --project="$PROJECT_ID"
 else
     echo ">>> Proxy subnet already exists."
 fi
@@ -632,7 +650,7 @@ else
 fi
 
 # Add Backend
-BACKENDS=$(gcloud compute backend-services describe "${LB_PREFIX}-backend" --region="$REGION" --format="value(backends)" || true)
+BACKENDS=$(gcloud compute backend-services describe "${LB_PREFIX}-backend" --region="$REGION" --project="$PROJECT_ID" --format="value(backends)" || true)
 if [[ -z "$BACKENDS" ]]; then
     gcloud compute backend-services add-backend "${LB_PREFIX}-backend" \
         --instance-group="$MIG_NAME" \
@@ -671,7 +689,7 @@ if ! gcloud compute firewall-rules describe allow-proxy-to-mig --project="$PROJE
         --project="$PROJECT_ID"
 fi
 
-# 5. NEW: Enable IAP SSH Access
+# 5. Enable IAP SSH Access
 if ! gcloud compute firewall-rules describe allow-ssh-ingress-from-iap --project="$PROJECT_ID" &>/dev/null; then
     echo ">>> Creating Firewall Rule for IAP SSH..."
     gcloud compute firewall-rules create allow-ssh-ingress-from-iap \
@@ -697,7 +715,7 @@ if ! gcloud compute forwarding-rules describe "${LB_PREFIX}-forwarding-rule" --r
         --project="$PROJECT_ID"
 fi
 
-LB_IP_ADDRESS=$(gcloud compute forwarding-rules describe "${LB_PREFIX}-forwarding-rule" --region="$REGION" --format="value(IPAddress)")
+LB_IP_ADDRESS=$(gcloud compute forwarding-rules describe "${LB_PREFIX}-forwarding-rule" --region="$REGION" --project="$PROJECT_ID" --format="value(IPAddress)")
 echo ">>> Internal LB Created at: $LB_IP_ADDRESS"
 
 echo ">>> Part 4 Complete."
@@ -724,10 +742,25 @@ echo ">>> Waiting 20s for IAM propagation..."
 sleep 20
 
 # IAM Roles
-gcloud storage buckets add-iam-policy-binding "gs://${BUCKET_NAME}" --member="serviceAccount:${GC_SA_EMAIL}" --role="roles/storage.objectAdmin" >/dev/null
-gcloud projects add-iam-policy-binding "$PROJECT_ID" --member="serviceAccount:${GC_SA_EMAIL}" --role="roles/dataproc.worker" --condition=None >/dev/null
-gcloud projects add-iam-policy-binding "$PROJECT_ID" --member="serviceAccount:${SCHEDULER_SA_EMAIL}" --role="roles/dataproc.editor" --condition=None >/dev/null
-gcloud iam service-accounts add-iam-policy-binding "$GC_SA_EMAIL" --member="serviceAccount:${SCHEDULER_SA_EMAIL}" --role="roles/iam.serviceAccountUser" >/dev/null
+gcloud storage buckets add-iam-policy-binding "gs://${BUCKET_NAME}" --member="serviceAccount:${GC_SA_EMAIL}" --role="roles/storage.objectAdmin" --project="$PROJECT_ID" >/dev/null
+gcloud projects add-iam-policy-binding "$PROJECT_ID" --member="serviceAccount:${GC_SA_EMAIL}" --role="roles/dataproc.worker" --condition=None --project="$PROJECT_ID" >/dev/null
+gcloud projects add-iam-policy-binding "$PROJECT_ID" --member="serviceAccount:${SCHEDULER_SA_EMAIL}" --role="roles/dataproc.editor" --condition=None --project="$PROJECT_ID" >/dev/null
+gcloud iam service-accounts add-iam-policy-binding "$GC_SA_EMAIL" --member="serviceAccount:${SCHEDULER_SA_EMAIL}" --role="roles/iam.serviceAccountUser" --project="$PROJECT_ID" >/dev/null
+
+echo ">>> Ensuring Dataproc service agent subnet access..."
+PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)" --project="$PROJECT_ID")
+DATAPROC_SA="service-${PROJECT_NUMBER}@dataproc-accounts.iam.gserviceaccount.com"
+DATAPROC_SA_ALT="service-${PROJECT_NUMBER}@gcp-sa-dataproc.iam.gserviceaccount.com"
+
+for DP_SA in "$DATAPROC_SA" "$DATAPROC_SA_ALT"; do
+    if gcloud iam service-accounts describe "$DP_SA" --project="$PROJECT_ID" &>/dev/null; then
+        gcloud compute networks subnets add-iam-policy-binding "$SUBNET_NAME" \
+            --region="$REGION" \
+            --member="serviceAccount:${DP_SA}" \
+            --role="roles/compute.networkUser" \
+            --project="$PROJECT_ID" >/dev/null
+    fi
+done
 
 # --- AUTOMATED SMOKE TEST & SETUP ---
 echo ">>> Starting Automated Setup & Verification..."
@@ -738,18 +771,32 @@ gcloud compute instance-groups managed wait-until --stable "$MIG_NAME" --region=
 
 # 1. Fetch the full URL of a random instance
 INSTANCE_URL=$(gcloud compute instance-groups managed list-instances "$MIG_NAME" \
-    --region="$REGION" --project="$PROJECT_ID" --format="value(instance)" | head -n1)
+    --region="$REGION" --project="$PROJECT_ID" --limit=1 --format="value(instance)")
 
-# 2. Extract the Instance Name (the part after the last slash)
+if [[ -z "$INSTANCE_URL" ]]; then
+    echo "ERROR: No instances found in MIG $MIG_NAME."
+    exit 1
+fi
+
+# 2. Extract the Instance Name and Zone from the URL
 INSTANCE_NAME=${INSTANCE_URL##*/}
+INSTANCE_ZONE=${INSTANCE_URL#*zones/}
+INSTANCE_ZONE=${INSTANCE_ZONE%%/*}
+
+if [[ -z "$INSTANCE_ZONE" ]]; then
+    echo "ERROR: Failed to determine instance zone from $INSTANCE_URL"
+    exit 1
+fi
 
 echo ">>> Admin Access Key: $ACCESS_KEY_ID"
+echo ">>> Fetch secret access key with:"
+echo "    gcloud secrets versions access latest --secret=lakefs-secret-access-key --project=$PROJECT_ID"
 
 # 2. Create Example Repository (Idempotent)
 echo ">>> Ensuring 'example-repo' exists..."
 # We SSH again to run the curl command using the newly acquired credentials
 # Note: Basic Auth uses AccessKey:SecretKey
-gcloud compute ssh "$INSTANCE_NAME" --zone="${REGION}-a" --tunnel-through-iap --quiet \
+gcloud compute ssh "$INSTANCE_NAME" --zone="$INSTANCE_ZONE" --tunnel-through-iap --project="$PROJECT_ID" --quiet \
     --command "curl -s -X POST http://localhost:8000/api/v1/repositories \
     -u \"$ACCESS_KEY_ID:$SECRET_ACCESS_KEY\" \
     -H 'Content-Type: application/json' \
@@ -808,6 +855,6 @@ echo "----------------------------------------------------"
 echo ">>> COMPLETE. LakeFS Infrastructure is deployed & configured."
 echo "----------------------------------------------------"
 echo ">>> Connect to your instance via IAP Tunnel:"
-echo "    gcloud compute ssh $INSTANCE_NAME --zone=${REGION}-a --tunnel-through-iap -- -L 8080:${LB_IP_ADDRESS}:80"
+echo "    gcloud compute ssh $INSTANCE_NAME --zone=${INSTANCE_ZONE} --tunnel-through-iap -- -L 8080:${LB_IP_ADDRESS}:80"
 echo ">>> Then visit: http://localhost:8080"
 echo "----------------------------------------------------"
