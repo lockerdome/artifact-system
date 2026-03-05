@@ -2,7 +2,7 @@
 set -eux
 
 cleanup() {
-    rm -f lakefs-signer.json build-script.sh runtime-startup.sh batch-request.json admin-creds.json
+    rm -f lakefs-signer.json build-script.sh runtime-startup.sh batch-request.json
     echo ">>> Cleanup complete."
 }
 trap cleanup EXIT
@@ -707,7 +707,7 @@ if ! gcloud compute forwarding-rules describe "${LB_PREFIX}-forwarding-rule" --r
     gcloud compute forwarding-rules create "${LB_PREFIX}-forwarding-rule" \
         --load-balancing-scheme=INTERNAL_MANAGED \
         --network="$VPC_NAME" \
-        --subnet="$PROXY_SUBNET_NAME" \
+        --subnet="$SUBNET_NAME" \
         --ports=80 \
         --target-http-proxy="${LB_PREFIX}-http-proxy" \
         --target-http-proxy-region="$REGION" \
