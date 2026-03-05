@@ -88,6 +88,44 @@ wait_for_sql_instance_deletion() {
     return 1
 }
 
+peering_exists() {
+    local PEERING
+    PEERING=$(gcloud compute networks peerings list \
+        --network="$VPC_NAME" \
+        --project="$PROJECT_ID" \
+        --format="value(name)" 2>/dev/null | grep "servicenetworking-googleapis-com" || true)
+    [[ -n "$PEERING" ]]
+}
+
+delete_vpc_peering() {
+    if ! peering_exists; then
+        echo ">>> VPC Peering already deleted."
+        return 0
+    fi
+
+    echo ">>> Removing VPC Peering to Service Networking..."
+    local MAX_RETRIES=20
+    local COUNT=0
+
+    while [ $COUNT -lt $MAX_RETRIES ]; do
+        if gcloud services vpc-peerings delete \
+            --service=servicenetworking.googleapis.com \
+            --network="$VPC_NAME" \
+            --project="$PROJECT_ID" --quiet; then
+            echo "    Peering deleted successfully."
+            break
+        fi
+        echo "    Peering deletion failed (likely dependent resources). Retrying in 15s... ($COUNT/$MAX_RETRIES)"
+        sleep 15
+        COUNT=$((COUNT+1))
+    done
+
+    if peering_exists; then
+        echo "ERROR: VPC peering still exists after retries."
+        return 1
+    fi
+}
+
 echo ">>> Starting Teardown..."
 
 # 1. Delete Cloud Scheduler
@@ -141,22 +179,7 @@ delete_resource "gcloud iam service-accounts" "${SCHEDULER_SA_NAME}@${PROJECT_ID
 # 11. Delete Networking
 delete_resource "gcloud compute routers nats" "lakefs-nat" "--router=lakefs-router --region=$REGION"
 delete_resource "gcloud compute routers" "lakefs-router" "--region=$REGION"
-
-echo ">>> Removing VPC Peering to Service Networking..."
-MAX_RETRIES=20
-COUNT=0
-while [ $COUNT -lt $MAX_RETRIES ]; do
-    if gcloud services vpc-peerings delete \
-        --service=servicenetworking.googleapis.com \
-        --network="$VPC_NAME" \
-        --project="$PROJECT_ID" --quiet; then
-        echo "    Peering deleted successfully."
-        break
-    fi
-    echo "    Peering deletion failed (likely dependent resources). Retrying in 15s... ($COUNT/$MAX_RETRIES)"
-    sleep 15
-    COUNT=$((COUNT+1))
-done
+delete_vpc_peering
 
 delete_resource "gcloud compute addresses" "google-managed-services-$VPC_NAME" "--global"
 
