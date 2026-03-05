@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package artifact_system;
+
+import "artifact_system.proto";
+
+// Placeholder for gRPC service definitions.
+// P1 will add: ArtifactService, IndexService, SnapshotTransactionService,
+// TypeRegistryService, and all request/response/error messages.
+
+// Minimal service so the proto compiles with gRPC stubs.
+service ArtifactService {
+  rpc Ping(PingRequest) returns (PingResponse);
+}
+
+message PingRequest {}
+message PingResponse {}
