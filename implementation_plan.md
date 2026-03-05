@@ -22,7 +22,7 @@ otherwise noted.
 | Phase | Description | Status |
 |-------|-------------|--------|
 | P0 | Project Scaffolding & Build Infrastructure | :white_check_mark: Complete |
-| P1 | Proto Definitions (System + API) | :white_large_square: Not started |
+| P1 | Proto Definitions (System + API) | :white_check_mark: Complete |
 | P2a | Storage Layer Abstraction & In-Memory Implementation | :white_large_square: Not started |
 | P2b | LakeFS Storage Layer Integration | :white_large_square: Not started |
 | P3 | Path Encoding & Index Key Encoding | :white_large_square: Not started |
@@ -84,7 +84,9 @@ otherwise noted.
    - The dependency provides `IdAllocatorClient` for allocating artifact IDs
 
 5. **`src/id/id_allocator_interface.h`** — abstract ID allocator interface + mock:
-   - `IdAllocatorInterface` with a single `virtual StatusOr<uint64_t> AllocateId() = 0`
+   - `IdAllocatorInterface` with a single `virtual uint64_t AllocateId() = 0`
+   - Throws `std::runtime_error` on failure — ID exhaustion is treated as a catastrophic
+     error (the gRPC service layer translates exceptions to `UNAVAILABLE` status)
    - `MockIdAllocator` — returns sequential IDs starting from a configurable base
     - This is trivial scaffolding but must exist early so that P6 (CRUD) and P8 (genesis)
       can compile and test without the real ID service. The production wrapper around
@@ -149,13 +151,13 @@ otherwise noted.
    target.
 
 ### Checklist
-- [ ] `proto/artifact_options.proto` — custom option extensions
-- [ ] `proto/artifact_types.proto` — built-in type messages with index options
-- [ ] `proto/artifact_service.proto` — all 4 gRPC services + all request/response/error messages
-- [ ] `proto/artifact_internal.proto` — StoredArtifact envelope
-- [ ] `artifact_layer_proto` CMake library target compiles
-- [ ] Generated C++ headers usable from test code
-- [ ] All fields, enums, services, and error messages match the PRD
+- [x] `proto/artifact_options.proto` — custom option extensions
+- [x] `proto/artifact_types.proto` — built-in type messages with index options
+- [x] `proto/artifact_service.proto` — all 4 gRPC services + all request/response/error messages
+- [x] `proto/artifact_internal.proto` — StoredArtifact envelope
+- [x] `artifact_layer_proto` CMake library target compiles
+- [x] Generated C++ headers usable from test code
+- [x] All fields, enums, services, and error messages match the PRD
 
 ---
 
@@ -420,6 +422,22 @@ descriptors) lives here because index serialization/deserialization depends on t
 - [ ] `tests/write_executor_test.cpp` — sub-branch isolation, concurrent writes
 - [ ] `tests/conflict_resolver_test.cpp` — retry success, exhaustion, non-retryable conflicts
 - [ ] Implicit transaction support working
+- [ ] TSan preset passing (see note below)
+
+### TSan note
+
+The TSan (ThreadSanitizer) preset does not currently work under GCC with gRPC v1.78.0.
+TSan-instrumented protoc crashes at startup ("unexpected memory mapping"), and building
+all dependencies with TSan triggers abseil constexpr failures. P5 is the first phase that
+introduces real concurrency (conflict retry, concurrent writes), making TSan coverage
+important. Before starting P5, either:
+
+1. Switch the toolchain to Clang (fixes both TSan and the abseil constexpr issue), or
+2. Upgrade gRPC/abseil to a version that compiles cleanly under GCC + TSan.
+
+The ASan+UBSan preset works (sanitizer flags are stripped from dependencies via
+`cmake/dependencies.cmake`). The same approach cannot work for TSan because TSan
+requires all linked code in a process to be instrumented.
 
 ---
 

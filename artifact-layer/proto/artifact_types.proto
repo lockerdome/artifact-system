@@ -1,0 +1,124 @@
+syntax = "proto3";
+
+package artifact_system;
+
+import "google/protobuf/descriptor.proto";
+import "artifact_options.proto";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// artifact_types.proto
+//
+// Built-in artifact type messages for the artifact system.  These messages
+// define the payload schemas for the core meta-types that the system uses to
+// track type registrations, type versions, and referential integrity rules.
+//
+// NOTE: IndexDefinition (the built-in artifact type) is NOT defined here.
+// It is defined in artifact_options.proto where it serves a dual purpose:
+// it is both the custom option message (used in `option (indexes) = { … }`)
+// AND the artifact payload message for IndexDefinition artifacts.  Its
+// self-referential index annotations live on that message in
+// artifact_options.proto.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// TypeDefinition represents a logical artifact type registered in the system.
+// Each artifact type that exists has a corresponding TypeDefinition artifact
+// that records its name, the current schema version, and access-control flags.
+message TypeDefinition {
+  option (indexes) = {
+    key_type: "type_name_unique"
+    key: ["type_name"]
+    order: { field: "artifact_id" direction: ASCENDING }
+    unique: true
+  };
+  option (indexes) = {
+    key_type: "all_types"
+    key: []
+    order: { field: "artifact_id" direction: ASCENDING }
+  };
+
+  // The unique name of this artifact type (e.g. "TypeDefinition", "User").
+  string type_name = 1;
+
+  // Artifact ID of the TypeVersionDefinition that represents the current
+  // schema version.  Absent when no version has been published yet.
+  optional uint64 current_version_id = 2;
+
+  // When true, creation of new artifacts of this type is denied.
+  bool deny_create = 3;
+
+  // When true, updates to existing artifacts of this type are denied.
+  bool deny_update = 4;
+
+  // When true, deletion of artifacts of this type is denied.
+  bool deny_delete = 5;
+}
+
+// TypeVersionDefinition represents a specific schema version of an artifact
+// type.  Each version carries the full protobuf FileDescriptorSet so that the
+// system can deserialize artifacts written against any historical schema.
+message TypeVersionDefinition {
+  option (indexes) = {
+    key_type: "type_versions_by_type"
+    key: ["type_id"]
+    order: { field: "artifact_id" direction: ASCENDING }
+  };
+
+  // Artifact ID of the parent TypeDefinition this version belongs to.
+  uint64 type_id = 1 [(references) = {
+    target_type_name: "TypeDefinition"
+    on_delete: RESTRICT
+  }];
+
+  // The compiled protobuf descriptor set for this version's schema.
+  google.protobuf.FileDescriptorSet descriptor_set = 2;
+
+  // The original .proto source text for this version.
+  string proto_source = 3;
+
+  // Artifact ID of the preceding version, if any.
+  optional uint64 previous_version_id = 4;
+
+  // Artifact ID of the succeeding version, if any.
+  optional uint64 next_version_id = 5;
+}
+
+// ReferenceDefinition represents a referential integrity declaration stored as
+// an artifact.  Each foreign-key relationship registered in the system has a
+// corresponding ReferenceDefinition artifact that records the relationship
+// metadata so that the runtime can enforce integrity on mutations.
+message ReferenceDefinition {
+  option (indexes) = {
+    key_type: "reference_key_type_unique"
+    key: ["key_type"]
+    order: { field: "artifact_id" direction: ASCENDING }
+    unique: true
+  };
+  option (indexes) = {
+    key_type: "references_by_target_type"
+    key: ["target_type_name"]
+    order: { field: "artifact_id" direction: ASCENDING }
+  };
+  option (indexes) = {
+    key_type: "all_reference_definitions"
+    key: []
+    order: { field: "artifact_id" direction: ASCENDING }
+  };
+
+  // Unique key identifying this reference relationship.
+  string key_type = 1;
+
+  // The name of the artifact type being referenced (the target).
+  string target_type_name = 2;
+
+  // The name of the artifact type that holds the reference (the source).
+  string referencing_type_name = 3;
+
+  // The field path on the referencing type that contains the foreign key.
+  string field_name = 4;
+
+  // The key_type of the covering index used to look up referencing artifacts.
+  string covering_index_key_type = 5;
+
+  // The referential integrity action to take when the target is deleted.
+  ReferenceOption.OnDelete on_delete = 6;
+}

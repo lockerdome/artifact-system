@@ -11,50 +11,83 @@ find_package(Threads REQUIRED)
 # ── Dependencies (gRPC, protobuf, googletest) ─────────────────────────────
 include(cmake/dependencies.cmake)
 
-# ── Proto: artifact_system.proto ──────────────────────────────────────────
+# ── Proto compilation ─────────────────────────────────────────────────────
 set(PROTO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/proto")
+set(PROTO_OUT "${CMAKE_CURRENT_BINARY_DIR}")
 
-set(AS_SYSTEM_PROTO "${PROTO_DIR}/artifact_system.proto")
-set(AS_SYSTEM_PROTO_SRCS "${CMAKE_CURRENT_BINARY_DIR}/artifact_system.pb.cc")
-set(AS_SYSTEM_PROTO_HDRS "${CMAKE_CURRENT_BINARY_DIR}/artifact_system.pb.h")
+# Well-known protobuf imports (google/protobuf/descriptor.proto, etc.)
+set(_PROTOBUF_IMPORT_DIR "${protobuf_SOURCE_DIR}/src")
 
-add_custom_command(
-  OUTPUT "${AS_SYSTEM_PROTO_SRCS}" "${AS_SYSTEM_PROTO_HDRS}"
-  COMMAND ${_PROTOBUF_PROTOC}
-    --cpp_out "${CMAKE_CURRENT_BINARY_DIR}"
-    -I "${PROTO_DIR}"
-    "${AS_SYSTEM_PROTO}"
-  DEPENDS "${AS_SYSTEM_PROTO}"
-  COMMENT "Generating C++ stubs from artifact_system.proto"
-)
+# Helper: generate C++ stubs from a .proto file (no gRPC).
+# Usage: proto_generate(<base_name> <depends...>)
+function(proto_generate BASE_NAME)
+  set(PROTO_FILE "${PROTO_DIR}/${BASE_NAME}.proto")
+  set(SRCS "${PROTO_OUT}/${BASE_NAME}.pb.cc")
+  set(HDRS "${PROTO_OUT}/${BASE_NAME}.pb.h")
+  add_custom_command(
+    OUTPUT "${SRCS}" "${HDRS}"
+    COMMAND ${_PROTOBUF_PROTOC}
+      --cpp_out "${PROTO_OUT}"
+      -I "${PROTO_DIR}"
+      -I "${_PROTOBUF_IMPORT_DIR}"
+      "${PROTO_FILE}"
+    DEPENDS "${PROTO_FILE}" ${ARGN} protoc
+    COMMENT "Generating C++ stubs from ${BASE_NAME}.proto"
+  )
+  set(${BASE_NAME}_PROTO_SRCS "${SRCS}" PARENT_SCOPE)
+  set(${BASE_NAME}_PROTO_HDRS "${HDRS}" PARENT_SCOPE)
+endfunction()
 
-# ── Proto: artifact_service.proto ─────────────────────────────────────────
-set(AS_SERVICE_PROTO "${PROTO_DIR}/artifact_service.proto")
-set(AS_SERVICE_PROTO_SRCS "${CMAKE_CURRENT_BINARY_DIR}/artifact_service.pb.cc")
-set(AS_SERVICE_PROTO_HDRS "${CMAKE_CURRENT_BINARY_DIR}/artifact_service.pb.h")
-set(AS_SERVICE_GRPC_SRCS  "${CMAKE_CURRENT_BINARY_DIR}/artifact_service.grpc.pb.cc")
-set(AS_SERVICE_GRPC_HDRS  "${CMAKE_CURRENT_BINARY_DIR}/artifact_service.grpc.pb.h")
+# Helper: generate C++ + gRPC stubs from a .proto file.
+function(proto_generate_grpc BASE_NAME)
+  set(PROTO_FILE "${PROTO_DIR}/${BASE_NAME}.proto")
+  set(PB_SRCS "${PROTO_OUT}/${BASE_NAME}.pb.cc")
+  set(PB_HDRS "${PROTO_OUT}/${BASE_NAME}.pb.h")
+  set(GRPC_SRCS "${PROTO_OUT}/${BASE_NAME}.grpc.pb.cc")
+  set(GRPC_HDRS "${PROTO_OUT}/${BASE_NAME}.grpc.pb.h")
+  add_custom_command(
+    OUTPUT "${PB_SRCS}" "${PB_HDRS}" "${GRPC_SRCS}" "${GRPC_HDRS}"
+    COMMAND ${_PROTOBUF_PROTOC}
+      --grpc_out "${PROTO_OUT}"
+      --cpp_out  "${PROTO_OUT}"
+      -I "${PROTO_DIR}"
+      -I "${_PROTOBUF_IMPORT_DIR}"
+      --plugin=protoc-gen-grpc="${_GRPC_CPP_PLUGIN}"
+      "${PROTO_FILE}"
+    DEPENDS "${PROTO_FILE}" ${ARGN} protoc grpc_cpp_plugin
+    COMMENT "Generating C++ + gRPC stubs from ${BASE_NAME}.proto"
+  )
+  set(${BASE_NAME}_PROTO_SRCS "${PB_SRCS}" PARENT_SCOPE)
+  set(${BASE_NAME}_PROTO_HDRS "${PB_HDRS}" PARENT_SCOPE)
+  set(${BASE_NAME}_GRPC_SRCS  "${GRPC_SRCS}" PARENT_SCOPE)
+  set(${BASE_NAME}_GRPC_HDRS  "${GRPC_HDRS}" PARENT_SCOPE)
+endfunction()
 
-add_custom_command(
-  OUTPUT "${AS_SERVICE_PROTO_SRCS}" "${AS_SERVICE_PROTO_HDRS}"
-         "${AS_SERVICE_GRPC_SRCS}" "${AS_SERVICE_GRPC_HDRS}"
-  COMMAND ${_PROTOBUF_PROTOC}
-    --grpc_out "${CMAKE_CURRENT_BINARY_DIR}"
-    --cpp_out  "${CMAKE_CURRENT_BINARY_DIR}"
-    -I "${PROTO_DIR}"
-    --plugin=protoc-gen-grpc="${_GRPC_CPP_PLUGIN}"
-    "${AS_SERVICE_PROTO}"
-  DEPENDS "${AS_SERVICE_PROTO}" "${AS_SYSTEM_PROTO}"
-  COMMENT "Generating C++ + gRPC stubs from artifact_service.proto"
-)
+# Proto dependency chain:
+#   artifact_options.proto  (imports google/protobuf/descriptor.proto)
+#   artifact_types.proto    (imports artifact_options.proto, google/protobuf/descriptor.proto)
+#   artifact_service.proto  (imports artifact_options.proto, google/protobuf/descriptor.proto)
+#   artifact_internal.proto (no local imports)
+
+set(OPTIONS_PROTO "${PROTO_DIR}/artifact_options.proto")
+set(TYPES_PROTO   "${PROTO_DIR}/artifact_types.proto")
+set(SERVICE_PROTO "${PROTO_DIR}/artifact_service.proto")
+set(INTERNAL_PROTO "${PROTO_DIR}/artifact_internal.proto")
+
+proto_generate(artifact_options)
+proto_generate(artifact_types   "${OPTIONS_PROTO}")
+proto_generate(artifact_internal)
+proto_generate_grpc(artifact_service "${OPTIONS_PROTO}")
 
 # ── Library: artifact_layer_proto ─────────────────────────────────────────
 add_library(artifact_layer_proto
-  ${AS_SYSTEM_PROTO_SRCS}
-  ${AS_SERVICE_PROTO_SRCS}
-  ${AS_SERVICE_GRPC_SRCS}
+  ${artifact_options_PROTO_SRCS}
+  ${artifact_types_PROTO_SRCS}
+  ${artifact_internal_PROTO_SRCS}
+  ${artifact_service_PROTO_SRCS}
+  ${artifact_service_GRPC_SRCS}
 )
-target_include_directories(artifact_layer_proto PUBLIC "${CMAKE_CURRENT_BINARY_DIR}")
+target_include_directories(artifact_layer_proto PUBLIC "${PROTO_OUT}")
 target_link_libraries(artifact_layer_proto PUBLIC ${_GRPC_GRPCPP} ${_PROTOBUF_LIBPROTOBUF})
 
 # ── Library: artifact_layer_lib (core logic) ──────────────────────────────
