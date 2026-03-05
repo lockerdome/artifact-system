@@ -60,6 +60,34 @@ remove_binding() {
         --quiet || echo "    (Binding already removed)"
 }
 
+wait_for_sql_instance_deletion() {
+    local MAX_RETRIES=40
+    local COUNT=0
+
+    echo ">>> Waiting for Cloud SQL instance '$DB_INSTANCE_NAME' to be fully deleted..."
+    while [ $COUNT -lt $MAX_RETRIES ]; do
+        local OUTPUT
+        if OUTPUT=$(gcloud sql instances describe "$DB_INSTANCE_NAME" --project="$PROJECT_ID" 2>&1); then
+            echo "    Cloud SQL still present. Retrying in 15s... ($COUNT/$MAX_RETRIES)"
+            sleep 15
+            COUNT=$((COUNT+1))
+            continue
+        fi
+
+        if grep -qiE "(was not found|not found|NOT_FOUND)" <<<"$OUTPUT"; then
+            echo "    Cloud SQL instance is fully deleted."
+            return 0
+        fi
+
+        echo "$OUTPUT"
+        echo "ERROR: Failed while checking SQL deletion status."
+        return 1
+    done
+
+    echo "ERROR: Timed out waiting for SQL instance deletion."
+    return 1
+}
+
 echo ">>> Starting Teardown..."
 
 # 1. Delete Cloud Scheduler
@@ -91,9 +119,7 @@ echo ">>> Deleting GCS Bucket: gs://${BUCKET_NAME}..."
 gcloud storage rm -r "gs://${BUCKET_NAME}" --project="$PROJECT_ID" --quiet || echo "    (Bucket already gone)"
 
 delete_resource "gcloud sql instances" "$DB_INSTANCE_NAME" ""
-
-echo ">>> Waiting 30s for SQL backend cleanup to release VPC resources..."
-sleep 30
+wait_for_sql_instance_deletion
 
 # 8. Delete Secrets
 delete_resource "gcloud secrets" "lakefs-signer-key" ""
