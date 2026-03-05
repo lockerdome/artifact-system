@@ -1,0 +1,125 @@
+syntax = "proto3";
+
+package artifact_system;
+
+import "google/protobuf/descriptor.proto";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// artifact_options.proto
+//
+// Custom protobuf option extensions for the artifact system.  These options
+// are applied to artifact type message definitions (MessageOptions) and their
+// fields (FieldOptions) so that tooling can derive storage indexes, referential
+// integrity rules, and documentation from the proto schema alone.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// OrderDefinition describes a single ordering term used within an index.
+message OrderDefinition {
+  // Direction in which the field should be ordered.
+  enum OrderBy {
+    ORDER_BY_UNSPECIFIED = 0;
+    ASCENDING            = 1;
+    DESCENDING           = 2;
+  }
+
+  // The field path to order by.
+  string field = 1;
+
+  // The sort direction for this field.
+  OrderBy direction = 2;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IndexDefinition – serves dual purpose:
+//
+// 1. As the *option* message attached to artifact type messages via
+//    `option (indexes) = { ... }`.
+// 2. As the *artifact payload* for IndexDefinition artifacts stored in the
+//    system.  IndexDefinition artifacts are first-class artifacts with their
+//    own artifact_id used as the key_prefix in index storage paths.
+//
+// The self-referential index annotations below bootstrap the system's ability
+// to look up index definitions by key_type and to enumerate all registered
+// index definitions.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// IndexDefinition declares a secondary index on an artifact type.
+message IndexDefinition {
+  // Self-referential indexes: IndexDefinition is itself an indexed artifact type.
+  option (indexes) = {
+    key_type: "index_key_type_unique"
+    key: ["key_type"]
+    order: { field: "artifact_id" direction: ASCENDING }
+    unique: true
+  };
+  option (indexes) = {
+    key_type: "all_index_definitions"
+    key: []
+    order: { field: "artifact_id" direction: ASCENDING }
+  };
+
+  // Globally unique identifier for this index (e.g. "by_owner",
+  // "type_name_unique").
+  string key_type = 1;
+
+  // Ordered list of field paths that form the composite key.
+  repeated string key = 2;
+
+  // Order fields that determine the sort order within each index entry set.
+  // Each order field must declare a direction.  The special field name
+  // "artifact_id" refers to the artifact's ID, not a payload field.
+  repeated OrderDefinition order = 3;
+
+  // Field 4 reserved for post-MVP WhereClause (filtered / partial indexes).
+  reserved 4;
+
+  // When true the index enforces at most one artifact ID per index key.
+  bool unique = 5;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ReferenceOption – field-level option that declares a foreign-key reference.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ReferenceOption annotates a field as a reference (foreign key) to another
+// artifact type, along with the desired referential-integrity behaviour on
+// deletion of the referenced artifact.
+message ReferenceOption {
+  // Behaviour when the referenced artifact is deleted.
+  enum OnDelete {
+    ON_DELETE_UNSPECIFIED = 0;
+    RESTRICT             = 1;
+    CASCADE              = 2;
+    SET_NULL             = 3;
+  }
+
+  // Fully-qualified (or package-relative) name of the target artifact type.
+  string target_type_name = 1;
+
+  // Action to take when the referenced artifact is deleted.
+  OnDelete on_delete = 2;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Custom option extensions
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Message-level options applied to artifact type definitions.
+extend google.protobuf.MessageOptions {
+  // Declares secondary indexes for the artifact type.
+  repeated IndexDefinition indexes = 50002;
+
+  // Human-readable description of the artifact type (for LLM and documentation).
+  // Named message_description to avoid collision with the field-level extension.
+  optional string message_description = 50004;
+}
+
+// Field-level options applied to individual fields within artifact types.
+extend google.protobuf.FieldOptions {
+  // Marks the field as a foreign-key reference to another artifact type.
+  optional ReferenceOption references = 50003;
+
+  // Human-readable description of the field (for LLM and documentation).
+  // Named field_description to avoid collision with the message-level extension.
+  optional string field_description = 50005;
+}

@@ -2,16 +2,374 @@ syntax = "proto3";
 
 package artifact_system;
 
-import "artifact_system.proto";
+import "google/protobuf/descriptor.proto";
+import "artifact_options.proto";
 
-// Placeholder for gRPC service definitions.
-// P1 will add: ArtifactService, IndexService, SnapshotTransactionService,
-// TypeRegistryService, and all request/response/error messages.
+// ─────────────────────────────────────────────────────────────────────────────
+// artifact_service.proto
+//
+// gRPC service definitions for the Artifact Layer.  Four services expose the
+// public API: snapshot/transaction lifecycle, artifact CRUD, index lookups,
+// and type registry operations.
+// ─────────────────────────────────────────────────────────────────────────────
 
-// Minimal service so the proto compiles with gRPC stubs.
-service ArtifactService {
-  rpc Ping(PingRequest) returns (PingResponse);
+// ═══════════════════════════════════════════════════════════════════════════════
+// Shared types
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ReadContext scopes reads and writes to a snapshot or transaction.
+// At most one field may be set.  If neither is set, reads use the canonical
+// branch head and writes are wrapped in an implicit transaction.
+message ReadContext {
+  oneof context {
+    uint64 snapshot_id = 1;
+    uint64 transaction_id = 2;
+  }
 }
 
-message PingRequest {}
-message PingResponse {}
+// ═══════════════════════════════════════════════════════════════════════════════
+// SnapshotTransactionService
+// ═══════════════════════════════════════════════════════════════════════════════
+
+service SnapshotTransactionService {
+  rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
+  rpc CreateTransaction(CreateTransactionRequest) returns (CreateTransactionResponse);
+  rpc CommitTransaction(CommitTransactionRequest) returns (CommitTransactionResponse);
+  rpc RollbackTransaction(RollbackTransactionRequest) returns (RollbackTransactionResponse);
+}
+
+message CreateSnapshotRequest {
+  // Transaction ID to snapshot; omit to snapshot the canonical branch head.
+  optional uint64 parent_id = 1;
+}
+
+message CreateSnapshotResponse {
+  uint64 snapshot_id = 1;
+}
+
+message CreateTransactionRequest {
+  // Snapshot ID or transaction ID to fork from; omit to fork from canonical
+  // branch head.
+  optional uint64 parent_id = 1;
+}
+
+message CreateTransactionResponse {
+  uint64 transaction_id = 1;
+}
+
+message CommitTransactionRequest {
+  uint64 transaction_id = 1;
+}
+
+message CommitTransactionResponse {
+  // Snapshot of the canonical branch state after the merge.
+  uint64 snapshot_id = 1;
+}
+
+message RollbackTransactionRequest {
+  uint64 transaction_id = 1;
+}
+
+message RollbackTransactionResponse {}
+
+// Error detail for snapshot/transaction operations.
+message SnapshotTransactionError {
+  enum Category {
+    CATEGORY_UNSPECIFIED = 0;
+    PARENT_NOT_FOUND = 1;
+    TRANSACTION_NOT_FOUND = 2;
+    SNAPSHOT_NOT_FOUND = 3;
+  }
+  Category category = 1;
+  string description = 2;
+  string id = 3;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ArtifactService
+// ═══════════════════════════════════════════════════════════════════════════════
+
+service ArtifactService {
+  rpc CreateArtifact(CreateArtifactRequest) returns (CreateArtifactResponse);
+  rpc GetArtifact(GetArtifactRequest) returns (GetArtifactResponse);
+  rpc BatchGetArtifacts(BatchGetArtifactsRequest) returns (BatchGetArtifactsResponse);
+  rpc UpdateArtifact(UpdateArtifactRequest) returns (UpdateArtifactResponse);
+  rpc DeleteArtifact(DeleteArtifactRequest) returns (DeleteArtifactResponse);
+}
+
+// --- CRUD request/response messages ---
+
+message CreateArtifactRequest {
+  uint64 version_id = 1;            // TypeVersionDefinition artifact_id (required)
+  bytes payload = 2;                 // serialized protobuf message for the resolved type version
+  optional uint64 transaction_id = 3; // omit for implicit transaction
+}
+
+message CreateArtifactResponse {
+  uint64 artifact_id = 1;           // allocated by the ID service
+  uint64 snapshot_id = 2;           // snapshot of the state after the write
+}
+
+message GetArtifactRequest {
+  uint64 artifact_id = 1;
+  ReadContext context = 2;
+}
+
+message GetArtifactResponse {
+  uint64 artifact_id = 1;
+  string type_name = 2;             // fully-qualified proto message name
+  uint64 version_id = 3;            // TypeVersionDefinition artifact_id stored with the artifact
+  bytes payload = 4;                 // serialized protobuf message
+}
+
+message BatchGetArtifactsRequest {
+  repeated uint64 artifact_ids = 1;
+  ReadContext context = 2;
+}
+
+message BatchGetArtifactsResponse {
+  // Results are in the same order as the input artifact_ids.
+  repeated ArtifactResult results = 1;
+}
+
+message ArtifactResult {
+  oneof result {
+    GetArtifactResponse artifact = 1;
+    ArtifactNotFoundError not_found = 2;
+  }
+}
+
+message UpdateArtifactRequest {
+  uint64 artifact_id = 1;
+  uint64 version_id = 2;            // TypeVersionDefinition artifact_id (required)
+  bytes payload = 3;                 // serialized protobuf message for the resolved type version
+  optional uint64 transaction_id = 4; // omit for implicit transaction
+}
+
+message UpdateArtifactResponse {
+  uint64 snapshot_id = 1;           // snapshot of the state after the write
+}
+
+message DeleteArtifactRequest {
+  uint64 artifact_id = 1;
+  optional uint64 transaction_id = 2; // omit for implicit transaction
+}
+
+message DeleteArtifactResponse {
+  uint64 snapshot_id = 1;           // snapshot of the state after the write
+}
+
+// --- CRUD error messages ---
+
+// Returned as gRPC detail when an artifact is not found (gRPC status NOT_FOUND).
+message ArtifactNotFoundError {
+  uint64 artifact_id = 1;
+  // True if the artifact exists but is tombstoned (logically deleted); false
+  // if the artifact_id was never created or is not present at the read pointer.
+  bool tombstoned = 2;
+}
+
+// Returned as gRPC detail on write-time validation failures (gRPC status
+// INVALID_ARGUMENT).  Contains one or more violations so callers can diagnose
+// and fix all issues in a single pass.
+message ArtifactWriteError {
+  repeated ArtifactWriteViolation violations = 1;
+}
+
+message ArtifactWriteViolation {
+  enum Category {
+    CATEGORY_UNSPECIFIED = 0;
+    INVALID_VERSION_ID = 1;
+    MUTATION_DENIED = 2;
+    PAYLOAD_VALIDATION_FAILURE = 3;
+    EMPTY_PAYLOAD = 4;
+    NAN_IN_INDEXED_FIELD = 5;
+    NON_MINIMAL_VARINT = 6;
+    REFERENCE_TARGET_NOT_FOUND = 7;
+    REFERENCE_TARGET_TOMBSTONED = 8;
+    REFERENCE_TARGET_WRONG_TYPE = 9;
+    REFERENCE_DUPLICATE_VALUE = 10;
+    REFERENCE_DELETE_RESTRICTED = 11;
+  }
+  Category category = 1;
+  string description = 2;
+  string subject = 3;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Conflict response (returned on CommitTransaction and implicit transactions)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Returned as gRPC detail on transaction commit conflicts (gRPC status ABORTED).
+message CommitConflict {
+  enum ConflictType {
+    CONFLICT_TYPE_UNSPECIFIED = 0;
+    INDEX_CONFLICT = 1;
+    PAYLOAD_CONFLICT = 2;
+    REFERENTIAL_INTEGRITY_VIOLATION = 3;
+  }
+
+  ConflictType conflict_type = 1;
+  bool retryable = 2;               // false when retries exhausted or payload conflict
+  uint32 attempts = 3;              // number of merge attempts performed
+
+  // Exactly one detail message is populated, corresponding to conflict_type.
+  oneof detail {
+    PayloadConflictDetail payload_detail = 4;
+    IndexConflictDetail index_detail = 5;
+    ReferentialIntegrityConflictDetail referential_integrity_detail = 6;
+  }
+
+  // Storage Layer commit IDs when available (for debugging).
+  optional string base_commit_id = 7;
+  optional string ours_commit_id = 8;
+  optional string theirs_commit_id = 9;
+}
+
+message PayloadConflictDetail {
+  uint64 artifact_id = 1;
+}
+
+message IndexConflictDetail {
+  string key_type = 1;
+  bytes encoded_key = 2;
+}
+
+message ReferentialIntegrityConflictDetail {
+  uint64 target_artifact_id = 1;
+  string reference_key_type = 2;
+  repeated uint64 referencing_artifact_ids = 3;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// IndexService
+// ═══════════════════════════════════════════════════════════════════════════════
+
+service IndexService {
+  rpc FetchIndex(FetchIndexRequest) returns (FetchIndexResponse);
+}
+
+message FetchIndexRequest {
+  string key_type = 1;               // identifies which index definition to query
+  bytes key = 2;                     // serialized IndexKey_* message for the queried index;
+                                     // all key fields are required; partial keys are rejected
+  ReadContext context = 3;
+}
+
+message FetchIndexResponse {
+  // The concrete, generated index message for the queried index, serialized
+  // as bytes.  Empty or tombstoned indexes return a message with zero entries.
+  bytes index_payload = 1;
+  // Fully-qualified name of the index message for deserialization.
+  string index_message_name = 2;
+}
+
+// Error detail for FetchIndex operations.
+message FetchIndexError {
+  enum Category {
+    CATEGORY_UNSPECIFIED = 0;
+    INDEX_NOT_FOUND = 1;
+    INCOMPLETE_KEY = 2;
+    KEY_PARSE_FAILURE = 3;
+  }
+  Category category = 1;
+  string description = 2;
+  string key_type = 3;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TypeRegistryService
+// ═══════════════════════════════════════════════════════════════════════════════
+
+service TypeRegistryService {
+  rpc RegisterTypeVersion(RegisterTypeVersionRequest) returns (RegisterTypeVersionResponse);
+  rpc GetTypeVersion(GetTypeVersionRequest) returns (GetTypeVersionResponse);
+  rpc ListTypeVersions(ListTypeVersionsRequest) returns (ListTypeVersionsResponse);
+  rpc GetIndexSchema(GetIndexSchemaRequest) returns (GetIndexSchemaResponse);
+}
+
+// --- Type version messages ---
+
+message RegisterTypeVersionRequest {
+  string type_name = 1;              // fully-qualified proto message name
+  string proto_source = 2;           // .proto source text
+  optional bool deny_create = 3;     // tighten-only; omit to preserve existing value
+  optional bool deny_update = 4;     // tighten-only; omit to preserve existing value
+  optional bool deny_delete = 5;     // tighten-only; omit to preserve existing value
+}
+
+message RegisterTypeVersionResponse {
+  uint64 version_id = 1;             // artifact_id of the new TypeVersionDefinition
+}
+
+message GetTypeVersionRequest {
+  uint64 version_id = 1;             // TypeVersionDefinition artifact_id
+}
+
+message GetTypeVersionResponse {
+  uint64 version_id = 1;             // TypeVersionDefinition artifact_id
+  uint64 type_id = 2;                // parent TypeDefinition artifact_id
+  google.protobuf.FileDescriptorSet descriptor_set = 3;
+  string proto_source = 4;
+  optional uint64 previous_version_id = 5;
+  optional uint64 next_version_id = 6;
+}
+
+message ListTypeVersionsRequest {
+  string type_name = 1;              // fully-qualified proto message name
+}
+
+message ListTypeVersionsResponse {
+  repeated uint64 version_ids = 1;   // in creation order (ascending artifact_id)
+}
+
+// --- Index schema messages ---
+
+message GetIndexSchemaRequest {
+  string key_type = 1;               // identifies which index definition to query
+}
+
+message GetIndexSchemaResponse {
+  // The IndexDefinition artifact for this key_type.
+  uint64 index_definition_id = 1;    // IndexDefinition artifact_id
+  string key_type = 2;
+  repeated string key_fields = 3;
+  repeated OrderDefinition order_fields = 4;
+  bool unique = 5;
+
+  // Generated proto schema for this index's key, value, and full index
+  // messages.  Contains the IndexKey_*, IndexValue_*, and Index_* message
+  // definitions.  Callers use this to serialize keys for FetchIndex and
+  // deserialize responses.
+  google.protobuf.FileDescriptorSet index_descriptor_set = 6;
+
+  // Fully-qualified message names for convenience (resolvable within
+  // index_descriptor_set).
+  string key_message_name = 7;       // e.g. "IndexKey_DataFrameArtifact_by_repo_created_by"
+  string value_message_name = 8;     // e.g. "IndexValue_DataFrameArtifact_by_repo_created_by"
+  string index_message_name = 9;     // e.g. "Index_DataFrameArtifact_by_repo_created_by"
+}
+
+// --- Type registry error messages ---
+
+// Returned as gRPC detail on RegisterTypeVersion validation failures (gRPC
+// status INVALID_ARGUMENT).
+message RegisterTypeVersionError {
+  repeated TypeRegistrationViolation violations = 1;
+}
+
+message TypeRegistrationViolation {
+  enum Category {
+    CATEGORY_UNSPECIFIED = 0;
+    PROTO_COMPILATION_FAILURE = 1;
+    SCHEMA_INCOMPATIBILITY = 2;
+    INVALID_INDEX_DEFINITION = 3;
+    INDEX_INCOMPATIBILITY = 4;
+    INVALID_REFERENCE_DECLARATION = 5;
+    REFERENCE_INCOMPATIBILITY = 6;
+    TIGHTEN_ONLY_VIOLATION = 7;
+  }
+  Category category = 1;
+  string description = 2;
+  string subject = 3;
+}

@@ -12,3 +12,4 @@ function(add_artifact_layer_test test_name)
 endfunction()
 
 add_artifact_layer_test(placeholder_test)
+add_artifact_layer_test(proto_compilation_test)

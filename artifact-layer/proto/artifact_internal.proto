@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package artifact_system;
+
+// Internal storage format for artifacts — NOT part of the public API.
+//
+// This file defines the on-disk envelope that wraps every artifact stored
+// under the `artifacts/{id}` key space. It is an implementation detail of
+// the storage layer and must not be referenced by external consumers.
+
+// StoredArtifact is the on-disk envelope written at `artifacts/{id}`.
+//
+// Design notes:
+//   - `type_name` is denormalized here (it could be derived by reading
+//     TypeVersionDefinition -> TypeDefinition) so that GetArtifact can
+//     return the fully-qualified proto message name without cascading
+//     reads on every call.
+//   - An empty `payload` indicates a tombstone — the artifact has been
+//     logically deleted but the key is retained for consistency and
+//     replication ordering.
+//   - `envelope_version` allows future format migrations: readers should
+//     check this field and reject or upgrade envelopes they do not
+//     understand.
+message StoredArtifact {
+  // Version of the envelope format, for forward-compatibility.
+  uint32 envelope_version = 1;
+
+  // The artifact_id of the TypeVersionDefinition that describes the
+  // schema used to encode `payload`.
+  uint64 version_id = 2;
+
+  // Fully-qualified proto message name (e.g. "artifact_system.SomeType").
+  // Stored alongside version_id to avoid needing to read
+  // TypeVersionDefinition -> TypeDefinition on every GetArtifact.
+  string type_name = 3;
+
+  // Serialized protobuf message conforming to the schema identified by
+  // version_id / type_name.  Empty for tombstones (logically deleted
+  // artifacts).
+  bytes payload = 4;
+}

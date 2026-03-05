@@ -22,7 +22,7 @@ otherwise noted.
 | Phase | Description | Status |
 |-------|-------------|--------|
 | P0 | Project Scaffolding & Build Infrastructure | :white_check_mark: Complete |
-| P1 | Proto Definitions (System + API) | :white_large_square: Not started |
+| P1 | Proto Definitions (System + API) | :construction: In progress |
 | P2a | Storage Layer Abstraction & In-Memory Implementation | :white_large_square: Not started |
 | P2b | LakeFS Storage Layer Integration | :white_large_square: Not started |
 | P3 | Path Encoding & Index Key Encoding | :white_large_square: Not started |
