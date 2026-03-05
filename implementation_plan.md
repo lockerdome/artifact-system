@@ -422,6 +422,22 @@ descriptors) lives here because index serialization/deserialization depends on t
 - [ ] `tests/write_executor_test.cpp` — sub-branch isolation, concurrent writes
 - [ ] `tests/conflict_resolver_test.cpp` — retry success, exhaustion, non-retryable conflicts
 - [ ] Implicit transaction support working
+- [ ] TSan preset passing (see note below)
+
+### TSan note
+
+The TSan (ThreadSanitizer) preset does not currently work under GCC with gRPC v1.78.0.
+TSan-instrumented protoc crashes at startup ("unexpected memory mapping"), and building
+all dependencies with TSan triggers abseil constexpr failures. P5 is the first phase that
+introduces real concurrency (conflict retry, concurrent writes), making TSan coverage
+important. Before starting P5, either:
+
+1. Switch the toolchain to Clang (fixes both TSan and the abseil constexpr issue), or
+2. Upgrade gRPC/abseil to a version that compiles cleanly under GCC + TSan.
+
+The ASan+UBSan preset works (sanitizer flags are stripped from dependencies via
+`cmake/dependencies.cmake`). The same approach cannot work for TSan because TSan
+requires all linked code in a process to be instrumented.
 
 ---
 
