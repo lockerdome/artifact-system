@@ -76,7 +76,7 @@ delete_resource "gcloud compute instance-groups managed" "$MIG_NAME" "--region=$
 
 # 4. Delete Dependencies (Health Check & Template)
 delete_resource "gcloud compute health-checks" "lakefs-health-check" "--region=$REGION"
-delete_resource "gcloud compute instance-templates" "$TEMPLATE_NAME" "--region=$REGION"
+delete_resource "gcloud compute instance-templates" "$TEMPLATE_NAME" ""
 
 # 5. Delete Firewall Rules
 delete_resource "gcloud compute firewall-rules" "allow-proxy-to-mig" ""
