@@ -84,7 +84,9 @@ otherwise noted.
    - The dependency provides `IdAllocatorClient` for allocating artifact IDs
 
 5. **`src/id/id_allocator_interface.h`** — abstract ID allocator interface + mock:
-   - `IdAllocatorInterface` with a single `virtual StatusOr<uint64_t> AllocateId() = 0`
+   - `IdAllocatorInterface` with a single `virtual uint64_t AllocateId() = 0`
+   - Throws `std::runtime_error` on failure — ID exhaustion is treated as a catastrophic
+     error (the gRPC service layer translates exceptions to `UNAVAILABLE` status)
    - `MockIdAllocator` — returns sequential IDs starting from a configurable base
     - This is trivial scaffolding but must exist early so that P6 (CRUD) and P8 (genesis)
       can compile and test without the real ID service. The production wrapper around
