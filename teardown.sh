@@ -74,7 +74,7 @@ wait_for_sql_instance_deletion() {
             continue
         fi
 
-        if grep -qiE "(was not found|not found|NOT_FOUND)" <<<"$OUTPUT"; then
+        if grep -qiE "(was not found|not found|does not exist|NOT_FOUND|HTTPError 404)" <<<"$OUTPUT"; then
             echo "    Cloud SQL instance is fully deleted."
             return 0
         fi
