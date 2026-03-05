@@ -22,7 +22,7 @@ otherwise noted.
 | Phase | Description | Status |
 |-------|-------------|--------|
 | P0 | Project Scaffolding & Build Infrastructure | :white_check_mark: Complete |
-| P1 | Proto Definitions (System + API) | :construction: In progress |
+| P1 | Proto Definitions (System + API) | :white_check_mark: Complete |
 | P2a | Storage Layer Abstraction & In-Memory Implementation | :white_large_square: Not started |
 | P2b | LakeFS Storage Layer Integration | :white_large_square: Not started |
 | P3 | Path Encoding & Index Key Encoding | :white_large_square: Not started |
@@ -151,13 +151,13 @@ otherwise noted.
    target.
 
 ### Checklist
-- [ ] `proto/artifact_options.proto` — custom option extensions
-- [ ] `proto/artifact_types.proto` — built-in type messages with index options
-- [ ] `proto/artifact_service.proto` — all 4 gRPC services + all request/response/error messages
-- [ ] `proto/artifact_internal.proto` — StoredArtifact envelope
-- [ ] `artifact_layer_proto` CMake library target compiles
-- [ ] Generated C++ headers usable from test code
-- [ ] All fields, enums, services, and error messages match the PRD
+- [x] `proto/artifact_options.proto` — custom option extensions
+- [x] `proto/artifact_types.proto` — built-in type messages with index options
+- [x] `proto/artifact_service.proto` — all 4 gRPC services + all request/response/error messages
+- [x] `proto/artifact_internal.proto` — StoredArtifact envelope
+- [x] `artifact_layer_proto` CMake library target compiles
+- [x] Generated C++ headers usable from test code
+- [x] All fields, enums, services, and error messages match the PRD
 
 ---
 
