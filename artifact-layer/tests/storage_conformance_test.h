@@ -30,6 +30,9 @@ template <typename T> class StorageConformanceTest : public ::testing::Test {
 protected:
   void SetUp() override {
     storage_ = T::Create();
+    if (!storage_) {
+      GTEST_SKIP() << "Storage backend not available (factory returned nullptr)";
+    }
   }
 
   StorageInterface& Storage() {
