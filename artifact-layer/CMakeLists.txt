@@ -90,9 +90,13 @@ add_library(artifact_layer_proto
 target_include_directories(artifact_layer_proto PUBLIC "${PROTO_OUT}")
 target_link_libraries(artifact_layer_proto PUBLIC ${_GRPC_GRPCPP} ${_PROTOBUF_LIBPROTOBUF})
 
+# ── Find system libcurl (used by LakeFS storage client) ───────────────────
+find_package(CURL REQUIRED)
+
 # ── Library: artifact_layer_lib (core logic) ──────────────────────────────
 add_library(artifact_layer_lib
   src/storage/memory_storage.cpp
+  src/storage/lakefs_storage.cpp
 )
 target_include_directories(artifact_layer_lib PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(artifact_layer_lib
@@ -104,6 +108,8 @@ target_link_libraries(artifact_layer_lib
     absl::statusor
     absl::strings
     Threads::Threads
+    CURL::libcurl
+    nlohmann_json::nlohmann_json
 )
 
 # ── Executable ────────────────────────────────────────────────────────────

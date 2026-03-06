@@ -65,6 +65,19 @@ string(REGEX REPLACE "-fsanitize=[^ ]+" "" CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SH
 
 FetchContent_MakeAvailable(grpc)
 
+# ---------------------------------------------------------------------------
+# nlohmann/json (header-only JSON library for LakeFS REST API parsing)
+# ---------------------------------------------------------------------------
+FetchContent_Declare(
+  nlohmann_json
+  GIT_REPOSITORY https://github.com/nlohmann/json.git
+  GIT_TAG        v3.11.3
+  GIT_SHALLOW    TRUE
+)
+set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
+set(JSON_Install OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(nlohmann_json)
+
 # Convenience aliases used throughout the build.
 set(_PROTOBUF_PROTOC $<TARGET_FILE:protoc>)
 set(_GRPC_CPP_PLUGIN $<TARGET_FILE:grpc_cpp_plugin>)
