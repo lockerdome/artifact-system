@@ -1,38 +1,19 @@
-/// @file lakefs_storage_test.cpp
-/// @brief Conformance tests for LakeFSStorage against a real LakeFS instance.
-///
-/// This test requires a running LakeFS instance. Configure via environment
-/// variables:
-///
-///   LAKEFS_ENDPOINT       — LakeFS API endpoint (e.g., "http://localhost:8000")
-///   LAKEFS_ACCESS_KEY_ID  — LakeFS access key ID
-///   LAKEFS_SECRET_KEY     — LakeFS secret access key
-///   LAKEFS_REPOSITORY     — LakeFS repository name
-///
-/// If LAKEFS_ENDPOINT is not set, all tests are skipped (allows CI to pass
-/// without a LakeFS instance). The test creates a fresh repository for each
-/// test case to ensure isolation.
-///
-/// Mark as an integration test: CI skips by default, runs on demand.
-
-#include <cstdlib>
-#include <memory>
-#include <mutex>
-#include <random>
-#include <string>
-#include <vector>
+#include "storage/lakefs_storage.h"
+#include "storage_conformance_test.h"
 
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
 
-#include "gtest/gtest.h"
-
-#include "storage/lakefs_config.h"
-#include "storage/lakefs_storage.h"
-#include "storage_conformance_test.h"
+#include <chrono>
+#include <cstdlib>
+#include <memory>
+#include <mutex>
+#include <random>
+#include <sstream>
+#include <string>
+#include <vector>
 
 namespace artifact_system::testing {
-
 namespace {
 
 using json = nlohmann::json;
@@ -40,120 +21,132 @@ using json = nlohmann::json;
 struct RepoCleanupInfo {
   std::string endpoint;
   std::string access_key_id;
-  std::string secret_key;
+  std::string secret_access_key;
   std::string repo_name;
 };
 
 std::mutex g_cleanup_mutex;
 std::vector<RepoCleanupInfo> g_repos_to_cleanup;
 
+size_t WriteCallback(char* ptr, size_t size, size_t nmemb, void* userdata) {
+  auto* out = static_cast<std::string*>(userdata);
+  out->append(ptr, size * nmemb);
+  return size * nmemb;
+}
+
 bool EnsureCurlGlobalInit() {
   static std::once_flag init_once;
   static bool initialized = false;
+
   std::call_once(init_once, []() { initialized = (curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK); });
   return initialized;
 }
 
-/// Get an environment variable, returning empty string if not set.
-std::string GetEnv(const char* name) {
-  const char* value = std::getenv(name);
-  return value ? value : "";
+std::string GetEnvOrEmpty(const char* key) {
+  const char* value = std::getenv(key);
+  return value ? std::string(value) : std::string();
 }
 
-/// Check if LakeFS integration tests are enabled (LAKEFS_ENDPOINT is set).
-bool LakeFSEnabled() {
-  return !GetEnv("LAKEFS_ENDPOINT").empty();
+std::string GetEnvOrDefault(const char* key, const char* default_value) {
+  const char* value = std::getenv(key);
+  return value ? std::string(value) : std::string(default_value);
 }
 
-/// CURL write callback for setup/teardown HTTP requests.
-size_t WriteCallback(char* ptr, size_t size, size_t nmemb, void* userdata) {
-  auto* body = static_cast<std::string*>(userdata);
-  body->append(ptr, size * nmemb);
-  return size * nmemb;
+std::string TrimTrailingSlash(std::string value) {
+  while (!value.empty() && value.back() == '/') {
+    value.pop_back();
+  }
+  return value;
 }
 
-/// Generate a unique repository name for test isolation.
-std::string GenerateRepoName() {
-  static std::random_device rd;
-  static std::mt19937 gen(rd());
-  static std::uniform_int_distribution<int> dist(0, 999999);
-  return "test-repo-" + std::to_string(dist(gen));
-}
-
-/// Create a LakeFS repository for testing. Returns true on success.
-bool CreateRepository(const std::string& endpoint, const std::string& access_key_id, const std::string& secret_key, const std::string& repo_name) {
+bool DoRequest(const std::string& method, const std::string& url, const std::string& access_key_id, const std::string& secret_access_key,
+               const std::string& request_body, long* status_code, std::string* response_body) {
   if (!EnsureCurlGlobalInit()) {
     return false;
   }
 
   CURL* curl = curl_easy_init();
-  if (!curl)
+  if (!curl) {
     return false;
-
-  json body;
-  body["name"] = repo_name;
-  body["storage_namespace"] = "local://" + repo_name;
-  body["default_branch"] = "main";
-  std::string body_str = body.dump();
-
-  std::string url = endpoint + "/api/v1/repositories";
-  std::string response_body;
-  std::string userpwd = access_key_id + ":" + secret_key;
+  }
 
   curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-  curl_easy_setopt(curl, CURLOPT_POST, 1L);
-  curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body_str.c_str());
-  curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body_str.size()));
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, response_body);
+  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+
+  const std::string userpwd = access_key_id + ":" + secret_access_key;
   curl_easy_setopt(curl, CURLOPT_USERPWD, userpwd.c_str());
   curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
-  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_body);
 
   struct curl_slist* headers = nullptr;
-  headers = curl_slist_append(headers, "Content-Type: application/json");
   headers = curl_slist_append(headers, "Accept: application/json");
+
+  if (method == "POST") {
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, request_body.c_str());
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(request_body.size()));
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+  } else if (method == "DELETE") {
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
+  } else {
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method.c_str());
+  }
+
   curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
-  CURLcode res = curl_easy_perform(curl);
-  long status_code = 0;
-  if (res == CURLE_OK) {
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status_code);
+  const CURLcode result = curl_easy_perform(curl);
+  if (result != CURLE_OK) {
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    return false;
   }
 
+  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, status_code);
   curl_slist_free_all(headers);
   curl_easy_cleanup(curl);
-
-  return (res == CURLE_OK && status_code == 201);
+  return true;
 }
 
-/// Delete a LakeFS repository (cleanup after test).
-void DeleteRepository(const std::string& endpoint, const std::string& access_key_id, const std::string& secret_key, const std::string& repo_name) {
-  if (!EnsureCurlGlobalInit()) {
-    return;
+bool CreateRepository(const std::string& endpoint, const std::string& access_key_id, const std::string& secret_access_key, const std::string& repo_name,
+                      const std::string& storage_bucket, const std::string& canonical_branch) {
+  json body;
+  body["name"] = repo_name;
+  body["storage_namespace"] = "s3://" + storage_bucket + "/" + repo_name;
+  body["default_branch"] = canonical_branch;
+
+  long status_code = 0;
+  std::string response_body;
+  const std::string url = TrimTrailingSlash(endpoint) + "/api/v1/repositories";
+  const bool ok = DoRequest("POST", url, access_key_id, secret_access_key, body.dump(), &status_code, &response_body);
+  if (!ok) {
+    return false;
   }
 
-  CURL* curl = curl_easy_init();
-  if (!curl)
-    return;
-
-  std::string url = endpoint + "/api/v1/repositories/" + repo_name;
-  std::string response_body;
-  std::string userpwd = access_key_id + ":" + secret_key;
-
-  curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-  curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
-  curl_easy_setopt(curl, CURLOPT_USERPWD, userpwd.c_str());
-  curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
-  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_body);
-
-  curl_easy_perform(curl);
-  curl_easy_cleanup(curl);
+  return status_code == 201 || status_code == 409;
 }
 
-void RegisterRepositoryForCleanup(const std::string& endpoint, const std::string& access_key_id, const std::string& secret_key, const std::string& repo_name) {
+void DeleteRepository(const std::string& endpoint, const std::string& access_key_id, const std::string& secret_access_key, const std::string& repo_name) {
+  long status_code = 0;
+  std::string response_body;
+  const std::string url = TrimTrailingSlash(endpoint) + "/api/v1/repositories/" + repo_name;
+  (void)DoRequest("DELETE", url, access_key_id, secret_access_key, "", &status_code, &response_body);
+}
+
+void RegisterRepositoryForCleanup(const std::string& endpoint, const std::string& access_key_id, const std::string& secret_access_key,
+                                  const std::string& repo_name) {
   std::lock_guard<std::mutex> lock(g_cleanup_mutex);
-  g_repos_to_cleanup.push_back(RepoCleanupInfo{.endpoint = endpoint, .access_key_id = access_key_id, .secret_key = secret_key, .repo_name = repo_name});
+  g_repos_to_cleanup.push_back(RepoCleanupInfo{endpoint, access_key_id, secret_access_key, repo_name});
+}
+
+std::string GenerateRepositoryName() {
+  const auto now = std::chrono::system_clock::now().time_since_epoch().count();
+  std::mt19937_64 rng(static_cast<std::mt19937_64::result_type>(now));
+  std::uniform_int_distribution<unsigned long long> dist;
+
+  std::ostringstream oss;
+  oss << "artifact-layer-it-" << std::hex << dist(rng);
+  return oss.str();
 }
 
 class LakeFSRepositoryCleanupEnvironment final : public ::testing::Environment {
@@ -166,7 +159,7 @@ public:
     }
 
     for (const auto& repo : repos) {
-      DeleteRepository(repo.endpoint, repo.access_key_id, repo.secret_key, repo.repo_name);
+      DeleteRepository(repo.endpoint, repo.access_key_id, repo.secret_access_key, repo.repo_name);
     }
   }
 };
@@ -178,42 +171,37 @@ public:
 
 } // namespace
 
-/// Factory for LakeFSStorage conformance tests.
-///
-/// Creates a fresh LakeFS repository for each test and cleans it up after.
 struct LakeFSStorageFactory {
   static std::unique_ptr<StorageInterface> Create() {
-    if (!LakeFSEnabled()) {
+    const std::string endpoint = GetEnvOrEmpty("LAKEFS_ENDPOINT");
+    const std::string access_key_id = GetEnvOrEmpty("LAKEFS_ACCESS_KEY_ID");
+    const std::string secret_access_key = GetEnvOrEmpty("LAKEFS_SECRET_ACCESS_KEY");
+
+    if (endpoint.empty() || access_key_id.empty() || secret_access_key.empty()) {
       return nullptr;
     }
 
-    std::string endpoint = GetEnv("LAKEFS_ENDPOINT");
-    std::string access_key_id = GetEnv("LAKEFS_ACCESS_KEY_ID");
-    std::string secret_key = GetEnv("LAKEFS_SECRET_KEY");
+    const std::string storage_bucket = GetEnvOrDefault("LAKEFS_STORAGE_BUCKET", "lakefs");
+    const std::string canonical_branch = GetEnvOrDefault("LAKEFS_CANONICAL_BRANCH", "main");
 
-    // Create a unique repo for this test.
-    std::string repo_name = GenerateRepoName();
-
-    if (!CreateRepository(endpoint, access_key_id, secret_key, repo_name)) {
+    const std::string repo_name = GenerateRepositoryName();
+    if (!CreateRepository(endpoint, access_key_id, secret_access_key, repo_name, storage_bucket, canonical_branch)) {
       return nullptr;
     }
-    RegisterRepositoryForCleanup(endpoint, access_key_id, secret_key, repo_name);
+
+    RegisterRepositoryForCleanup(endpoint, access_key_id, secret_access_key, repo_name);
 
     LakeFSConfig config;
     config.endpoint = endpoint;
     config.access_key_id = access_key_id;
-    config.secret_access_key = secret_key;
+    config.secret_access_key = secret_access_key;
     config.repository = repo_name;
-    config.canonical_branch = "main";
-    config.timeout_seconds = 30;
+    config.canonical_branch = canonical_branch;
 
     return std::make_unique<LakeFSStorage>(std::move(config));
   }
 };
 
-// Only instantiate the conformance suite if LakeFS is available.
-// When LAKEFS_ENDPOINT is not set, the factory returns nullptr and the
-// test fixture's SetUp will fail gracefully.
 INSTANTIATE_TYPED_TEST_SUITE_P(LakeFS, StorageConformanceTest, LakeFSStorageFactory);
 
 } // namespace artifact_system::testing
