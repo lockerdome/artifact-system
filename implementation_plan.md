@@ -24,7 +24,7 @@ otherwise noted.
 | P0 | Project Scaffolding & Build Infrastructure | :white_check_mark: Complete |
 | P1 | Proto Definitions (System + API) | :white_check_mark: Complete |
 | P2a | Storage Layer Abstraction & In-Memory Implementation | :white_check_mark: Complete |
-| P2b | LakeFS Storage Layer Integration | :white_large_square: Not started |
+| P2b | LakeFS Storage Layer Integration | :white_check_mark: Complete |
 | P3 | Path Encoding & Index Key Encoding | :white_large_square: Not started |
 | P4 | Index Storage & Three-Way Merge | :white_large_square: Not started |
 | P5 | Transaction & Snapshot Manager | :white_large_square: Not started |
@@ -261,12 +261,12 @@ the contract; P2b validates that LakeFS actually conforms to it.
    - Additional LakeFS-specific tests: connection handling, auth, error mapping
 
 ### Checklist
-- [ ] `src/storage/lakefs_storage.h/.cpp` — LakeFS API client implementing StorageInterface
-- [ ] `src/storage/lakefs_config.h` — configuration struct
-- [ ] `tests/lakefs_storage_test.cpp` — conformance suite passes against real LakeFS
-- [ ] Conflict response correctly translated to `MergeResult`
-- [ ] Merge base accessible for three-way diff
-- [ ] Risk findings documented in `lakefs_storage.h` header comment
+- [x] `src/storage/lakefs_storage.h/.cpp` — LakeFS API client implementing StorageInterface
+- [x] `src/storage/lakefs_config.h` — configuration struct
+- [x] `tests/lakefs_storage_test.cpp` — conformance suite passes against real LakeFS
+- [x] Conflict response correctly translated to `MergeResult`
+- [x] Merge base accessible for three-way diff
+- [x] Risk findings documented in `lakefs_storage.h` header comment
 
 ---
 
