@@ -59,6 +59,22 @@ std::string TrimTrailingSlash(std::string value) {
   return value;
 }
 
+bool EndsWith(const std::string& value, const std::string& suffix) {
+  return value.size() >= suffix.size() && value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+std::string BuildStorageNamespace(const std::string& storage_namespace_prefix, const std::string& repo_name) {
+  if (storage_namespace_prefix.empty()) {
+    return repo_name;
+  }
+
+  if (storage_namespace_prefix.back() == '/' || EndsWith(storage_namespace_prefix, "://")) {
+    return storage_namespace_prefix + repo_name;
+  }
+
+  return storage_namespace_prefix + "/" + repo_name;
+}
+
 bool DoRequest(const std::string& method, const std::string& url, const std::string& access_key_id, const std::string& secret_access_key,
                const std::string& request_body, long* status_code, std::string* response_body) {
   if (!EnsureCurlGlobalInit()) {
@@ -109,10 +125,10 @@ bool DoRequest(const std::string& method, const std::string& url, const std::str
 }
 
 bool CreateRepository(const std::string& endpoint, const std::string& access_key_id, const std::string& secret_access_key, const std::string& repo_name,
-                      const std::string& storage_bucket, const std::string& canonical_branch) {
+                      const std::string& storage_namespace, const std::string& canonical_branch) {
   json body;
   body["name"] = repo_name;
-  body["storage_namespace"] = "s3://" + storage_bucket + "/" + repo_name;
+  body["storage_namespace"] = storage_namespace;
   body["default_branch"] = canonical_branch;
 
   long status_code = 0;
@@ -181,11 +197,15 @@ struct LakeFSStorageFactory {
       return nullptr;
     }
 
+    const std::string storage_namespace_prefix = GetEnvOrEmpty("LAKEFS_STORAGE_NAMESPACE_PREFIX");
     const std::string storage_bucket = GetEnvOrDefault("LAKEFS_STORAGE_BUCKET", "lakefs");
     const std::string canonical_branch = GetEnvOrDefault("LAKEFS_CANONICAL_BRANCH", "main");
 
     const std::string repo_name = GenerateRepositoryName();
-    if (!CreateRepository(endpoint, access_key_id, secret_access_key, repo_name, storage_bucket, canonical_branch)) {
+    const std::string storage_namespace =
+        storage_namespace_prefix.empty() ? "s3://" + storage_bucket + "/" + repo_name : BuildStorageNamespace(storage_namespace_prefix, repo_name);
+
+    if (!CreateRepository(endpoint, access_key_id, secret_access_key, repo_name, storage_namespace, canonical_branch)) {
       return nullptr;
     }
 

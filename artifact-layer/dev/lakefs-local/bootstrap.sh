@@ -3,10 +3,10 @@
 set -euo pipefail
 
 LAKEFS_ENDPOINT="${LAKEFS_ENDPOINT:-http://localhost:8000}"
-LAKEFS_ACCESS_KEY_ID="${LAKEFS_ACCESS_KEY_ID:-LKFS_LOCAL_ACCESS_KEY}"
-LAKEFS_SECRET_ACCESS_KEY="${LAKEFS_SECRET_ACCESS_KEY:-LKFS_LOCAL_SECRET_KEY}"
+LAKEFS_ACCESS_KEY_ID="${LAKEFS_ACCESS_KEY_ID:-AKIAIOSFOLQUICKSTART}"
+LAKEFS_SECRET_ACCESS_KEY="${LAKEFS_SECRET_ACCESS_KEY:-wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY}"
 LAKEFS_REPOSITORY="${LAKEFS_REPOSITORY:-artifact-layer-it}"
-LAKEFS_STORAGE_BUCKET="${LAKEFS_STORAGE_BUCKET:-lakefs}"
+LAKEFS_STORAGE_NAMESPACE_PREFIX="${LAKEFS_STORAGE_NAMESPACE_PREFIX:-local://}"
 LAKEFS_CANONICAL_BRANCH="${LAKEFS_CANONICAL_BRANCH:-main}"
 
 wait_for_lakefs() {
@@ -36,39 +36,32 @@ post_json() {
     -d "$json_body"
 }
 
-setup_lakefs() {
-  local setup_payload
-  setup_payload=$(cat <<EOF
-{"username":"local-admin","key":{"access_key_id":"${LAKEFS_ACCESS_KEY_ID}","secret_access_key":"${LAKEFS_SECRET_ACCESS_KEY}"}}
-EOF
-)
+build_storage_namespace() {
+  local prefix="$1"
+  local repository="$2"
 
-  local code
-  code=$(curl -sS -o /tmp/lakefs_bootstrap_response.json -w "%{http_code}" \
-    -X POST "${LAKEFS_ENDPOINT}/api/v1/setup_lakefs" \
-    -H "Content-Type: application/json" \
-    -H "Accept: application/json" \
-    -d "$setup_payload")
+  if [ -z "$prefix" ]; then
+    printf "%s" "$repository"
+    return
+  fi
 
-  case "$code" in
-    200|201)
-      echo "LakeFS bootstrap user created."
-      ;;
-    400|409)
-      echo "LakeFS already initialized; reusing existing setup."
+  case "$prefix" in
+    */|*://)
+      printf "%s%s" "$prefix" "$repository"
       ;;
     *)
-      echo "Failed to initialize LakeFS (HTTP ${code})." >&2
-      cat /tmp/lakefs_bootstrap_response.json >&2 || true
-      return 1
+      printf "%s/%s" "$prefix" "$repository"
       ;;
   esac
 }
 
 create_repository() {
+  local storage_namespace
+  storage_namespace=$(build_storage_namespace "${LAKEFS_STORAGE_NAMESPACE_PREFIX}" "${LAKEFS_REPOSITORY}")
+
   local repo_payload
   repo_payload=$(cat <<EOF
-{"name":"${LAKEFS_REPOSITORY}","storage_namespace":"s3://${LAKEFS_STORAGE_BUCKET}/${LAKEFS_REPOSITORY}","default_branch":"${LAKEFS_CANONICAL_BRANCH}"}
+{"name":"${LAKEFS_REPOSITORY}","storage_namespace":"${storage_namespace}","default_branch":"${LAKEFS_CANONICAL_BRANCH}"}
 EOF
 )
 
@@ -91,7 +84,6 @@ EOF
 }
 
 wait_for_lakefs
-setup_lakefs
 create_repository
 
 cat <<EOF
@@ -102,7 +94,7 @@ Export these vars for integration tests:
   export LAKEFS_ENDPOINT='${LAKEFS_ENDPOINT}'
   export LAKEFS_ACCESS_KEY_ID='${LAKEFS_ACCESS_KEY_ID}'
   export LAKEFS_SECRET_ACCESS_KEY='${LAKEFS_SECRET_ACCESS_KEY}'
-  export LAKEFS_STORAGE_BUCKET='${LAKEFS_STORAGE_BUCKET}'
+  export LAKEFS_STORAGE_NAMESPACE_PREFIX='${LAKEFS_STORAGE_NAMESPACE_PREFIX}'
   export LAKEFS_CANONICAL_BRANCH='${LAKEFS_CANONICAL_BRANCH}'
 
 Run LakeFS conformance tests with:
