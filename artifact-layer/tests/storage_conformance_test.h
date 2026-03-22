@@ -661,11 +661,19 @@ TYPED_TEST_P(StorageConformanceTest, MergeNonexistentTargetBranch) {
   EXPECT_EQ(merge.status().code(), absl::StatusCode::kNotFound);
 }
 
+// 44. Merging a branch into itself returns INVALID_ARGUMENT.
+TYPED_TEST_P(StorageConformanceTest, MergeSameSourceAndTargetBranch) {
+  const std::string canonical = this->Storage().GetCanonicalBranch();
+  auto merge = this->Storage().Merge(canonical, canonical);
+  ASSERT_FALSE(merge.ok());
+  EXPECT_EQ(merge.status().code(), absl::StatusCode::kInvalidArgument);
+}
+
 // ===========================================================================
 // Merge — Complex
 // ===========================================================================
 
-// 44. Chained branches: A from canonical, B from A. Merge B → canonical.
+// 45. Chained branches: A from canonical, B from A. Merge B → canonical.
 TYPED_TEST_P(StorageConformanceTest, MergeChainedBranches) {
   const std::string canonical = this->Storage().GetCanonicalBranch();
   ASSERT_TRUE(this->Storage().CreateBranch("chain-A", "").ok());
@@ -892,6 +900,7 @@ REGISTER_TYPED_TEST_SUITE_P(StorageConformanceTest,
                             MergeConflict, MergeConflictOneDeleteOneModify, MergeConflictMultiplePaths, MergeConflictIncludesBaseAndHeadCommits,
                             // Merge — Preconditions
                             MergeWithUncommittedChangesSource, MergeWithUncommittedChangesTarget, MergeNonexistentSourceBranch, MergeNonexistentTargetBranch,
+                            MergeSameSourceAndTargetBranch,
                             // Merge — Complex
                             MergeChainedBranches, MergeTwoBranchesSequentially, MergeWithDiamondHistory,
                             // Merge — Additional

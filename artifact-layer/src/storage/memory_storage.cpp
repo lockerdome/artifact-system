@@ -341,6 +341,10 @@ absl::StatusOr<std::string> MemoryStorage::Commit(const std::string& branch, con
 // ---------------------------------------------------------------------------
 
 absl::StatusOr<MergeResult> MemoryStorage::Merge(const std::string& source, const std::string& target) {
+  if (source == target) {
+    return absl::InvalidArgumentError(absl::StrCat("source and target branches must differ: ", source));
+  }
+
   // Validate branches exist.
   auto src_it = branches_.find(source);
   if (src_it == branches_.end()) {
