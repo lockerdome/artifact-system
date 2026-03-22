@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <deque>
+#include <limits>
 #include <set>
 #include <string>
 #include <utility>
@@ -58,62 +59,84 @@ std::map<std::string, std::string> MemoryStorage::ResolveState(const BranchData&
   return state;
 }
 
-std::string MemoryStorage::FindMergeBase(const std::string& commit_a, const std::string& commit_b) const {
-  // BFS from both commits simultaneously.  The first commit found in both
-  // ancestor sets is the merge base.
-  std::set<std::string> ancestors_a;
-  std::set<std::string> ancestors_b;
-  std::deque<std::string> queue_a;
-  std::deque<std::string> queue_b;
-
-  queue_a.push_back(commit_a);
-  ancestors_a.insert(commit_a);
-  queue_b.push_back(commit_b);
-  ancestors_b.insert(commit_b);
-
+absl::StatusOr<std::string> MemoryStorage::FindMergeBase(const std::string& commit_a, const std::string& commit_b) const {
+  if (!commits_.contains(commit_a)) {
+    return absl::InternalError(absl::StrCat("commit not found: ", commit_a));
+  }
+  if (!commits_.contains(commit_b)) {
+    return absl::InternalError(absl::StrCat("commit not found: ", commit_b));
+  }
   if (commit_a == commit_b) {
     return commit_a;
   }
 
-  // Alternating BFS expansion.
-  while (!queue_a.empty() || !queue_b.empty()) {
-    // Expand one level from A.
-    if (!queue_a.empty()) {
-      auto current = queue_a.front();
-      queue_a.pop_front();
+  auto build_ancestor_depths = [this](const std::string& start) -> absl::StatusOr<std::map<std::string, size_t>> {
+    std::map<std::string, size_t> depths;
+    std::deque<std::pair<std::string, size_t>> queue;
+    depths[start] = 0;
+    queue.push_back({start, 0});
+
+    while (!queue.empty()) {
+      const auto [current, depth] = queue.front();
+      queue.pop_front();
+
       auto cit = commits_.find(current);
-      if (cit != commits_.end()) {
-        for (const auto& parent : cit->second.parent_ids) {
-          if (ancestors_b.contains(parent)) {
-            return parent;
-          }
-          if (ancestors_a.insert(parent).second) {
-            queue_a.push_back(parent);
-          }
+      if (cit == commits_.end()) {
+        return absl::InternalError(absl::StrCat("commit graph is corrupt, missing commit: ", current));
+      }
+
+      for (const auto& parent : cit->second.parent_ids) {
+        const size_t parent_depth = depth + 1;
+        auto it = depths.find(parent);
+        if (it == depths.end() || parent_depth < it->second) {
+          depths[parent] = parent_depth;
+          queue.push_back({parent, parent_depth});
         }
       }
     }
 
-    // Expand one level from B.
-    if (!queue_b.empty()) {
-      auto current = queue_b.front();
-      queue_b.pop_front();
-      auto cit = commits_.find(current);
-      if (cit != commits_.end()) {
-        for (const auto& parent : cit->second.parent_ids) {
-          if (ancestors_a.contains(parent)) {
-            return parent;
-          }
-          if (ancestors_b.insert(parent).second) {
-            queue_b.push_back(parent);
-          }
-        }
-      }
+    return depths;
+  };
+
+  auto depths_a_or = build_ancestor_depths(commit_a);
+  if (!depths_a_or.ok()) {
+    return depths_a_or.status();
+  }
+  auto depths_b_or = build_ancestor_depths(commit_b);
+  if (!depths_b_or.ok()) {
+    return depths_b_or.status();
+  }
+
+  const auto& depths_a = *depths_a_or;
+  const auto& depths_b = *depths_b_or;
+
+  std::string best_base;
+  size_t best_max_depth = std::numeric_limits<size_t>::max();
+  size_t best_sum_depth = std::numeric_limits<size_t>::max();
+
+  for (const auto& [ancestor, depth_a] : depths_a) {
+    auto it_b = depths_b.find(ancestor);
+    if (it_b == depths_b.end()) {
+      continue;
+    }
+
+    const size_t depth_b = it_b->second;
+    const size_t max_depth = std::max(depth_a, depth_b);
+    const size_t sum_depth = depth_a + depth_b;
+
+    if (best_base.empty() || max_depth < best_max_depth || (max_depth == best_max_depth && sum_depth < best_sum_depth) ||
+        (max_depth == best_max_depth && sum_depth == best_sum_depth && ancestor < best_base)) {
+      best_base = ancestor;
+      best_max_depth = max_depth;
+      best_sum_depth = sum_depth;
     }
   }
 
-  // Fallback: should not happen if all commits share the genesis.
-  return "commit-0";
+  if (best_base.empty()) {
+    return absl::FailedPreconditionError(absl::StrCat("no common merge base found for commits: ", commit_a, " and ", commit_b));
+  }
+
+  return best_base;
 }
 
 // ---------------------------------------------------------------------------
@@ -339,7 +362,11 @@ absl::StatusOr<MergeResult> MemoryStorage::Merge(const std::string& source, cons
   const std::string target_head = tgt_it->second.head_commit_id;
 
   // Find the common ancestor.
-  std::string base_id = FindMergeBase(source_head, target_head);
+  auto base_or = FindMergeBase(source_head, target_head);
+  if (!base_or.ok()) {
+    return base_or.status();
+  }
+  const std::string base_id = *base_or;
 
   // Get snapshots (use find() instead of at() to avoid throwing on bad state).
   auto base_it = commits_.find(base_id);

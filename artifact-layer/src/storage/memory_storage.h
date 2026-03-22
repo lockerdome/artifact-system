@@ -53,8 +53,8 @@ private:
   /// Resolve the effective state of a branch (committed + staged).
   std::map<std::string, std::string> ResolveState(const BranchData& branch) const;
 
-  /// Find the common ancestor of two commits.
-  std::string FindMergeBase(const std::string& commit_a, const std::string& commit_b) const;
+  /// Find the best common ancestor of two commits.
+  absl::StatusOr<std::string> FindMergeBase(const std::string& commit_a, const std::string& commit_b) const;
 
   /// Generate a new commit ID.
   std::string NextCommitId();
