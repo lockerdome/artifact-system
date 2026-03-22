@@ -143,11 +143,22 @@ TYPED_TEST_P(StorageConformanceTest, CreateBranchFromNonexistentCommit) {
   EXPECT_EQ(branch.status().code(), absl::StatusCode::kNotFound);
 }
 
+// 10. Creating branch with a name that matches an existing commit ID returns
+//     ALREADY_EXISTS to prevent ambiguous refs.
+TYPED_TEST_P(StorageConformanceTest, CreateBranchNameCollidesWithCommitId) {
+  const std::string canonical = this->Storage().GetCanonicalBranch();
+  std::string commit_id = this->PutAndCommit(canonical, "collision.txt", "data");
+
+  auto branch = this->Storage().CreateBranch(commit_id, "");
+  ASSERT_FALSE(branch.ok());
+  EXPECT_EQ(branch.status().code(), absl::StatusCode::kAlreadyExists);
+}
+
 // ===========================================================================
 // Object I/O
 // ===========================================================================
 
-// 10. Put an object, get it back. Verify data matches.
+// 11. Put an object, get it back. Verify data matches.
 TYPED_TEST_P(StorageConformanceTest, PutAndGetObject) {
   const std::string canonical = this->Storage().GetCanonicalBranch();
   ASSERT_TRUE(this->Storage().PutObject(canonical, "hello.txt", "world").ok());
@@ -865,6 +876,7 @@ REGISTER_TYPED_TEST_SUITE_P(StorageConformanceTest,
                             // Branch CRUD
                             CanonicalBranchExists, CreateBranchFromCanonical, CreateBranchFromCommit, CreateBranchDuplicate, DeleteBranch,
                             DeleteCanonicalBranch, DeleteNonexistentBranch, GetBranchHeadNonexistent, CreateBranchFromNonexistentCommit,
+                            CreateBranchNameCollidesWithCommitId,
                             // Object I/O
                             PutAndGetObject, PutOverwrite, GetNonexistentObject, DeleteObject, DeleteObjectTombstone, ObjectExists, ObjectExistsWithTombstone,
                             ObjectExistsOnCommitRef, ObjectExistsOnNonexistentRef, GetObjectOnCommitRef, GetObjectOnNonexistentRef, ListObjectsEmpty,
