@@ -79,27 +79,26 @@ public:
   /// Overwrites if the path already exists.
   virtual absl::Status PutObject(const std::string& branch, const std::string& path, const std::string& data) = 0;
 
-  /// Read an object from a branch (committed + staged).
+  /// Read an object from a ref.
+  /// Ref may be either a branch name or a commit ID.
+  /// For branches, staged changes are visible.
   /// @return The object data, or NOT_FOUND if the path doesn't exist.
-  virtual absl::StatusOr<std::string> GetObject(const std::string& branch, const std::string& path) = 0;
-
-  /// Read an object at a specific commit.
-  /// @return The object data, or NOT_FOUND if the path doesn't exist at that commit.
-  virtual absl::StatusOr<std::string> GetObjectAtCommit(const std::string& commit_id, const std::string& path) = 0;
+  virtual absl::StatusOr<std::string> GetObject(const std::string& ref, const std::string& path) = 0;
 
   /// Delete an object from a branch's staging area.
   /// The delete is staged (not committed until Commit is called).
   virtual absl::Status DeleteObject(const std::string& branch, const std::string& path) = 0;
 
-  /// Check if an object exists on a branch (committed + staged).
-  virtual absl::StatusOr<bool> ObjectExists(const std::string& branch, const std::string& path) = 0;
+  /// Check if an object exists on a ref.
+  /// Ref may be either a branch name or a commit ID.
+  /// For branches, staged changes are visible.
+  virtual absl::StatusOr<bool> ObjectExists(const std::string& ref, const std::string& path) = 0;
 
-  /// Check if an object exists at a specific commit.
-  virtual absl::StatusOr<bool> ObjectExistsAtCommit(const std::string& commit_id, const std::string& path) = 0;
-
-  /// List all object paths under a prefix on a branch.
+  /// List all object paths under a prefix on a ref.
+  /// Ref may be either a branch name or a commit ID.
+  /// For branches, staged changes are visible.
   /// Returns paths in sorted order.
-  virtual absl::StatusOr<std::vector<std::string>> ListObjects(const std::string& branch, const std::string& prefix) = 0;
+  virtual absl::StatusOr<std::vector<std::string>> ListObjects(const std::string& ref, const std::string& prefix) = 0;
 
   // ── Commit and merge ───────────────────────────────────────────────────
 

@@ -246,45 +246,46 @@ TYPED_TEST_P(StorageConformanceTest, ObjectExistsWithTombstone) {
   EXPECT_FALSE(*exists);
 }
 
-// 17. ObjectExistsAtCommit returns true for objects in that commit,
-//     false for paths not in the commit.
-TYPED_TEST_P(StorageConformanceTest, ObjectExistsAtCommit) {
+// 17. ObjectExists accepts a commit ref and returns true for objects in that
+//     commit, false for paths not in the commit.
+TYPED_TEST_P(StorageConformanceTest, ObjectExistsOnCommitRef) {
   const std::string canonical = this->Storage().GetCanonicalBranch();
-  std::string cid = this->PutAndCommit(canonical, "committed.txt", "data");
+  std::string commit_ref = this->PutAndCommit(canonical, "committed.txt", "data");
 
-  auto yes = this->Storage().ObjectExistsAtCommit(cid, "committed.txt");
+  auto yes = this->Storage().ObjectExists(commit_ref, "committed.txt");
   ASSERT_TRUE(yes.ok()) << yes.status();
   EXPECT_TRUE(*yes);
 
-  auto no = this->Storage().ObjectExistsAtCommit(cid, "other.txt");
+  auto no = this->Storage().ObjectExists(commit_ref, "other.txt");
   ASSERT_TRUE(no.ok()) << no.status();
   EXPECT_FALSE(*no);
 }
 
-// 18. ObjectExistsAtCommit with nonexistent commit returns NOT_FOUND.
-TYPED_TEST_P(StorageConformanceTest, ObjectExistsAtCommitNonexistent) {
-  auto result = this->Storage().ObjectExistsAtCommit("bad-commit", "any.txt");
+// 18. ObjectExists with a nonexistent ref returns NOT_FOUND.
+TYPED_TEST_P(StorageConformanceTest, ObjectExistsOnNonexistentRef) {
+  auto result = this->Storage().ObjectExists("bad-commit", "any.txt");
   ASSERT_FALSE(result.ok());
   EXPECT_EQ(result.status().code(), absl::StatusCode::kNotFound);
 }
 
-// 19. GetObjectAtCommit returns correct data; missing path → NOT_FOUND.
-TYPED_TEST_P(StorageConformanceTest, GetObjectAtCommit) {
+// 19. GetObject accepts a commit ref and returns correct data;
+//     missing path -> NOT_FOUND.
+TYPED_TEST_P(StorageConformanceTest, GetObjectOnCommitRef) {
   const std::string canonical = this->Storage().GetCanonicalBranch();
-  std::string cid = this->PutAndCommit(canonical, "versioned.txt", "v1-data");
+  std::string commit_ref = this->PutAndCommit(canonical, "versioned.txt", "v1-data");
 
-  auto data = this->Storage().GetObjectAtCommit(cid, "versioned.txt");
+  auto data = this->Storage().GetObject(commit_ref, "versioned.txt");
   ASSERT_TRUE(data.ok()) << data.status();
   EXPECT_EQ(*data, "v1-data");
 
-  auto missing = this->Storage().GetObjectAtCommit(cid, "absent.txt");
+  auto missing = this->Storage().GetObject(commit_ref, "absent.txt");
   ASSERT_FALSE(missing.ok());
   EXPECT_EQ(missing.status().code(), absl::StatusCode::kNotFound);
 }
 
-// 20. GetObjectAtCommit with nonexistent commit returns NOT_FOUND.
-TYPED_TEST_P(StorageConformanceTest, GetObjectAtCommitNonexistent) {
-  auto data = this->Storage().GetObjectAtCommit("no-such-commit", "any.txt");
+// 20. GetObject with nonexistent ref returns NOT_FOUND.
+TYPED_TEST_P(StorageConformanceTest, GetObjectOnNonexistentRef) {
+  auto data = this->Storage().GetObject("no-such-commit", "any.txt");
   ASSERT_FALSE(data.ok());
   EXPECT_EQ(data.status().code(), absl::StatusCode::kNotFound);
 }
@@ -762,13 +763,13 @@ TYPED_TEST_P(StorageConformanceTest, BranchIsolation) {
 //     advances.
 TYPED_TEST_P(StorageConformanceTest, CommitImmutability) {
   const std::string canonical = this->Storage().GetCanonicalBranch();
-  std::string cid1 = this->PutAndCommit(canonical, "immutable.txt", "v1");
+  std::string commit_ref = this->PutAndCommit(canonical, "immutable.txt", "v1");
 
   // Advance the branch.
   this->PutAndCommit(canonical, "immutable.txt", "v2");
 
   // The old commit should still return v1.
-  auto old_data = this->Storage().GetObjectAtCommit(cid1, "immutable.txt");
+  auto old_data = this->Storage().GetObject(commit_ref, "immutable.txt");
   ASSERT_TRUE(old_data.ok()) << old_data.status();
   EXPECT_EQ(*old_data, "v1");
 
@@ -866,7 +867,7 @@ REGISTER_TYPED_TEST_SUITE_P(StorageConformanceTest,
                             DeleteCanonicalBranch, DeleteNonexistentBranch, GetBranchHeadNonexistent, CreateBranchFromNonexistentCommit,
                             // Object I/O
                             PutAndGetObject, PutOverwrite, GetNonexistentObject, DeleteObject, DeleteObjectTombstone, ObjectExists, ObjectExistsWithTombstone,
-                            ObjectExistsAtCommit, ObjectExistsAtCommitNonexistent, GetObjectAtCommit, GetObjectAtCommitNonexistent, ListObjectsEmpty,
+                            ObjectExistsOnCommitRef, ObjectExistsOnNonexistentRef, GetObjectOnCommitRef, GetObjectOnNonexistentRef, ListObjectsEmpty,
                             ListObjectsWithPrefix, StagedChangesVisibleInGet, StagedDeleteHidesCommitted, PutOnNonexistentBranch, ListObjectsIncludesStaged,
                             ListObjectsExcludesTombstoned, DeleteObjectOnNonexistentBranch, GetObjectOnNonexistentBranch, ObjectExistsOnNonexistentBranch,
                             ListObjectsOnNonexistentBranch,

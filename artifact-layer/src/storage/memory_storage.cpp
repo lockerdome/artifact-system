@@ -178,46 +178,42 @@ absl::Status MemoryStorage::PutObject(const std::string& branch, const std::stri
   return absl::OkStatus();
 }
 
-absl::StatusOr<std::string> MemoryStorage::GetObject(const std::string& branch, const std::string& path) {
-  auto bit = branches_.find(branch);
-  if (bit == branches_.end()) {
-    return absl::NotFoundError(absl::StrCat("branch not found: ", branch));
-  }
+absl::StatusOr<std::string> MemoryStorage::GetObject(const std::string& ref, const std::string& path) {
+  // Branch ref: include staged view.
+  auto bit = branches_.find(ref);
+  if (bit != branches_.end()) {
+    const auto& br = bit->second;
 
-  const auto& br = bit->second;
-
-  // Check staging first.
-  auto sit = br.staging.find(path);
-  if (sit != br.staging.end()) {
-    if (sit->second.data.has_value()) {
-      return *sit->second.data;
+    auto sit = br.staging.find(path);
+    if (sit != br.staging.end()) {
+      if (sit->second.data.has_value()) {
+        return *sit->second.data;
+      }
+      return absl::NotFoundError(absl::StrCat("object not found: ", path));
     }
-    // Tombstone — staged delete.
-    return absl::NotFoundError(absl::StrCat("object not found: ", path));
+
+    auto cit = commits_.find(br.head_commit_id);
+    if (cit == commits_.end()) {
+      return absl::InternalError("head commit not found");
+    }
+    auto oit = cit->second.objects.find(path);
+    if (oit == cit->second.objects.end()) {
+      return absl::NotFoundError(absl::StrCat("object not found: ", path));
+    }
+    return oit->second;
   }
 
-  // Fall through to committed state.
-  auto cit = commits_.find(br.head_commit_id);
-  if (cit == commits_.end()) {
-    return absl::InternalError("head commit not found");
+  // Commit ref: read immutable snapshot.
+  auto cit = commits_.find(ref);
+  if (cit != commits_.end()) {
+    auto oit = cit->second.objects.find(path);
+    if (oit == cit->second.objects.end()) {
+      return absl::NotFoundError(absl::StrCat("object not found: ", path));
+    }
+    return oit->second;
   }
-  auto oit = cit->second.objects.find(path);
-  if (oit == cit->second.objects.end()) {
-    return absl::NotFoundError(absl::StrCat("object not found: ", path));
-  }
-  return oit->second;
-}
 
-absl::StatusOr<std::string> MemoryStorage::GetObjectAtCommit(const std::string& commit_id, const std::string& path) {
-  auto cit = commits_.find(commit_id);
-  if (cit == commits_.end()) {
-    return absl::NotFoundError(absl::StrCat("commit not found: ", commit_id));
-  }
-  auto oit = cit->second.objects.find(path);
-  if (oit == cit->second.objects.end()) {
-    return absl::NotFoundError(absl::StrCat("object not found at commit ", commit_id, ": ", path));
-  }
-  return oit->second;
+  return absl::NotFoundError(absl::StrCat("ref not found: ", ref));
 }
 
 absl::Status MemoryStorage::DeleteObject(const std::string& branch, const std::string& path) {
@@ -230,43 +226,49 @@ absl::Status MemoryStorage::DeleteObject(const std::string& branch, const std::s
   return absl::OkStatus();
 }
 
-absl::StatusOr<bool> MemoryStorage::ObjectExists(const std::string& branch, const std::string& path) {
-  auto bit = branches_.find(branch);
-  if (bit == branches_.end()) {
-    return absl::NotFoundError(absl::StrCat("branch not found: ", branch));
+absl::StatusOr<bool> MemoryStorage::ObjectExists(const std::string& ref, const std::string& path) {
+  // Branch ref: include staged view.
+  auto bit = branches_.find(ref);
+  if (bit != branches_.end()) {
+    const auto& br = bit->second;
+
+    auto sit = br.staging.find(path);
+    if (sit != br.staging.end()) {
+      return sit->second.data.has_value();
+    }
+
+    auto cit = commits_.find(br.head_commit_id);
+    if (cit == commits_.end()) {
+      return absl::InternalError("head commit not found");
+    }
+    return cit->second.objects.contains(path);
   }
 
-  const auto& br = bit->second;
-
-  // Check staging first.
-  auto sit = br.staging.find(path);
-  if (sit != br.staging.end()) {
-    return sit->second.data.has_value();
+  // Commit ref: check immutable snapshot.
+  auto cit = commits_.find(ref);
+  if (cit != commits_.end()) {
+    return cit->second.objects.contains(path);
   }
 
-  // Fall through to committed state.
-  auto cit = commits_.find(br.head_commit_id);
-  if (cit == commits_.end()) {
-    return absl::InternalError("head commit not found");
-  }
-  return cit->second.objects.contains(path);
+  return absl::NotFoundError(absl::StrCat("ref not found: ", ref));
 }
 
-absl::StatusOr<bool> MemoryStorage::ObjectExistsAtCommit(const std::string& commit_id, const std::string& path) {
-  auto cit = commits_.find(commit_id);
-  if (cit == commits_.end()) {
-    return absl::NotFoundError(absl::StrCat("commit not found: ", commit_id));
-  }
-  return cit->second.objects.contains(path);
-}
+absl::StatusOr<std::vector<std::string>> MemoryStorage::ListObjects(const std::string& ref, const std::string& prefix) {
+  std::map<std::string, std::string> state;
 
-absl::StatusOr<std::vector<std::string>> MemoryStorage::ListObjects(const std::string& branch, const std::string& prefix) {
-  auto bit = branches_.find(branch);
-  if (bit == branches_.end()) {
-    return absl::NotFoundError(absl::StrCat("branch not found: ", branch));
+  // Branch ref: include staged view.
+  auto bit = branches_.find(ref);
+  if (bit != branches_.end()) {
+    state = ResolveState(bit->second);
+  } else {
+    // Commit ref: list immutable snapshot.
+    auto cit = commits_.find(ref);
+    if (cit == commits_.end()) {
+      return absl::NotFoundError(absl::StrCat("ref not found: ", ref));
+    }
+    state = cit->second.objects;
   }
 
-  auto state = ResolveState(bit->second);
   std::vector<std::string> result;
   for (const auto& [path, _] : state) {
     if (path.starts_with(prefix)) {

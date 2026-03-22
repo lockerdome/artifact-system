@@ -21,12 +21,10 @@ public:
 
   // Object I/O
   absl::Status PutObject(const std::string& branch, const std::string& path, const std::string& data) override;
-  absl::StatusOr<std::string> GetObject(const std::string& branch, const std::string& path) override;
-  absl::StatusOr<std::string> GetObjectAtCommit(const std::string& commit_id, const std::string& path) override;
+  absl::StatusOr<std::string> GetObject(const std::string& ref, const std::string& path) override;
   absl::Status DeleteObject(const std::string& branch, const std::string& path) override;
-  absl::StatusOr<bool> ObjectExists(const std::string& branch, const std::string& path) override;
-  absl::StatusOr<bool> ObjectExistsAtCommit(const std::string& commit_id, const std::string& path) override;
-  absl::StatusOr<std::vector<std::string>> ListObjects(const std::string& branch, const std::string& prefix) override;
+  absl::StatusOr<bool> ObjectExists(const std::string& ref, const std::string& path) override;
+  absl::StatusOr<std::vector<std::string>> ListObjects(const std::string& ref, const std::string& prefix) override;
 
   // Commit and merge
   absl::StatusOr<std::string> Commit(const std::string& branch, const std::string& message) override;
