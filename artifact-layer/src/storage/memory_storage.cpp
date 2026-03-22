@@ -22,12 +22,13 @@ MemoryStorage::MemoryStorage() {
   CommitData genesis;
   genesis.id = NextCommitId(); // "commit-0"
   genesis.message = "genesis";
+  const std::string genesis_id = genesis.id;
   // No parents, no objects.
   commits_[genesis.id] = std::move(genesis);
 
   // Create the canonical branch pointing at the genesis commit.
   BranchData main_branch;
-  main_branch.head_commit_id = "commit-0";
+  main_branch.head_commit_id = genesis_id;
   branches_[kCanonicalBranch] = std::move(main_branch);
 }
 
@@ -57,6 +58,24 @@ std::map<std::string, std::string> MemoryStorage::ResolveState(const BranchData&
     }
   }
   return state;
+}
+
+absl::StatusOr<std::map<std::string, std::string>> MemoryStorage::ResolveRefState(const std::string& ref) const {
+  auto bit = branches_.find(ref);
+  if (bit != branches_.end()) {
+    auto head_it = commits_.find(bit->second.head_commit_id);
+    if (head_it == commits_.end()) {
+      return absl::InternalError(absl::StrCat("head commit not found for branch: ", ref));
+    }
+    return ResolveState(bit->second);
+  }
+
+  auto cit = commits_.find(ref);
+  if (cit != commits_.end()) {
+    return cit->second.objects;
+  }
+
+  return absl::NotFoundError(absl::StrCat("ref not found: ", ref));
 }
 
 absl::StatusOr<std::string> MemoryStorage::FindMergeBase(const std::string& commit_a, const std::string& commit_b) const {
@@ -205,41 +224,17 @@ absl::Status MemoryStorage::PutObject(const std::string& branch, const std::stri
 }
 
 absl::StatusOr<std::string> MemoryStorage::GetObject(const std::string& ref, const std::string& path) {
-  // Branch ref: include staged view.
-  auto bit = branches_.find(ref);
-  if (bit != branches_.end()) {
-    const auto& br = bit->second;
-
-    auto sit = br.staging.find(path);
-    if (sit != br.staging.end()) {
-      if (sit->second.data.has_value()) {
-        return *sit->second.data;
-      }
-      return absl::NotFoundError(absl::StrCat("object not found: ", path));
-    }
-
-    auto cit = commits_.find(br.head_commit_id);
-    if (cit == commits_.end()) {
-      return absl::InternalError("head commit not found");
-    }
-    auto oit = cit->second.objects.find(path);
-    if (oit == cit->second.objects.end()) {
-      return absl::NotFoundError(absl::StrCat("object not found: ", path));
-    }
-    return oit->second;
+  auto state_or = ResolveRefState(ref);
+  if (!state_or.ok()) {
+    return state_or.status();
   }
 
-  // Commit ref: read immutable snapshot.
-  auto cit = commits_.find(ref);
-  if (cit != commits_.end()) {
-    auto oit = cit->second.objects.find(path);
-    if (oit == cit->second.objects.end()) {
-      return absl::NotFoundError(absl::StrCat("object not found: ", path));
-    }
-    return oit->second;
+  const auto& state = *state_or;
+  auto it = state.find(path);
+  if (it == state.end()) {
+    return absl::NotFoundError(absl::StrCat("object not found: ", path));
   }
-
-  return absl::NotFoundError(absl::StrCat("ref not found: ", ref));
+  return it->second;
 }
 
 absl::Status MemoryStorage::DeleteObject(const std::string& branch, const std::string& path) {
@@ -253,50 +248,21 @@ absl::Status MemoryStorage::DeleteObject(const std::string& branch, const std::s
 }
 
 absl::StatusOr<bool> MemoryStorage::ObjectExists(const std::string& ref, const std::string& path) {
-  // Branch ref: include staged view.
-  auto bit = branches_.find(ref);
-  if (bit != branches_.end()) {
-    const auto& br = bit->second;
-
-    auto sit = br.staging.find(path);
-    if (sit != br.staging.end()) {
-      return sit->second.data.has_value();
-    }
-
-    auto cit = commits_.find(br.head_commit_id);
-    if (cit == commits_.end()) {
-      return absl::InternalError("head commit not found");
-    }
-    return cit->second.objects.contains(path);
+  auto state_or = ResolveRefState(ref);
+  if (!state_or.ok()) {
+    return state_or.status();
   }
-
-  // Commit ref: check immutable snapshot.
-  auto cit = commits_.find(ref);
-  if (cit != commits_.end()) {
-    return cit->second.objects.contains(path);
-  }
-
-  return absl::NotFoundError(absl::StrCat("ref not found: ", ref));
+  return state_or->contains(path);
 }
 
 absl::StatusOr<std::vector<std::string>> MemoryStorage::ListObjects(const std::string& ref, const std::string& prefix) {
-  std::map<std::string, std::string> state;
-
-  // Branch ref: include staged view.
-  auto bit = branches_.find(ref);
-  if (bit != branches_.end()) {
-    state = ResolveState(bit->second);
-  } else {
-    // Commit ref: list immutable snapshot.
-    auto cit = commits_.find(ref);
-    if (cit == commits_.end()) {
-      return absl::NotFoundError(absl::StrCat("ref not found: ", ref));
-    }
-    state = cit->second.objects;
+  auto state_or = ResolveRefState(ref);
+  if (!state_or.ok()) {
+    return state_or.status();
   }
 
   std::vector<std::string> result;
-  for (const auto& [path, _] : state) {
+  for (const auto& [path, _] : *state_or) {
     if (path.starts_with(prefix)) {
       result.push_back(path);
     }

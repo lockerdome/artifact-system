@@ -53,6 +53,9 @@ private:
   /// Resolve the effective state of a branch (committed + staged).
   std::map<std::string, std::string> ResolveState(const BranchData& branch) const;
 
+  /// Resolve a ref (branch or commit) to an object state snapshot.
+  absl::StatusOr<std::map<std::string, std::string>> ResolveRefState(const std::string& ref) const;
+
   /// Find the best common ancestor of two commits.
   absl::StatusOr<std::string> FindMergeBase(const std::string& commit_a, const std::string& commit_b) const;
 
