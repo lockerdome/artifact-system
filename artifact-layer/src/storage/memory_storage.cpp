@@ -190,9 +190,6 @@ absl::StatusOr<std::string> MemoryStorage::CreateBranch(const std::string& name,
   if (IsReservedCommitIdName(name)) {
     return absl::InvalidArgumentError(absl::StrCat("branch name is reserved: ", name));
   }
-  if (commits_.contains(name)) {
-    return absl::AlreadyExistsError(absl::StrCat("branch name collides with commit id: ", name));
-  }
 
   std::string base = base_commit_id;
   if (base.empty()) {
