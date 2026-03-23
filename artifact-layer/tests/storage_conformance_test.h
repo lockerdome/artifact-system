@@ -339,7 +339,24 @@ TYPED_TEST_P(StorageConformanceTest, ListObjectsWithPrefix) {
   EXPECT_TRUE(std::is_sorted(all->begin(), all->end()));
 }
 
-// 23. Staged puts are visible via GetObject before commit.
+// 23. ListObjects accepts a commit ref and does not include branch staging.
+TYPED_TEST_P(StorageConformanceTest, ListObjectsOnCommitRef) {
+  const std::string canonical = this->Storage().GetCanonicalBranch();
+  ASSERT_TRUE(this->Storage().PutObject(canonical, "dir/a.txt", "a").ok());
+  ASSERT_TRUE(this->Storage().PutObject(canonical, "dir/b.txt", "b").ok());
+  auto commit_ref = this->Storage().Commit(canonical, "seed commit");
+  ASSERT_TRUE(commit_ref.ok()) << commit_ref.status();
+
+  ASSERT_TRUE(this->Storage().PutObject(canonical, "dir/staged.txt", "staged").ok());
+
+  auto list = this->Storage().ListObjects(*commit_ref, "dir/");
+  ASSERT_TRUE(list.ok()) << list.status();
+  ASSERT_EQ(list->size(), 2u);
+  EXPECT_EQ((*list)[0], "dir/a.txt");
+  EXPECT_EQ((*list)[1], "dir/b.txt");
+}
+
+// 24. Staged puts are visible via GetObject before commit.
 TYPED_TEST_P(StorageConformanceTest, StagedChangesVisibleInGet) {
   const std::string canonical = this->Storage().GetCanonicalBranch();
   ASSERT_TRUE(this->Storage().PutObject(canonical, "staged.txt", "staged-data").ok());
@@ -349,7 +366,7 @@ TYPED_TEST_P(StorageConformanceTest, StagedChangesVisibleInGet) {
   EXPECT_EQ(*data, "staged-data");
 }
 
-// 24. Committed object hidden by staged delete.
+// 25. Committed object hidden by staged delete.
 TYPED_TEST_P(StorageConformanceTest, StagedDeleteHidesCommitted) {
   const std::string canonical = this->Storage().GetCanonicalBranch();
   this->PutAndCommit(canonical, "visible.txt", "data");
@@ -368,7 +385,7 @@ TYPED_TEST_P(StorageConformanceTest, StagedDeleteHidesCommitted) {
   EXPECT_EQ(after.status().code(), absl::StatusCode::kNotFound);
 }
 
-// 25. PutObject on nonexistent branch returns NOT_FOUND.
+// 26. PutObject on nonexistent branch returns NOT_FOUND.
 TYPED_TEST_P(StorageConformanceTest, PutOnNonexistentBranch) {
   auto result = this->Storage().PutObject("ghost-branch", "file.txt", "data");
   ASSERT_FALSE(result.ok());
@@ -379,7 +396,7 @@ TYPED_TEST_P(StorageConformanceTest, PutOnNonexistentBranch) {
 // Commit
 // ===========================================================================
 
-// 26. Commit advances the branch head.
+// 27. Commit advances the branch head.
 TYPED_TEST_P(StorageConformanceTest, CommitCreatesNewHead) {
   const std::string canonical = this->Storage().GetCanonicalBranch();
   auto old_head = this->Storage().GetBranchHead(canonical);
@@ -395,7 +412,7 @@ TYPED_TEST_P(StorageConformanceTest, CommitCreatesNewHead) {
   EXPECT_EQ(*new_head, *commit);
 }
 
-// 27. After commit, staging is clear — putting again and getting shows
+// 28. After commit, staging is clear — putting again and getting shows
 //     no leftover staged data.
 TYPED_TEST_P(StorageConformanceTest, CommitClearsStaging) {
   const std::string canonical = this->Storage().GetCanonicalBranch();
@@ -408,7 +425,7 @@ TYPED_TEST_P(StorageConformanceTest, CommitClearsStaging) {
   EXPECT_EQ(*data, "updated");
 }
 
-// 28. Commit with no staged changes succeeds (empty commit).
+// 29. Commit with no staged changes succeeds (empty commit).
 TYPED_TEST_P(StorageConformanceTest, EmptyCommit) {
   const std::string canonical = this->Storage().GetCanonicalBranch();
   auto commit = this->Storage().Commit(canonical, "empty");
@@ -416,7 +433,7 @@ TYPED_TEST_P(StorageConformanceTest, EmptyCommit) {
   EXPECT_FALSE(commit->empty());
 }
 
-// 29. Commit object on branch, create new branch from that commit,
+// 30. Commit object on branch, create new branch from that commit,
 //     verify object exists there.
 TYPED_TEST_P(StorageConformanceTest, CommitPreservesObjects) {
   const std::string canonical = this->Storage().GetCanonicalBranch();
@@ -430,7 +447,7 @@ TYPED_TEST_P(StorageConformanceTest, CommitPreservesObjects) {
   EXPECT_EQ(*data, "keep-me");
 }
 
-// 30. Commit on nonexistent branch returns NOT_FOUND.
+// 31. Commit on nonexistent branch returns NOT_FOUND.
 TYPED_TEST_P(StorageConformanceTest, CommitOnNonexistentBranch) {
   auto commit = this->Storage().Commit("no-branch", "msg");
   ASSERT_FALSE(commit.ok());
@@ -441,7 +458,7 @@ TYPED_TEST_P(StorageConformanceTest, CommitOnNonexistentBranch) {
 // Merge — No Conflict
 // ===========================================================================
 
-// 31. Create branch from canonical, add objects, commit.
+// 32. Create branch from canonical, add objects, commit.
 //     Merge branch into canonical. Canonical now has the objects.
 TYPED_TEST_P(StorageConformanceTest, MergeNoConflict) {
   const std::string canonical = this->Storage().GetCanonicalBranch();
@@ -458,7 +475,7 @@ TYPED_TEST_P(StorageConformanceTest, MergeNoConflict) {
   EXPECT_EQ(*data, "feature-data");
 }
 
-// 32. Both branches add different paths. Merge succeeds with all objects.
+// 33. Both branches add different paths. Merge succeeds with all objects.
 TYPED_TEST_P(StorageConformanceTest, MergeNoConflictBothSidesAddDifferentPaths) {
   const std::string canonical = this->Storage().GetCanonicalBranch();
   ASSERT_TRUE(this->Storage().CreateBranch("b1", "").ok());
@@ -479,7 +496,7 @@ TYPED_TEST_P(StorageConformanceTest, MergeNoConflictBothSidesAddDifferentPaths) 
   EXPECT_EQ(*d2, "b1-data");
 }
 
-// 33. Both branches make identical changes. Merge succeeds.
+// 34. Both branches make identical changes. Merge succeeds.
 TYPED_TEST_P(StorageConformanceTest, MergeIdenticalChanges) {
   const std::string canonical = this->Storage().GetCanonicalBranch();
   ASSERT_TRUE(this->Storage().CreateBranch("ident", "").ok());
@@ -496,7 +513,7 @@ TYPED_TEST_P(StorageConformanceTest, MergeIdenticalChanges) {
   EXPECT_EQ(*data, "same-value");
 }
 
-// 34. One branch deletes a path, other doesn't touch it. Merge succeeds
+// 35. One branch deletes a path, other doesn't touch it. Merge succeeds
 //     with path deleted.
 TYPED_TEST_P(StorageConformanceTest, MergeDeletionOnOneSide) {
   const std::string canonical = this->Storage().GetCanonicalBranch();
@@ -517,7 +534,7 @@ TYPED_TEST_P(StorageConformanceTest, MergeDeletionOnOneSide) {
   EXPECT_FALSE(*exists);
 }
 
-// 35. Merge when source and target share the same head (no-op).
+// 36. Merge when source and target share the same head (no-op).
 TYPED_TEST_P(StorageConformanceTest, MergeSourceAndTargetSameCommit) {
   const std::string canonical = this->Storage().GetCanonicalBranch();
   ASSERT_TRUE(this->Storage().CreateBranch("same-head", "").ok());
@@ -528,11 +545,29 @@ TYPED_TEST_P(StorageConformanceTest, MergeSourceAndTargetSameCommit) {
   ASSERT_TRUE(merge->IsSuccess());
 }
 
+// 37. Successful merge result commit ID equals target branch head after merge.
+TYPED_TEST_P(StorageConformanceTest, MergeSuccessAdvancesTargetToResultCommit) {
+  const std::string canonical = this->Storage().GetCanonicalBranch();
+  ASSERT_TRUE(this->Storage().CreateBranch("merge-success", "").ok());
+  this->PutAndCommit("merge-success", "feature.txt", "feature-data");
+
+  auto merge = this->Storage().Merge("merge-success", canonical);
+  ASSERT_TRUE(merge.ok()) << merge.status();
+  ASSERT_TRUE(merge->IsSuccess());
+
+  const std::string merge_commit_id = merge->GetSuccess().commit_id;
+  EXPECT_FALSE(merge_commit_id.empty());
+
+  auto target_head = this->Storage().GetBranchHead(canonical);
+  ASSERT_TRUE(target_head.ok()) << target_head.status();
+  EXPECT_EQ(*target_head, merge_commit_id);
+}
+
 // ===========================================================================
 // Merge — Conflict
 // ===========================================================================
 
-// 36. Both branches modify the same path differently. Conflict.
+// 38. Both branches modify the same path differently. Conflict.
 TYPED_TEST_P(StorageConformanceTest, MergeConflict) {
   const std::string canonical = this->Storage().GetCanonicalBranch();
   this->PutAndCommit(canonical, "shared.txt", "base");
@@ -551,7 +586,7 @@ TYPED_TEST_P(StorageConformanceTest, MergeConflict) {
   EXPECT_EQ(conflict.conflicting_paths[0], "shared.txt");
 }
 
-// 37. One branch deletes, other modifies. Conflict.
+// 39. One branch deletes, other modifies. Conflict.
 TYPED_TEST_P(StorageConformanceTest, MergeConflictOneDeleteOneModify) {
   const std::string canonical = this->Storage().GetCanonicalBranch();
   this->PutAndCommit(canonical, "clash.txt", "original");
@@ -574,7 +609,7 @@ TYPED_TEST_P(StorageConformanceTest, MergeConflictOneDeleteOneModify) {
   EXPECT_EQ(conflict.conflicting_paths[0], "clash.txt");
 }
 
-// 38. Multiple conflicting paths returned in sorted order.
+// 40. Multiple conflicting paths returned in sorted order.
 TYPED_TEST_P(StorageConformanceTest, MergeConflictMultiplePaths) {
   const std::string canonical = this->Storage().GetCanonicalBranch();
   // Create base state with two files.
@@ -604,7 +639,7 @@ TYPED_TEST_P(StorageConformanceTest, MergeConflictMultiplePaths) {
   EXPECT_EQ(conflict.conflicting_paths[1], "z.txt");
 }
 
-// 39. Conflict result includes correct commit IDs.
+// 41. Conflict result includes correct commit IDs.
 TYPED_TEST_P(StorageConformanceTest, MergeConflictIncludesBaseAndHeadCommits) {
   const std::string canonical = this->Storage().GetCanonicalBranch();
   std::string base_cid = this->PutAndCommit(canonical, "info.txt", "base");
@@ -624,11 +659,60 @@ TYPED_TEST_P(StorageConformanceTest, MergeConflictIncludesBaseAndHeadCommits) {
   EXPECT_EQ(conflict.target_commit_id, canon_cid);
 }
 
+// 42. Conflict merge does not advance target branch head.
+TYPED_TEST_P(StorageConformanceTest, MergeConflictDoesNotAdvanceTargetHead) {
+  const std::string canonical = this->Storage().GetCanonicalBranch();
+  this->PutAndCommit(canonical, "shared-head.txt", "base");
+  ASSERT_TRUE(this->Storage().CreateBranch("conflict-head", "").ok());
+
+  this->PutAndCommit(canonical, "shared-head.txt", "canon-edit");
+  this->PutAndCommit("conflict-head", "shared-head.txt", "branch-edit");
+
+  auto src_head_before = this->Storage().GetBranchHead("conflict-head");
+  ASSERT_TRUE(src_head_before.ok()) << src_head_before.status();
+  auto target_head_before = this->Storage().GetBranchHead(canonical);
+  ASSERT_TRUE(target_head_before.ok()) << target_head_before.status();
+
+  auto merge = this->Storage().Merge("conflict-head", canonical);
+  ASSERT_TRUE(merge.ok()) << merge.status();
+  ASSERT_TRUE(merge->IsConflict());
+
+  auto src_head_after = this->Storage().GetBranchHead("conflict-head");
+  ASSERT_TRUE(src_head_after.ok()) << src_head_after.status();
+  auto target_head_after = this->Storage().GetBranchHead(canonical);
+  ASSERT_TRUE(target_head_after.ok()) << target_head_after.status();
+
+  EXPECT_EQ(*src_head_after, *src_head_before);
+  EXPECT_EQ(*target_head_after, *target_head_before);
+}
+
+// 43. Conflict merge does not change target branch object state.
+TYPED_TEST_P(StorageConformanceTest, MergeConflictDoesNotChangeTargetObjects) {
+  const std::string canonical = this->Storage().GetCanonicalBranch();
+  this->PutAndCommit(canonical, "state.txt", "base");
+  ASSERT_TRUE(this->Storage().CreateBranch("conflict-state", "").ok());
+
+  this->PutAndCommit(canonical, "state.txt", "canon-edit");
+  this->PutAndCommit("conflict-state", "state.txt", "branch-edit");
+
+  auto before = this->Storage().GetObject(canonical, "state.txt");
+  ASSERT_TRUE(before.ok()) << before.status();
+  EXPECT_EQ(*before, "canon-edit");
+
+  auto merge = this->Storage().Merge("conflict-state", canonical);
+  ASSERT_TRUE(merge.ok()) << merge.status();
+  ASSERT_TRUE(merge->IsConflict());
+
+  auto after = this->Storage().GetObject(canonical, "state.txt");
+  ASSERT_TRUE(after.ok()) << after.status();
+  EXPECT_EQ(*after, "canon-edit");
+}
+
 // ===========================================================================
 // Merge — Preconditions
 // ===========================================================================
 
-// 40. Merge fails with FAILED_PRECONDITION if source has uncommitted changes.
+// 44. Merge fails with FAILED_PRECONDITION if source has uncommitted changes.
 TYPED_TEST_P(StorageConformanceTest, MergeWithUncommittedChangesSource) {
   const std::string canonical = this->Storage().GetCanonicalBranch();
   ASSERT_TRUE(this->Storage().CreateBranch("dirty-src", "").ok());
@@ -640,7 +724,7 @@ TYPED_TEST_P(StorageConformanceTest, MergeWithUncommittedChangesSource) {
   EXPECT_EQ(merge.status().code(), absl::StatusCode::kFailedPrecondition);
 }
 
-// 41. Merge fails with FAILED_PRECONDITION if target has uncommitted changes.
+// 45. Merge fails with FAILED_PRECONDITION if target has uncommitted changes.
 TYPED_TEST_P(StorageConformanceTest, MergeWithUncommittedChangesTarget) {
   const std::string canonical = this->Storage().GetCanonicalBranch();
   ASSERT_TRUE(this->Storage().CreateBranch("clean-src", "").ok());
@@ -653,7 +737,7 @@ TYPED_TEST_P(StorageConformanceTest, MergeWithUncommittedChangesTarget) {
   EXPECT_EQ(merge.status().code(), absl::StatusCode::kFailedPrecondition);
 }
 
-// 42. Merge from nonexistent source returns NOT_FOUND.
+// 46. Merge from nonexistent source returns NOT_FOUND.
 TYPED_TEST_P(StorageConformanceTest, MergeNonexistentSourceBranch) {
   const std::string canonical = this->Storage().GetCanonicalBranch();
   auto merge = this->Storage().Merge("ghost", canonical);
@@ -661,7 +745,7 @@ TYPED_TEST_P(StorageConformanceTest, MergeNonexistentSourceBranch) {
   EXPECT_EQ(merge.status().code(), absl::StatusCode::kNotFound);
 }
 
-// 43. Merge into nonexistent target returns NOT_FOUND.
+// 47. Merge into nonexistent target returns NOT_FOUND.
 TYPED_TEST_P(StorageConformanceTest, MergeNonexistentTargetBranch) {
   const std::string canonical = this->Storage().GetCanonicalBranch();
   auto merge = this->Storage().Merge(canonical, "phantom");
@@ -669,7 +753,7 @@ TYPED_TEST_P(StorageConformanceTest, MergeNonexistentTargetBranch) {
   EXPECT_EQ(merge.status().code(), absl::StatusCode::kNotFound);
 }
 
-// 44. Merging a branch into itself returns INVALID_ARGUMENT.
+// 48. Merging a branch into itself returns INVALID_ARGUMENT.
 TYPED_TEST_P(StorageConformanceTest, MergeSameSourceAndTargetBranch) {
   const std::string canonical = this->Storage().GetCanonicalBranch();
   auto merge = this->Storage().Merge(canonical, canonical);
@@ -681,7 +765,7 @@ TYPED_TEST_P(StorageConformanceTest, MergeSameSourceAndTargetBranch) {
 // Merge — Complex
 // ===========================================================================
 
-// 45. Chained branches: A from canonical, B from A. Merge B → canonical.
+// 49. Chained branches: A from canonical, B from A. Merge B → canonical.
 TYPED_TEST_P(StorageConformanceTest, MergeChainedBranches) {
   const std::string canonical = this->Storage().GetCanonicalBranch();
   ASSERT_TRUE(this->Storage().CreateBranch("chain-A", "").ok());
@@ -705,7 +789,7 @@ TYPED_TEST_P(StorageConformanceTest, MergeChainedBranches) {
   EXPECT_EQ(*b_data, "from-B");
 }
 
-// 45. Merge two branches sequentially into canonical.
+// 50. Merge two branches sequentially into canonical.
 TYPED_TEST_P(StorageConformanceTest, MergeTwoBranchesSequentially) {
   const std::string canonical = this->Storage().GetCanonicalBranch();
   ASSERT_TRUE(this->Storage().CreateBranch("seq-1", "").ok());
@@ -731,7 +815,7 @@ TYPED_TEST_P(StorageConformanceTest, MergeTwoBranchesSequentially) {
   EXPECT_EQ(*d2, "seq2-data");
 }
 
-// 46. Diamond history: A and B branch from canonical. Merge A into canonical.
+// 51. Diamond history: A and B branch from canonical. Merge A into canonical.
 //     Then merge B into canonical (merge base is original canonical head).
 TYPED_TEST_P(StorageConformanceTest, MergeWithDiamondHistory) {
   const std::string canonical = this->Storage().GetCanonicalBranch();
@@ -769,7 +853,7 @@ TYPED_TEST_P(StorageConformanceTest, MergeWithDiamondHistory) {
 // Cross-cutting
 // ===========================================================================
 
-// 47. Changes on one branch are not visible on another until merge.
+// 52. Changes on one branch are not visible on another until merge.
 TYPED_TEST_P(StorageConformanceTest, BranchIsolation) {
   const std::string canonical = this->Storage().GetCanonicalBranch();
   ASSERT_TRUE(this->Storage().CreateBranch("isolated", "").ok());
@@ -786,7 +870,7 @@ TYPED_TEST_P(StorageConformanceTest, BranchIsolation) {
   EXPECT_EQ(get.status().code(), absl::StatusCode::kNotFound);
 }
 
-// 48. After committing, the commit's objects don't change when the branch
+// 53. After committing, the commit's objects don't change when the branch
 //     advances.
 TYPED_TEST_P(StorageConformanceTest, CommitImmutability) {
   const std::string canonical = this->Storage().GetCanonicalBranch();
@@ -806,11 +890,27 @@ TYPED_TEST_P(StorageConformanceTest, CommitImmutability) {
   EXPECT_EQ(*cur_data, "v2");
 }
 
+// 54. Commit refs ignore branch staging done after the commit.
+TYPED_TEST_P(StorageConformanceTest, CommitRefIgnoresBranchStaging) {
+  const std::string canonical = this->Storage().GetCanonicalBranch();
+  std::string commit_ref = this->PutAndCommit(canonical, "staging-immune.txt", "v1");
+
+  ASSERT_TRUE(this->Storage().PutObject(canonical, "staging-immune.txt", "staged-v2").ok());
+
+  auto commit_data = this->Storage().GetObject(commit_ref, "staging-immune.txt");
+  ASSERT_TRUE(commit_data.ok()) << commit_data.status();
+  EXPECT_EQ(*commit_data, "v1");
+
+  auto branch_data = this->Storage().GetObject(canonical, "staging-immune.txt");
+  ASSERT_TRUE(branch_data.ok()) << branch_data.status();
+  EXPECT_EQ(*branch_data, "staged-v2");
+}
+
 // ===========================================================================
 // Additional edge cases (from review)
 // ===========================================================================
 
-// 49. ListObjects sees staged (uncommitted) objects.
+// 55. ListObjects sees staged (uncommitted) objects.
 TYPED_TEST_P(StorageConformanceTest, ListObjectsIncludesStaged) {
   const std::string canonical = this->Storage().GetCanonicalBranch();
   ASSERT_TRUE(this->Storage().PutObject(canonical, "staged/a.txt", "a").ok());
@@ -823,7 +923,7 @@ TYPED_TEST_P(StorageConformanceTest, ListObjectsIncludesStaged) {
   EXPECT_EQ((*list)[1], "staged/b.txt");
 }
 
-// 50. ListObjects excludes tombstoned objects.
+// 56. ListObjects excludes tombstoned objects.
 TYPED_TEST_P(StorageConformanceTest, ListObjectsExcludesTombstoned) {
   const std::string canonical = this->Storage().GetCanonicalBranch();
   this->PutAndCommit(canonical, "alive.txt", "data");
@@ -838,35 +938,35 @@ TYPED_TEST_P(StorageConformanceTest, ListObjectsExcludesTombstoned) {
   EXPECT_EQ((*list)[0], "alive.txt");
 }
 
-// 51. DeleteObject on nonexistent branch returns NOT_FOUND.
+// 57. DeleteObject on nonexistent branch returns NOT_FOUND.
 TYPED_TEST_P(StorageConformanceTest, DeleteObjectOnNonexistentBranch) {
   auto result = this->Storage().DeleteObject("ghost-branch", "file.txt");
   ASSERT_FALSE(result.ok());
   EXPECT_EQ(result.code(), absl::StatusCode::kNotFound);
 }
 
-// 52. GetObject on nonexistent branch returns NOT_FOUND.
+// 58. GetObject on nonexistent branch returns NOT_FOUND.
 TYPED_TEST_P(StorageConformanceTest, GetObjectOnNonexistentBranch) {
   auto result = this->Storage().GetObject("ghost-branch", "file.txt");
   ASSERT_FALSE(result.ok());
   EXPECT_EQ(result.status().code(), absl::StatusCode::kNotFound);
 }
 
-// 53. ObjectExists on nonexistent branch returns NOT_FOUND.
+// 59. ObjectExists on nonexistent branch returns NOT_FOUND.
 TYPED_TEST_P(StorageConformanceTest, ObjectExistsOnNonexistentBranch) {
   auto result = this->Storage().ObjectExists("ghost-branch", "file.txt");
   ASSERT_FALSE(result.ok());
   EXPECT_EQ(result.status().code(), absl::StatusCode::kNotFound);
 }
 
-// 54. ListObjects on nonexistent branch returns NOT_FOUND.
+// 60. ListObjects on nonexistent branch returns NOT_FOUND.
 TYPED_TEST_P(StorageConformanceTest, ListObjectsOnNonexistentBranch) {
   auto result = this->Storage().ListObjects("ghost-branch", "");
   ASSERT_FALSE(result.ok());
   EXPECT_EQ(result.status().code(), absl::StatusCode::kNotFound);
 }
 
-// 55. Merge does not advance source branch head.
+// 61. Merge does not advance source branch head.
 TYPED_TEST_P(StorageConformanceTest, MergeDoesNotAdvanceSourceHead) {
   const std::string canonical = this->Storage().GetCanonicalBranch();
   ASSERT_TRUE(this->Storage().CreateBranch("src-branch", "").ok());
@@ -896,9 +996,9 @@ REGISTER_TYPED_TEST_SUITE_P(StorageConformanceTest,
                             // Object I/O
                             PutAndGetObject, PutOverwrite, GetNonexistentObject, DeleteObject, DeleteObjectTombstone, ObjectExists, ObjectExistsWithTombstone,
                             ObjectExistsOnCommitRef, ObjectExistsOnNonexistentRef, GetObjectOnCommitRef, GetObjectOnNonexistentRef, ListObjectsEmpty,
-                            ListObjectsWithPrefix, StagedChangesVisibleInGet, StagedDeleteHidesCommitted, PutOnNonexistentBranch, ListObjectsIncludesStaged,
-                            ListObjectsExcludesTombstoned, DeleteObjectOnNonexistentBranch, GetObjectOnNonexistentBranch, ObjectExistsOnNonexistentBranch,
-                            ListObjectsOnNonexistentBranch,
+                            ListObjectsOnCommitRef, ListObjectsWithPrefix, StagedChangesVisibleInGet, StagedDeleteHidesCommitted, PutOnNonexistentBranch,
+                            ListObjectsIncludesStaged, ListObjectsExcludesTombstoned, DeleteObjectOnNonexistentBranch, GetObjectOnNonexistentBranch,
+                            ObjectExistsOnNonexistentBranch, ListObjectsOnNonexistentBranch,
                             // Commit
                             CommitCreatesNewHead, CommitClearsStaging, EmptyCommit, CommitPreservesObjects, CommitOnNonexistentBranch,
                             // Merge — No Conflict
@@ -906,14 +1006,15 @@ REGISTER_TYPED_TEST_SUITE_P(StorageConformanceTest,
                             MergeSourceAndTargetSameCommit,
                             // Merge — Conflict
                             MergeConflict, MergeConflictOneDeleteOneModify, MergeConflictMultiplePaths, MergeConflictIncludesBaseAndHeadCommits,
+                            MergeConflictDoesNotAdvanceTargetHead, MergeConflictDoesNotChangeTargetObjects,
                             // Merge — Preconditions
                             MergeWithUncommittedChangesSource, MergeWithUncommittedChangesTarget, MergeNonexistentSourceBranch, MergeNonexistentTargetBranch,
                             MergeSameSourceAndTargetBranch,
                             // Merge — Complex
                             MergeChainedBranches, MergeTwoBranchesSequentially, MergeWithDiamondHistory,
                             // Merge — Additional
-                            MergeDoesNotAdvanceSourceHead,
+                            MergeDoesNotAdvanceSourceHead, MergeSuccessAdvancesTargetToResultCommit,
                             // Cross-cutting
-                            BranchIsolation, CommitImmutability);
+                            BranchIsolation, CommitImmutability, CommitRefIgnoresBranchStaging);
 
 } // namespace artifact_system::testing
