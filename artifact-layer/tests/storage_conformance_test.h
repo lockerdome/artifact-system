@@ -144,21 +144,29 @@ TYPED_TEST_P(StorageConformanceTest, CreateBranchFromNonexistentCommit) {
 }
 
 // 10. Creating branch with a name that matches an existing commit ID returns
-//     ALREADY_EXISTS to prevent ambiguous refs.
+//     INVALID_ARGUMENT because commit-id namespace is reserved.
 TYPED_TEST_P(StorageConformanceTest, CreateBranchNameCollidesWithCommitId) {
   const std::string canonical = this->Storage().GetCanonicalBranch();
   std::string commit_id = this->PutAndCommit(canonical, "collision.txt", "data");
 
   auto branch = this->Storage().CreateBranch(commit_id, "");
   ASSERT_FALSE(branch.ok());
-  EXPECT_EQ(branch.status().code(), absl::StatusCode::kAlreadyExists);
+  EXPECT_EQ(branch.status().code(), absl::StatusCode::kInvalidArgument);
+}
+
+// 11. Creating a branch in the reserved commit-id namespace returns
+//     INVALID_ARGUMENT even if no commit with that id exists yet.
+TYPED_TEST_P(StorageConformanceTest, CreateBranchReservedCommitIdNamespace) {
+  auto branch = this->Storage().CreateBranch("commit-999", "");
+  ASSERT_FALSE(branch.ok());
+  EXPECT_EQ(branch.status().code(), absl::StatusCode::kInvalidArgument);
 }
 
 // ===========================================================================
 // Object I/O
 // ===========================================================================
 
-// 11. Put an object, get it back. Verify data matches.
+// 12. Put an object, get it back. Verify data matches.
 TYPED_TEST_P(StorageConformanceTest, PutAndGetObject) {
   const std::string canonical = this->Storage().GetCanonicalBranch();
   ASSERT_TRUE(this->Storage().PutObject(canonical, "hello.txt", "world").ok());
@@ -884,7 +892,7 @@ REGISTER_TYPED_TEST_SUITE_P(StorageConformanceTest,
                             // Branch CRUD
                             CanonicalBranchExists, CreateBranchFromCanonical, CreateBranchFromCommit, CreateBranchDuplicate, DeleteBranch,
                             DeleteCanonicalBranch, DeleteNonexistentBranch, GetBranchHeadNonexistent, CreateBranchFromNonexistentCommit,
-                            CreateBranchNameCollidesWithCommitId,
+                            CreateBranchNameCollidesWithCommitId, CreateBranchReservedCommitIdNamespace,
                             // Object I/O
                             PutAndGetObject, PutOverwrite, GetNonexistentObject, DeleteObject, DeleteObjectTombstone, ObjectExists, ObjectExistsWithTombstone,
                             ObjectExistsOnCommitRef, ObjectExistsOnNonexistentRef, GetObjectOnCommitRef, GetObjectOnNonexistentRef, ListObjectsEmpty,

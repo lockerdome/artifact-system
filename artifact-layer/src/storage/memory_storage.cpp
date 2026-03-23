@@ -1,6 +1,7 @@
 #include "storage/memory_storage.h"
 
 #include <algorithm>
+#include <cctype>
 #include <deque>
 #include <limits>
 #include <set>
@@ -12,6 +13,26 @@
 #include "absl/strings/str_cat.h"
 
 namespace artifact_system {
+
+namespace {
+
+bool IsReservedCommitIdName(const std::string& name) {
+  constexpr std::string_view kPrefix = "commit-";
+  if (!name.starts_with(kPrefix)) {
+    return false;
+  }
+  if (name.size() == kPrefix.size()) {
+    return false;
+  }
+  for (size_t i = kPrefix.size(); i < name.size(); ++i) {
+    if (!std::isdigit(static_cast<unsigned char>(name[i]))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+} // namespace
 
 // ---------------------------------------------------------------------------
 // Construction
@@ -165,6 +186,9 @@ absl::StatusOr<std::string> MemoryStorage::FindMergeBase(const std::string& comm
 absl::StatusOr<std::string> MemoryStorage::CreateBranch(const std::string& name, const std::string& base_commit_id) {
   if (branches_.contains(name)) {
     return absl::AlreadyExistsError(absl::StrCat("branch already exists: ", name));
+  }
+  if (IsReservedCommitIdName(name)) {
+    return absl::InvalidArgumentError(absl::StrCat("branch name is reserved: ", name));
   }
   if (commits_.contains(name)) {
     return absl::AlreadyExistsError(absl::StrCat("branch name collides with commit id: ", name));
