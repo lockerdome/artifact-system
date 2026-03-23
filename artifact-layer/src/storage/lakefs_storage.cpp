@@ -301,6 +301,26 @@ absl::StatusOr<bool> LakeFSStorage::CommitExists(const std::string& commit_id) {
   return HttpStatusToAbsl(resp.status_code, resp.body, "CommitExists");
 }
 
+absl::StatusOr<bool> LakeFSStorage::ResolveRefKind(const std::string& ref) {
+  auto branch_exists = BranchExists(ref);
+  if (!branch_exists.ok()) {
+    return branch_exists.status();
+  }
+  if (*branch_exists) {
+    return true;
+  }
+
+  auto commit_exists = CommitExists(ref);
+  if (!commit_exists.ok()) {
+    return commit_exists.status();
+  }
+  if (*commit_exists) {
+    return false;
+  }
+
+  return absl::NotFoundError(absl::StrCat("ref not found: ", ref));
+}
+
 absl::StatusOr<bool> LakeFSStorage::HasUncommittedChanges(const std::string& branch) {
   auto encoded_branch = UrlEncode(branch);
   auto api_path = absl::StrCat("/repositories/", UrlEncode(config_.repository), "/branches/", encoded_branch, "/diff?amount=1");
@@ -537,16 +557,13 @@ absl::Status LakeFSStorage::PutObject(const std::string& branch, const std::stri
   return HttpStatusToAbsl(resp.status_code, resp.body, "PutObject");
 }
 
-absl::StatusOr<std::string> LakeFSStorage::GetObject(const std::string& branch, const std::string& path) {
-  auto branch_exists = BranchExists(branch);
-  if (!branch_exists.ok()) {
-    return branch_exists.status();
-  }
-  if (!*branch_exists) {
-    return absl::NotFoundError(absl::StrCat("branch not found: ", branch));
+absl::StatusOr<std::string> LakeFSStorage::GetObject(const std::string& ref, const std::string& path) {
+  auto ref_kind = ResolveRefKind(ref);
+  if (!ref_kind.ok()) {
+    return ref_kind.status();
   }
 
-  auto api_path = absl::StrCat("/repositories/", UrlEncode(config_.repository), "/refs/", UrlEncode(branch), "/objects?path=", UrlEncode(path));
+  auto api_path = absl::StrCat("/repositories/", UrlEncode(config_.repository), "/refs/", UrlEncode(ref), "/objects?path=", UrlEncode(path));
   auto resp = DoRequest("GET", api_path, "", "application/json", "application/octet-stream");
 
   if (resp.status_code == 0) {
@@ -556,33 +573,9 @@ absl::StatusOr<std::string> LakeFSStorage::GetObject(const std::string& branch, 
     return resp.body;
   }
   if (resp.status_code == 404) {
-    return absl::NotFoundError(absl::StrCat("object not found: ", path, " on branch ", branch));
+    return absl::NotFoundError(absl::StrCat("object not found: ", path, " at ref ", ref));
   }
   return HttpStatusToAbsl(resp.status_code, resp.body, "GetObject");
-}
-
-absl::StatusOr<std::string> LakeFSStorage::GetObjectAtCommit(const std::string& commit_id, const std::string& path) {
-  auto commit_exists = CommitExists(commit_id);
-  if (!commit_exists.ok()) {
-    return commit_exists.status();
-  }
-  if (!*commit_exists) {
-    return absl::NotFoundError(absl::StrCat("commit not found: ", commit_id));
-  }
-
-  auto api_path = absl::StrCat("/repositories/", UrlEncode(config_.repository), "/refs/", UrlEncode(commit_id), "/objects?path=", UrlEncode(path));
-  auto resp = DoRequest("GET", api_path, "", "application/json", "application/octet-stream");
-
-  if (resp.status_code == 0) {
-    return absl::UnavailableError(absl::StrCat("GetObjectAtCommit: ", resp.body));
-  }
-  if (resp.status_code == 200) {
-    return resp.body;
-  }
-  if (resp.status_code == 404) {
-    return absl::NotFoundError(absl::StrCat("object not found: ", path, " at commit ", commit_id));
-  }
-  return HttpStatusToAbsl(resp.status_code, resp.body, "GetObjectAtCommit");
 }
 
 absl::Status LakeFSStorage::DeleteObject(const std::string& branch, const std::string& path) {
@@ -613,16 +606,13 @@ absl::Status LakeFSStorage::DeleteObject(const std::string& branch, const std::s
   return HttpStatusToAbsl(resp.status_code, resp.body, "DeleteObject");
 }
 
-absl::StatusOr<bool> LakeFSStorage::ObjectExists(const std::string& branch, const std::string& path) {
-  auto branch_exists = BranchExists(branch);
-  if (!branch_exists.ok()) {
-    return branch_exists.status();
-  }
-  if (!*branch_exists) {
-    return absl::NotFoundError(absl::StrCat("branch not found: ", branch));
+absl::StatusOr<bool> LakeFSStorage::ObjectExists(const std::string& ref, const std::string& path) {
+  auto ref_kind = ResolveRefKind(ref);
+  if (!ref_kind.ok()) {
+    return ref_kind.status();
   }
 
-  auto result = StatObject(branch, path);
+  auto result = StatObject(ref, path);
   if (result.ok()) {
     return true;
   }
@@ -631,33 +621,18 @@ absl::StatusOr<bool> LakeFSStorage::ObjectExists(const std::string& branch, cons
   }
   return result.status();
 }
-
-absl::StatusOr<bool> LakeFSStorage::ObjectExistsAtCommit(const std::string& commit_id, const std::string& path) {
-  auto commit_exists = CommitExists(commit_id);
-  if (!commit_exists.ok()) {
-    return commit_exists.status();
-  }
-  if (!*commit_exists) {
-    return absl::NotFoundError(absl::StrCat("commit not found: ", commit_id));
+absl::StatusOr<std::vector<std::string>> LakeFSStorage::ListObjects(const std::string& ref, const std::string& prefix) {
+  auto ref_kind = ResolveRefKind(ref);
+  if (!ref_kind.ok()) {
+    return ref_kind.status();
   }
 
-  auto result = StatObject(commit_id, path);
-  if (result.ok()) {
-    return true;
-  }
-  if (result.status().code() == absl::StatusCode::kNotFound) {
-    return false;
-  }
-  return result.status();
-}
-
-absl::StatusOr<std::vector<std::string>> LakeFSStorage::ListObjects(const std::string& branch, const std::string& prefix) {
   std::vector<std::string> paths;
   std::string after;
 
   while (true) {
     auto api_path =
-        absl::StrCat("/repositories/", UrlEncode(config_.repository), "/refs/", UrlEncode(branch), "/objects/ls?prefix=", UrlEncode(prefix), "&amount=1000");
+        absl::StrCat("/repositories/", UrlEncode(config_.repository), "/refs/", UrlEncode(ref), "/objects/ls?prefix=", UrlEncode(prefix), "&amount=1000");
     if (!after.empty()) {
       absl::StrAppend(&api_path, "&after=", UrlEncode(after));
     }
@@ -668,7 +643,7 @@ absl::StatusOr<std::vector<std::string>> LakeFSStorage::ListObjects(const std::s
       return absl::UnavailableError(absl::StrCat("ListObjects: ", resp.body));
     }
     if (resp.status_code == 404) {
-      return absl::NotFoundError(absl::StrCat("branch not found: ", branch));
+      return absl::NotFoundError(absl::StrCat("ref not found: ", ref));
     }
     if (resp.status_code != 200) {
       return HttpStatusToAbsl(resp.status_code, resp.body, "ListObjects");

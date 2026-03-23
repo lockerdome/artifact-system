@@ -31,12 +31,10 @@ public:
   // ── Object I/O ─────────────────────────────────────────────────────────
 
   absl::Status PutObject(const std::string& branch, const std::string& path, const std::string& data) override;
-  absl::StatusOr<std::string> GetObject(const std::string& branch, const std::string& path) override;
-  absl::StatusOr<std::string> GetObjectAtCommit(const std::string& commit_id, const std::string& path) override;
+  absl::StatusOr<std::string> GetObject(const std::string& ref, const std::string& path) override;
   absl::Status DeleteObject(const std::string& branch, const std::string& path) override;
-  absl::StatusOr<bool> ObjectExists(const std::string& branch, const std::string& path) override;
-  absl::StatusOr<bool> ObjectExistsAtCommit(const std::string& commit_id, const std::string& path) override;
-  absl::StatusOr<std::vector<std::string>> ListObjects(const std::string& branch, const std::string& prefix) override;
+  absl::StatusOr<bool> ObjectExists(const std::string& ref, const std::string& path) override;
+  absl::StatusOr<std::vector<std::string>> ListObjects(const std::string& ref, const std::string& prefix) override;
 
   // ── Commit and merge ───────────────────────────────────────────────────
 
@@ -77,6 +75,11 @@ private:
 
   /// Check if a commit exists. Returns true if found, false if not.
   absl::StatusOr<bool> CommitExists(const std::string& commit_id);
+
+  /// Validate a ref and classify whether it resolves to a branch.
+  /// Returns true if ref is a branch, false if ref is a commit, or NOT_FOUND
+  /// if no branch/commit matches the ref.
+  absl::StatusOr<bool> ResolveRefKind(const std::string& ref);
 
   /// Check if a ref has uncommitted changes (staging area is non-empty).
   absl::StatusOr<bool> HasUncommittedChanges(const std::string& branch);
