@@ -91,14 +91,18 @@ target_include_directories(artifact_layer_proto PUBLIC "${PROTO_OUT}")
 target_link_libraries(artifact_layer_proto PUBLIC ${_GRPC_GRPCPP} ${_PROTOBUF_LIBPROTOBUF})
 
 # ── Library: artifact_layer_lib (core logic) ──────────────────────────────
-# Placeholder — no source files yet. Header-only for now (id allocator interface).
-add_library(artifact_layer_lib INTERFACE)
-target_include_directories(artifact_layer_lib INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+add_library(artifact_layer_lib
+  src/storage/memory_storage.cpp
+)
+target_include_directories(artifact_layer_lib PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(artifact_layer_lib
-  INTERFACE
+  PUBLIC
     artifact_layer_proto
     ${_GRPC_GRPCPP}
     ${_PROTOBUF_LIBPROTOBUF}
+    absl::status
+    absl::statusor
+    absl::strings
     Threads::Threads
 )
 
