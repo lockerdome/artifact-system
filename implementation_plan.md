@@ -25,7 +25,7 @@ otherwise noted.
 | P1 | Proto Definitions (System + API) | :white_check_mark: Complete |
 | P2a | Storage Layer Abstraction & In-Memory Implementation | :white_check_mark: Complete |
 | P2b | LakeFS Storage Layer Integration | :white_check_mark: Complete |
-| P3 | Path Encoding & Index Key Encoding | :white_large_square: Not started |
+| P3 | Path Encoding & Index Key Encoding | :white_check_mark: Complete |
 | P4 | Index Storage & Three-Way Merge | :white_large_square: Not started |
 | P5 | Transaction & Snapshot Manager | :white_large_square: Not started |
 | P6 | Artifact CRUD Engine | :white_large_square: Not started |
@@ -311,12 +311,12 @@ the contract; P2b validates that LakeFS actually conforms to it.
    - Path length assertions (63 bytes for index paths)
 
 ### Checklist
-- [ ] `src/encoding/base64url.h/.cpp` — URL-safe base64 without padding
-- [ ] `src/encoding/artifact_path.h/.cpp` — artifact and index path generation
-- [ ] `src/encoding/index_key_encoder.h/.cpp` — all PRD key encoding rules
-- [ ] `tests/base64url_test.cpp` — known-answer vectors
-- [ ] `tests/artifact_path_test.cpp` — path format and length assertions
-- [ ] `tests/index_key_encoder_test.cpp` — all types, NaN rejection, -0 normalization, varint validation
+- [x] `src/encoding/base64url.h/.cpp` — URL-safe base64 without padding
+- [x] `src/encoding/artifact_path.h/.cpp` — artifact and index path generation
+- [x] `src/encoding/index_key_encoder.h/.cpp` — all PRD key encoding rules
+- [x] `tests/base64url_test.cpp` — known-answer vectors
+- [x] `tests/artifact_path_test.cpp` — path format and length assertions
+- [x] `tests/index_key_encoder_test.cpp` — all types, NaN rejection, -0 normalization, varint validation
 
 ---
 
