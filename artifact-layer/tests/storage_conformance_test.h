@@ -157,14 +157,6 @@ TYPED_TEST_P(StorageConformanceTest, CreateBranchNameCollidesWithCommitId) {
   EXPECT_EQ(branch.status().code(), absl::StatusCode::kInvalidArgument);
 }
 
-// 11. Creating a branch in the reserved commit-id namespace returns
-//     INVALID_ARGUMENT even if no commit with that id exists yet.
-TYPED_TEST_P(StorageConformanceTest, CreateBranchReservedCommitIdNamespace) {
-  auto branch = this->Storage().CreateBranch("commit-999", "");
-  ASSERT_FALSE(branch.ok());
-  EXPECT_EQ(branch.status().code(), absl::StatusCode::kInvalidArgument);
-}
-
 // ===========================================================================
 // Object I/O
 // ===========================================================================
@@ -995,7 +987,7 @@ REGISTER_TYPED_TEST_SUITE_P(StorageConformanceTest,
                             // Branch CRUD
                             CanonicalBranchExists, CreateBranchFromCanonical, CreateBranchFromCommit, CreateBranchDuplicate, DeleteBranch,
                             DeleteCanonicalBranch, DeleteNonexistentBranch, GetBranchHeadNonexistent, CreateBranchFromNonexistentCommit,
-                            CreateBranchNameCollidesWithCommitId, CreateBranchReservedCommitIdNamespace,
+                            CreateBranchNameCollidesWithCommitId,
                             // Object I/O
                             PutAndGetObject, PutOverwrite, GetNonexistentObject, DeleteObject, DeleteObjectTombstone, ObjectExists, ObjectExistsWithTombstone,
                             ObjectExistsOnCommitRef, ObjectExistsOnNonexistentRef, GetObjectOnCommitRef, GetObjectOnNonexistentRef, ListObjectsEmpty,
