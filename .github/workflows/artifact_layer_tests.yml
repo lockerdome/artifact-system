@@ -29,5 +29,21 @@ jobs:
         run: cmake --preset release
       - name: Build
         run: cmake --build --preset release
-      - name: Test
-        run: ctest --preset release
+      - name: Test (non-LakeFS)
+        run: ctest --preset release -E '^LakeFS/'
+      - name: Start LakeFS
+        run: make lakefs-up
+      - name: Test (LakeFS conformance)
+        env:
+          LAKEFS_ENDPOINT: http://localhost:8000
+          LAKEFS_ACCESS_KEY_ID: AKIAIOSFOLQUICKSTART
+          LAKEFS_SECRET_ACCESS_KEY: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+          LAKEFS_STORAGE_NAMESPACE_PREFIX: local://
+          LAKEFS_CANONICAL_BRANCH: main
+        run: ctest --preset release -R '^LakeFS/'
+      - name: LakeFS logs on failure
+        if: failure()
+        run: docker logs artifact-layer-lakefs || true
+      - name: Stop LakeFS
+        if: always()
+        run: make lakefs-down
