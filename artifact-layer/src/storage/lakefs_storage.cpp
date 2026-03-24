@@ -451,6 +451,24 @@ absl::StatusOr<LakeFSStorage::HttpResponse> LakeFSStorage::StatObject(const std:
 // ---------------------------------------------------------------------------
 
 absl::StatusOr<std::string> LakeFSStorage::CreateBranch(const std::string& name, const std::string& base_commit_id) {
+  // Preserve duplicate branch semantics required by StorageInterface.
+  auto name_is_branch = BranchExists(name);
+  if (!name_is_branch.ok()) {
+    return name_is_branch.status();
+  }
+  if (*name_is_branch) {
+    return absl::AlreadyExistsError(absl::StrCat("branch already exists: ", name));
+  }
+
+  // Guard against ambiguous refs: branch names must not collide with commit IDs.
+  auto name_is_commit = CommitExists(name);
+  if (!name_is_commit.ok()) {
+    return name_is_commit.status();
+  }
+  if (*name_is_commit) {
+    return absl::InvalidArgumentError(absl::StrCat("branch name collides with commit ID: ", name));
+  }
+
   std::string source = base_commit_id;
 
   if (source.empty()) {
@@ -728,6 +746,10 @@ absl::StatusOr<std::string> LakeFSStorage::Commit(const std::string& branch, con
 // ---------------------------------------------------------------------------
 
 absl::StatusOr<MergeResult> LakeFSStorage::Merge(const std::string& source, const std::string& target) {
+  if (source == target) {
+    return absl::InvalidArgumentError(absl::StrCat("source and target branches must differ: ", source));
+  }
+
   // Pre-check: both branches must have no uncommitted changes.
   auto source_uncommitted = HasUncommittedChanges(source);
   if (!source_uncommitted.ok()) {
