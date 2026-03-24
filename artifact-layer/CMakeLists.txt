@@ -92,9 +92,13 @@ target_link_libraries(artifact_layer_proto PUBLIC ${_GRPC_GRPCPP} ${_PROTOBUF_LI
 
 # ── Find system libcurl (used by LakeFS storage client) ───────────────────
 find_package(CURL REQUIRED)
+find_package(OpenSSL REQUIRED)
 
 # ── Library: artifact_layer_lib (core logic) ──────────────────────────────
 add_library(artifact_layer_lib
+  src/encoding/artifact_path.cpp
+  src/encoding/base64url.cpp
+  src/encoding/index_key_encoder.cpp
   src/storage/memory_storage.cpp
   src/storage/lakefs_storage.cpp
 )
@@ -109,6 +113,7 @@ target_link_libraries(artifact_layer_lib
     absl::strings
     Threads::Threads
     CURL::libcurl
+    OpenSSL::Crypto
     nlohmann_json::nlohmann_json
 )
 
