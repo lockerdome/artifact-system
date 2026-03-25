@@ -103,8 +103,6 @@ bool DoRequest(const std::string& method, const std::string& url, const std::str
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, request_body.c_str());
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(request_body.size()));
     headers = curl_slist_append(headers, "Content-Type: application/json");
-  } else if (method == "DELETE") {
-    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
   } else {
     curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method.c_str());
   }
