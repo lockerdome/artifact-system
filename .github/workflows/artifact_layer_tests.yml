@@ -17,7 +17,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build build-essential pkg-config libssl-dev gcc-14 g++-14
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build build-essential pkg-config curl libssl-dev libcurl4-openssl-dev gcc-14 g++-14
       - name: Cache build dependencies
         uses: actions/cache@v4
         with:
@@ -29,5 +29,27 @@ jobs:
         run: cmake --preset release
       - name: Build
         run: cmake --build --preset release
-      - name: Test
-        run: ctest --preset release
+      - name: Test (non-LakeFS)
+        run: ctest --preset release -E '^LakeFS/'
+      - name: Load LakeFS defaults
+        run: |
+          set -a
+          source dev/lakefs-local/defaults.sh
+          set +a
+          {
+            echo "LAKEFS_ENDPOINT=${LAKEFS_ENDPOINT}"
+            echo "LAKEFS_ACCESS_KEY_ID=${LAKEFS_ACCESS_KEY_ID}"
+            echo "LAKEFS_SECRET_ACCESS_KEY=${LAKEFS_SECRET_ACCESS_KEY}"
+            echo "LAKEFS_STORAGE_NAMESPACE_PREFIX=${LAKEFS_STORAGE_NAMESPACE_PREFIX}"
+            echo "LAKEFS_CANONICAL_BRANCH=${LAKEFS_CANONICAL_BRANCH}"
+          } >> "$GITHUB_ENV"
+      - name: Start LakeFS
+        run: make lakefs-up
+      - name: Test (LakeFS conformance)
+        run: ctest --preset release -R '^LakeFS/'
+      - name: LakeFS logs on failure
+        if: failure()
+        run: docker logs artifact-layer-lakefs || true
+      - name: Stop LakeFS
+        if: always()
+        run: make lakefs-down

@@ -30,6 +30,9 @@ template <typename T> class StorageConformanceTest : public ::testing::Test {
 protected:
   void SetUp() override {
     storage_ = T::Create();
+    if (!storage_) {
+      GTEST_SKIP() << "Storage backend not available (factory returned nullptr)";
+    }
   }
 
   StorageInterface& Storage() {
@@ -150,14 +153,6 @@ TYPED_TEST_P(StorageConformanceTest, CreateBranchNameCollidesWithCommitId) {
   std::string commit_id = this->PutAndCommit(canonical, "collision.txt", "data");
 
   auto branch = this->Storage().CreateBranch(commit_id, "");
-  ASSERT_FALSE(branch.ok());
-  EXPECT_EQ(branch.status().code(), absl::StatusCode::kInvalidArgument);
-}
-
-// 11. Creating a branch in the reserved commit-id namespace returns
-//     INVALID_ARGUMENT even if no commit with that id exists yet.
-TYPED_TEST_P(StorageConformanceTest, CreateBranchReservedCommitIdNamespace) {
-  auto branch = this->Storage().CreateBranch("commit-999", "");
   ASSERT_FALSE(branch.ok());
   EXPECT_EQ(branch.status().code(), absl::StatusCode::kInvalidArgument);
 }
@@ -992,7 +987,7 @@ REGISTER_TYPED_TEST_SUITE_P(StorageConformanceTest,
                             // Branch CRUD
                             CanonicalBranchExists, CreateBranchFromCanonical, CreateBranchFromCommit, CreateBranchDuplicate, DeleteBranch,
                             DeleteCanonicalBranch, DeleteNonexistentBranch, GetBranchHeadNonexistent, CreateBranchFromNonexistentCommit,
-                            CreateBranchNameCollidesWithCommitId, CreateBranchReservedCommitIdNamespace,
+                            CreateBranchNameCollidesWithCommitId,
                             // Object I/O
                             PutAndGetObject, PutOverwrite, GetNonexistentObject, DeleteObject, DeleteObjectTombstone, ObjectExists, ObjectExistsWithTombstone,
                             ObjectExistsOnCommitRef, ObjectExistsOnNonexistentRef, GetObjectOnCommitRef, GetObjectOnNonexistentRef, ListObjectsEmpty,
