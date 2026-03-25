@@ -1,4 +1,5 @@
 #include "storage/lakefs_storage.h"
+#include "storage/lakefs_storage_internal.h"
 #include "storage_conformance_test.h"
 
 #include <curl/curl.h>
@@ -221,5 +222,17 @@ struct LakeFSStorageFactory {
 };
 
 INSTANTIATE_TYPED_TEST_SUITE_P(LakeFS, StorageConformanceTest, LakeFSStorageFactory);
+
+TEST(LakeFSStorageInternalTest, DeleteBranchForbiddenMapsCanonicalBranchProtectionToFailedPrecondition) {
+  const absl::Status status = internal::MapDeleteBranchForbidden("{\"message\":\"cannot delete repository default branch\"}");
+
+  EXPECT_EQ(status.code(), absl::StatusCode::kFailedPrecondition);
+}
+
+TEST(LakeFSStorageInternalTest, DeleteBranchForbiddenMapsOtherCasesToPermissionDenied) {
+  const absl::Status status = internal::MapDeleteBranchForbidden("{\"message\":\"forbidden by policy\"}");
+
+  EXPECT_EQ(status.code(), absl::StatusCode::kPermissionDenied);
+}
 
 } // namespace artifact_system::testing

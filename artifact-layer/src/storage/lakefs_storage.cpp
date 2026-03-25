@@ -1,4 +1,5 @@
 #include "storage/lakefs_storage.h"
+#include "storage/lakefs_storage_internal.h"
 
 #include <algorithm>
 #include <mutex>
@@ -73,6 +74,17 @@ absl::Status HttpStatusToAbsl(long code, const std::string& body, const std::str
 }
 
 } // namespace
+
+namespace internal {
+
+absl::Status MapDeleteBranchForbidden(const std::string& response_body) {
+  if (response_body.find("default branch") != std::string::npos || response_body.find("canonical branch") != std::string::npos) {
+    return absl::FailedPreconditionError("cannot delete canonical branch");
+  }
+  return absl::PermissionDeniedError(absl::StrCat("DeleteBranch: forbidden - ", response_body));
+}
+
+} // namespace internal
 
 // ---------------------------------------------------------------------------
 // Construction / Destruction / Move
@@ -518,7 +530,7 @@ absl::Status LakeFSStorage::DeleteBranch(const std::string& branch) {
     return absl::NotFoundError(absl::StrCat("branch not found: ", branch));
   }
   if (resp.status_code == 403) {
-    return absl::FailedPreconditionError("cannot delete canonical branch");
+    return internal::MapDeleteBranchForbidden(resp.body);
   }
   return HttpStatusToAbsl(resp.status_code, resp.body, "DeleteBranch");
 }
