@@ -26,7 +26,7 @@ otherwise noted.
 | P2a | Storage Layer Abstraction & In-Memory Implementation | :white_check_mark: Complete |
 | P2b | LakeFS Storage Layer Integration | :white_check_mark: Complete |
 | P3 | Path Encoding & Index Key Encoding | :white_check_mark: Complete |
-| P4 | Index Storage & Three-Way Merge | :white_large_square: Not started |
+| P4 | Index Storage & Three-Way Merge | :white_check_mark: Complete |
 | P5 | Transaction & Snapshot Manager | :white_large_square: Not started |
 | P6 | Artifact CRUD Engine | :white_large_square: Not started |
 | P7a | Registry Utilities (proto compiler, schema compat) | :white_large_square: Not started |
@@ -366,14 +366,14 @@ descriptors) lives here because index serialization/deserialization depends on t
    - Edge cases: empty indexes, tombstoned indexes (row_count=0)
 
 ### Checklist
-- [ ] `src/index/index_schema_generator.h/.cpp` — generate IndexKey_*/IndexValue_*/Index_* descriptors
-- [ ] `tests/index_schema_generator_test.cpp` — generated schemas match expected layout
-- [ ] `src/index/index_object.h/.cpp` — serialize/deserialize with DynamicMessage, row_count validation
-- [ ] `src/index/index_merge.h/.cpp` — three-way merge (deterministic, idempotent)
-- [ ] `src/index/index_derivation.h/.cpp` — derive entries from artifact payload + descriptor set
-- [ ] `tests/index_object_test.cpp`
-- [ ] `tests/index_merge_test.cpp` — no-conflict, add+add, add+remove, unique conflict
-- [ ] `tests/index_derivation_test.cpp` — all field types, repeated fields, optional presence, NaN rejection
+- [x] `src/index/index_schema_generator.h/.cpp` — generate IndexKey_*/IndexValue_*/Index_* descriptors
+- [x] `tests/index_schema_generator_test.cpp` — generated schemas match expected layout
+- [x] `src/index/index_object.h/.cpp` — serialize/deserialize with DynamicMessage, row_count validation
+- [x] `src/index/index_merge.h/.cpp` — three-way merge (deterministic, idempotent)
+- [x] `src/index/index_derivation.h/.cpp` — derive entries from artifact payload + descriptor set
+- [x] `tests/index_object_test.cpp`
+- [x] `tests/index_merge_test.cpp` — no-conflict, add+add, add+remove, unique conflict
+- [x] `tests/index_derivation_test.cpp` — all field types, repeated fields, optional presence, NaN rejection
 
 ---
 
