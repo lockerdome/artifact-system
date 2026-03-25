@@ -475,17 +475,12 @@ absl::StatusOr<std::string> LakeFSStorage::CreateBranch(const std::string& name,
     // Fork from the canonical branch head.
     source = config_.canonical_branch;
   } else {
-    // Verify the commit exists.
-    auto api_path = absl::StrCat("/repositories/", UrlEncode(config_.repository), "/commits/", UrlEncode(source));
-    auto resp = DoRequest("GET", api_path);
-    if (resp.status_code == 0) {
-      return absl::UnavailableError(absl::StrCat("CreateBranch: ", resp.body));
+    auto source_is_commit = CommitExists(source);
+    if (!source_is_commit.ok()) {
+      return source_is_commit.status();
     }
-    if (resp.status_code == 404) {
+    if (!*source_is_commit) {
       return absl::NotFoundError(absl::StrCat("base commit not found: ", source));
-    }
-    if (resp.status_code != 200) {
-      return HttpStatusToAbsl(resp.status_code, resp.body, "CreateBranch: verify commit");
     }
   }
 
