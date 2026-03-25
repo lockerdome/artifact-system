@@ -99,6 +99,10 @@ add_library(artifact_layer_lib
   src/encoding/artifact_path.cpp
   src/encoding/base64url.cpp
   src/encoding/index_key_encoder.cpp
+  src/index/index_schema_generator.cpp
+  src/index/index_object.cpp
+  src/index/index_merge.cpp
+  src/index/index_derivation.cpp
   src/storage/memory_storage.cpp
   src/storage/lakefs_storage.cpp
 )
