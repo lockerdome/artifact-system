@@ -29,18 +29,8 @@ struct RepoCleanupInfo {
 std::mutex g_cleanup_mutex;
 std::vector<RepoCleanupInfo> g_repos_to_cleanup;
 
-size_t WriteCallback(char* ptr, size_t size, size_t nmemb, void* userdata) {
-  auto* out = static_cast<std::string*>(userdata);
-  out->append(ptr, size * nmemb);
-  return size * nmemb;
-}
-
 bool EnsureCurlGlobalInit() {
-  static std::once_flag init_once;
-  static bool initialized = false;
-
-  std::call_once(init_once, []() { initialized = (curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK); });
-  return initialized;
+  return internal::EnsureCurlGlobalInit().ok();
 }
 
 std::string GetEnvOrEmpty(const char* key) {
@@ -88,7 +78,7 @@ bool DoRequest(const std::string& method, const std::string& url, const std::str
   }
 
   curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, internal::WriteCallback);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, response_body);
   curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 

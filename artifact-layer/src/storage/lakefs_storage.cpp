@@ -19,10 +19,10 @@ namespace artifact_system {
 using json = nlohmann::json;
 
 // ---------------------------------------------------------------------------
-// curl write callback
+// curl helpers
 // ---------------------------------------------------------------------------
 
-namespace {
+namespace internal {
 
 absl::Status EnsureCurlGlobalInit() {
   static std::once_flag init_once;
@@ -42,6 +42,10 @@ size_t WriteCallback(char* ptr, size_t size, size_t nmemb, void* userdata) {
   response_body->append(ptr, total);
   return total;
 }
+
+} // namespace internal
+
+namespace {
 
 /// Map an HTTP status code to an absl::Status for general API errors.
 /// Caller may override for specific endpoints (e.g., 409 on branch create).
@@ -91,7 +95,7 @@ absl::Status MapDeleteBranchForbidden(const std::string& response_body) {
 // ---------------------------------------------------------------------------
 
 LakeFSStorage::LakeFSStorage(LakeFSConfig config) : config_(std::move(config)) {
-  (void)EnsureCurlGlobalInit();
+  (void)internal::EnsureCurlGlobalInit();
 }
 
 LakeFSStorage::~LakeFSStorage() = default;
@@ -126,7 +130,7 @@ LakeFSStorage::HttpResponse LakeFSStorage::DoRequest(const std::string& method, 
                                                      const std::string& content_type, const std::string& accept_type) {
   HttpResponse response;
 
-  auto init_status = EnsureCurlGlobalInit();
+  auto init_status = internal::EnsureCurlGlobalInit();
   if (!init_status.ok()) {
     response.status_code = 0;
     response.body = std::string(init_status.message());
@@ -142,7 +146,7 @@ LakeFSStorage::HttpResponse LakeFSStorage::DoRequest(const std::string& method, 
 
   std::string url = ApiUrl(api_path);
   curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, internal::WriteCallback);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response.body);
   curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 
@@ -202,7 +206,7 @@ LakeFSStorage::HttpResponse LakeFSStorage::DoRequest(const std::string& method, 
 LakeFSStorage::HttpResponse LakeFSStorage::DoUpload(const std::string& api_path, const std::string& data) {
   HttpResponse response;
 
-  auto init_status = EnsureCurlGlobalInit();
+  auto init_status = internal::EnsureCurlGlobalInit();
   if (!init_status.ok()) {
     response.status_code = 0;
     response.body = std::string(init_status.message());
@@ -218,7 +222,7 @@ LakeFSStorage::HttpResponse LakeFSStorage::DoUpload(const std::string& api_path,
 
   std::string url = ApiUrl(api_path);
   curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, internal::WriteCallback);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response.body);
   curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 
