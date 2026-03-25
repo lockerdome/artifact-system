@@ -23,14 +23,7 @@ The script starts:
 It then creates the test repository.
 Each `up` run starts from a clean instance.
 
-Default bootstrap values:
-
-- `LAKEFS_ENDPOINT=http://localhost:8000`
-- `LAKEFS_ACCESS_KEY_ID=AKIAIOSFOLQUICKSTART`
-- `LAKEFS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY`
-- `LAKEFS_REPOSITORY=artifact-layer-it`
-- `LAKEFS_STORAGE_NAMESPACE_PREFIX=local://`
-- `LAKEFS_CANONICAL_BRANCH=main`
+Default bootstrap values are defined in `dev/lakefs-local/defaults.sh`.
 
 You can override those via Make variables, for example:
 

@@ -31,15 +31,21 @@ jobs:
         run: cmake --build --preset release
       - name: Test (non-LakeFS)
         run: ctest --preset release -E '^LakeFS/'
+      - name: Load LakeFS defaults
+        run: |
+          set -a
+          source dev/lakefs-local/defaults.sh
+          set +a
+          {
+            echo "LAKEFS_ENDPOINT=${LAKEFS_ENDPOINT}"
+            echo "LAKEFS_ACCESS_KEY_ID=${LAKEFS_ACCESS_KEY_ID}"
+            echo "LAKEFS_SECRET_ACCESS_KEY=${LAKEFS_SECRET_ACCESS_KEY}"
+            echo "LAKEFS_STORAGE_NAMESPACE_PREFIX=${LAKEFS_STORAGE_NAMESPACE_PREFIX}"
+            echo "LAKEFS_CANONICAL_BRANCH=${LAKEFS_CANONICAL_BRANCH}"
+          } >> "$GITHUB_ENV"
       - name: Start LakeFS
         run: make lakefs-up
       - name: Test (LakeFS conformance)
-        env:
-          LAKEFS_ENDPOINT: http://localhost:8000
-          LAKEFS_ACCESS_KEY_ID: AKIAIOSFOLQUICKSTART
-          LAKEFS_SECRET_ACCESS_KEY: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
-          LAKEFS_STORAGE_NAMESPACE_PREFIX: local://
-          LAKEFS_CANONICAL_BRANCH: main
         run: ctest --preset release -R '^LakeFS/'
       - name: LakeFS logs on failure
         if: failure()

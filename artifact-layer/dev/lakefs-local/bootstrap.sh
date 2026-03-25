@@ -2,12 +2,9 @@
 
 set -euo pipefail
 
-LAKEFS_ENDPOINT="${LAKEFS_ENDPOINT:-http://localhost:8000}"
-LAKEFS_ACCESS_KEY_ID="${LAKEFS_ACCESS_KEY_ID:-AKIAIOSFOLQUICKSTART}"
-LAKEFS_SECRET_ACCESS_KEY="${LAKEFS_SECRET_ACCESS_KEY:-wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY}"
-LAKEFS_REPOSITORY="${LAKEFS_REPOSITORY:-artifact-layer-it}"
-LAKEFS_STORAGE_NAMESPACE_PREFIX="${LAKEFS_STORAGE_NAMESPACE_PREFIX:-local://}"
-LAKEFS_CANONICAL_BRANCH="${LAKEFS_CANONICAL_BRANCH:-main}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=defaults.sh
+source "${SCRIPT_DIR}/defaults.sh"
 
 wait_for_lakefs() {
   local attempts=0
