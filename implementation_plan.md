@@ -27,7 +27,7 @@ otherwise noted.
 | P2b | LakeFS Storage Layer Integration | :white_check_mark: Complete |
 | P3 | Path Encoding & Index Key Encoding | :white_check_mark: Complete |
 | P4 | Index Storage & Three-Way Merge | :white_check_mark: Complete |
-| P5 | Transaction & Snapshot Manager | :white_large_square: Not started |
+| P5 | Transaction & Snapshot Manager | :construction: In progress |
 | P6 | Artifact CRUD Engine | :white_large_square: Not started |
 | P7a | Registry Utilities (proto compiler, schema compat) | :white_large_square: Not started |
 | P7b | Type Registry Orchestration (RegisterTypeVersion + introspection) | :white_large_square: Not started |
