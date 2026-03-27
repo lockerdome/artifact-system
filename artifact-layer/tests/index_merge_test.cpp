@@ -158,5 +158,43 @@ TEST(IndexMergeTest, RejectsDuplicateArtifactIdOrderFields) {
   EXPECT_EQ(merged_or.status().code(), absl::StatusCode::kInvalidArgument);
 }
 
+TEST(IndexMergeTest, MergeResortsWithDescendingOrder) {
+  // Index with a DESCENDING score field followed by ASCENDING artifact_id.
+  // Verify the merge result is sorted correctly: highest score first.
+  artifact_system::IndexDefinition definition;
+  definition.set_key_type("test_index");
+  definition.set_unique(false);
+  auto* order0 = definition.add_order();
+  order0->set_field("score");
+  order0->set_direction(artifact_system::OrderDefinition::DESCENDING);
+  auto* order1 = definition.add_order();
+  order1->set_field("artifact_id");
+  order1->set_direction(artifact_system::OrderDefinition::ASCENDING);
+
+  // base has artifact 1 with score 10.
+  index::IndexObject base{.serialized_key = "k",
+                          .rows = {index::IndexRow{.artifact_id = 1, .order_values = {static_cast<int32_t>(10), static_cast<uint64_t>(1)}}}};
+  // ours adds artifact 2 with score 30 (should sort first in DESCENDING).
+  index::IndexObject ours{.serialized_key = "k",
+                          .rows = {index::IndexRow{.artifact_id = 1, .order_values = {static_cast<int32_t>(10), static_cast<uint64_t>(1)}},
+                                   index::IndexRow{.artifact_id = 2, .order_values = {static_cast<int32_t>(30), static_cast<uint64_t>(2)}}}};
+  // theirs adds artifact 3 with score 20 (should sort between 30 and 10).
+  index::IndexObject theirs{.serialized_key = "k",
+                            .rows = {index::IndexRow{.artifact_id = 1, .order_values = {static_cast<int32_t>(10), static_cast<uint64_t>(1)}},
+                                     index::IndexRow{.artifact_id = 3, .order_values = {static_cast<int32_t>(20), static_cast<uint64_t>(3)}}}};
+
+  auto merged_or = index::MergeIndexObjects(definition, base, ours, theirs);
+  ASSERT_TRUE(merged_or.ok()) << merged_or.status();
+  ASSERT_EQ(merged_or->merged.rows.size(), 3U);
+
+  // DESCENDING by score: 30, 20, 10.
+  EXPECT_EQ(merged_or->merged.rows[0].artifact_id, 2U);
+  EXPECT_EQ(std::get<int32_t>(merged_or->merged.rows[0].order_values[0]), 30);
+  EXPECT_EQ(merged_or->merged.rows[1].artifact_id, 3U);
+  EXPECT_EQ(std::get<int32_t>(merged_or->merged.rows[1].order_values[0]), 20);
+  EXPECT_EQ(merged_or->merged.rows[2].artifact_id, 1U);
+  EXPECT_EQ(std::get<int32_t>(merged_or->merged.rows[2].order_values[0]), 10);
+}
+
 } // namespace
 } // namespace artifact_system::testing

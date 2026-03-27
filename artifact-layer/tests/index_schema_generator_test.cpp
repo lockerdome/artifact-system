@@ -140,5 +140,110 @@ TEST(IndexSchemaGeneratorTest, RejectsDuplicateArtifactIdOrderFields) {
   EXPECT_EQ(schema_or.status().code(), absl::StatusCode::kInvalidArgument);
 }
 
+TEST(IndexSchemaGeneratorTest, RejectsOrderByUnspecifiedDirection) {
+  const auto* descriptor = artifact_system::TypeDefinition::descriptor();
+  ASSERT_NE(descriptor, nullptr);
+
+  const auto& options = descriptor->options();
+  ASSERT_GT(options.ExtensionSize(artifact_system::indexes), 0);
+  artifact_system::IndexDefinition definition = options.GetExtension(artifact_system::indexes, 0);
+
+  definition.clear_order();
+  auto* order = definition.add_order();
+  order->set_field("artifact_id");
+  order->set_direction(artifact_system::OrderDefinition::ORDER_BY_UNSPECIFIED);
+
+  auto schema_or = index::GenerateIndexSchema(definition, *descriptor);
+  ASSERT_FALSE(schema_or.ok());
+  EXPECT_EQ(schema_or.status().code(), absl::StatusCode::kInvalidArgument);
+}
+
+TEST(IndexSchemaGeneratorTest, GeneratesMultiKeyAndMultiOrderSchema) {
+  // Build a descriptor with two key fields and two order fields to exercise
+  // multi-column schema generation and correct field numbering.
+  google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
+
+  google::protobuf::FileDescriptorProto file;
+  file.set_name("index_schema_generator_multi.proto");
+  file.set_package("artifact_system.testing");
+  file.set_syntax("proto3");
+  file.add_dependency("artifact_options.proto");
+
+  auto* message = file.add_message_type();
+  message->set_name("MultiColumnArtifact");
+
+  auto* repo = message->add_field();
+  repo->set_name("repo_id");
+  repo->set_number(1);
+  repo->set_label(google::protobuf::FieldDescriptorProto::LABEL_OPTIONAL);
+  repo->set_type(google::protobuf::FieldDescriptorProto::TYPE_UINT64);
+
+  auto* owner = message->add_field();
+  owner->set_name("owner");
+  owner->set_number(2);
+  owner->set_label(google::protobuf::FieldDescriptorProto::LABEL_OPTIONAL);
+  owner->set_type(google::protobuf::FieldDescriptorProto::TYPE_STRING);
+
+  auto* created_at = message->add_field();
+  created_at->set_name("created_at");
+  created_at->set_number(3);
+  created_at->set_label(google::protobuf::FieldDescriptorProto::LABEL_OPTIONAL);
+  created_at->set_type(google::protobuf::FieldDescriptorProto::TYPE_INT64);
+
+  auto* index = message->mutable_options()->AddExtension(artifact_system::indexes);
+  index->set_key_type("by_repo_owner");
+  index->add_key("repo_id");
+  index->add_key("owner");
+  auto* order_created = index->add_order();
+  order_created->set_field("created_at");
+  order_created->set_direction(artifact_system::OrderDefinition::DESCENDING);
+  auto* order_id = index->add_order();
+  order_id->set_field("artifact_id");
+  order_id->set_direction(artifact_system::OrderDefinition::ASCENDING);
+
+  const google::protobuf::FileDescriptor* built_file = pool.BuildFile(file);
+  ASSERT_NE(built_file, nullptr);
+  const auto* descriptor = built_file->FindMessageTypeByName("MultiColumnArtifact");
+  ASSERT_NE(descriptor, nullptr);
+
+  const auto& opts = descriptor->options();
+  ASSERT_EQ(opts.ExtensionSize(artifact_system::indexes), 1);
+  const artifact_system::IndexDefinition& def = opts.GetExtension(artifact_system::indexes, 0);
+
+  auto schema_or = index::GenerateIndexSchema(def, *descriptor);
+  ASSERT_TRUE(schema_or.ok()) << schema_or.status();
+  const index::GeneratedIndexSchema& schema = *schema_or;
+
+  // IndexKey has 2 key fields.
+  EXPECT_EQ(schema.key_descriptor->field_count(), 2);
+  const auto* key1 = schema.key_descriptor->FindFieldByNumber(1);
+  const auto* key2 = schema.key_descriptor->FindFieldByNumber(2);
+  ASSERT_NE(key1, nullptr);
+  ASSERT_NE(key2, nullptr);
+  EXPECT_EQ(key1->type(), google::protobuf::FieldDescriptor::TYPE_UINT64);
+  EXPECT_EQ(key2->type(), google::protobuf::FieldDescriptor::TYPE_STRING);
+
+  // IndexValue has row_count + 2 order columns (created_at, artifact_id).
+  EXPECT_EQ(schema.value_descriptor->field_count(), 3);
+  const auto* row_count = schema.value_descriptor->FindFieldByName("row_count");
+  ASSERT_NE(row_count, nullptr);
+  EXPECT_EQ(row_count->type(), google::protobuf::FieldDescriptor::TYPE_UINT32);
+
+  const auto* created_col = schema.value_descriptor->FindFieldByNumber(2);
+  ASSERT_NE(created_col, nullptr);
+  EXPECT_EQ(created_col->type(), google::protobuf::FieldDescriptor::TYPE_INT64);
+  EXPECT_TRUE(created_col->is_repeated());
+
+  const auto* artifact_id_col = schema.value_descriptor->FindFieldByNumber(3);
+  ASSERT_NE(artifact_id_col, nullptr);
+  EXPECT_EQ(artifact_id_col->type(), google::protobuf::FieldDescriptor::TYPE_UINT64);
+  EXPECT_TRUE(artifact_id_col->is_repeated());
+
+  // value_fields vector matches order columns.
+  ASSERT_EQ(schema.value_fields.size(), 2U);
+  EXPECT_EQ(schema.value_fields[0], created_col);
+  EXPECT_EQ(schema.value_fields[1], artifact_id_col);
+}
+
 } // namespace
 } // namespace artifact_system::testing

@@ -211,5 +211,54 @@ TEST(IndexObjectTest, RejectsDuplicateArtifactIdsOnDeserialize) {
   EXPECT_EQ(parsed_or.status().code(), absl::StatusCode::kInvalidArgument);
 }
 
+TEST(IndexObjectTest, SerializationIsDeterministic) {
+  // PRD: index objects must be encoded deterministically. Serialize the same
+  // object twice and assert byte-for-byte equality.
+  const auto* descriptor = artifact_system::TypeDefinition::descriptor();
+  ASSERT_NE(descriptor, nullptr);
+
+  const artifact_system::IndexDefinition index_definition = FindIndexDefinitionByKeyType(*descriptor, "type_name_unique");
+  ASSERT_FALSE(index_definition.key_type().empty());
+
+  auto schema_or = index::GenerateIndexSchema(index_definition, *descriptor);
+  ASSERT_TRUE(schema_or.ok()) << schema_or.status();
+  const index::GeneratedIndexSchema& schema = *schema_or;
+
+  google::protobuf::DynamicMessageFactory factory;
+  const google::protobuf::Message* key_prototype = factory.GetPrototype(schema.key_descriptor);
+  ASSERT_NE(key_prototype, nullptr);
+  std::unique_ptr<google::protobuf::Message> key_message(key_prototype->New());
+  const auto* key_field = schema.key_descriptor->FindFieldByNumber(1);
+  key_message->GetReflection()->SetString(key_message.get(), key_field, "TypeDefinition");
+  std::string serialized_key;
+  ASSERT_TRUE(key_message->SerializeToString(&serialized_key));
+
+  index::IndexObject object;
+  object.serialized_key = serialized_key;
+  // Intentionally add rows out of order -- serializer must sort them and
+  // produce a stable result regardless of input order.
+  object.rows = {
+      index::IndexRow{.artifact_id = 33, .order_values = {static_cast<uint64_t>(33)}},
+      index::IndexRow{.artifact_id = 11, .order_values = {static_cast<uint64_t>(11)}},
+      index::IndexRow{.artifact_id = 22, .order_values = {static_cast<uint64_t>(22)}},
+  };
+
+  auto bytes1_or = index::SerializeIndexObject(schema, index_definition, object);
+  ASSERT_TRUE(bytes1_or.ok()) << bytes1_or.status();
+
+  auto bytes2_or = index::SerializeIndexObject(schema, index_definition, object);
+  ASSERT_TRUE(bytes2_or.ok()) << bytes2_or.status();
+
+  EXPECT_EQ(*bytes1_or, *bytes2_or);
+
+  // Also verify the round-trip comes back sorted.
+  auto parsed_or = index::DeserializeIndexObject(schema, index_definition, *bytes1_or);
+  ASSERT_TRUE(parsed_or.ok()) << parsed_or.status();
+  ASSERT_EQ(parsed_or->rows.size(), 3U);
+  EXPECT_EQ(parsed_or->rows[0].artifact_id, 11U);
+  EXPECT_EQ(parsed_or->rows[1].artifact_id, 22U);
+  EXPECT_EQ(parsed_or->rows[2].artifact_id, 33U);
+}
+
 } // namespace
 } // namespace artifact_system::testing

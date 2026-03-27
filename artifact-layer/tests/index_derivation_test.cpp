@@ -489,6 +489,65 @@ TEST(IndexDerivationTest, DeriveFromPayloadSupportsUnorderedDescriptorSet) {
   EXPECT_EQ(derived_or->at(0).index_def_id, 1U);
 }
 
+TEST(IndexDerivationTest, DeduplicatesRepeatedFieldValues) {
+  // PRD: repeated scalar fields produce "one entry per element value (distinct
+  // values only)". Duplicate values in the repeated field must be collapsed.
+  google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
+  const auto* descriptor = BuildDescriptorWithIndexes(&pool);
+  ASSERT_NE(descriptor, nullptr);
+
+  google::protobuf::DynamicMessageFactory factory;
+  std::unique_ptr<google::protobuf::Message> message = NewMessage(descriptor, &factory);
+  ASSERT_NE(message, nullptr);
+  const auto* reflection = message->GetReflection();
+
+  reflection->SetString(message.get(), descriptor->FindFieldByName("repo"), "alpha");
+  // Add duplicate tag values.
+  reflection->AddString(message.get(), descriptor->FindFieldByName("tags"), "dup");
+  reflection->AddString(message.get(), descriptor->FindFieldByName("tags"), "dup");
+  reflection->AddString(message.get(), descriptor->FindFieldByName("tags"), "other");
+
+  auto derived_or = index::DeriveIndexEntries(*descriptor, *message, 1);
+  ASSERT_TRUE(derived_or.ok()) << derived_or.status();
+
+  // Count entries for the "by_tag" index -- should be 2 (dup, other), not 3.
+  int tag_entries = 0;
+  for (const auto& entry : *derived_or) {
+    if (entry.key_type == "by_tag") {
+      ++tag_entries;
+    }
+  }
+  EXPECT_EQ(tag_entries, 2);
+}
+
+TEST(IndexDerivationTest, RejectsNaNInIndexedDoubleField) {
+  // The existing RejectsNaNInIndexedField test covers float. This covers
+  // the double path (TYPE_DOUBLE).
+  google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
+  const auto* descriptor = BuildDescriptorAllScalarTypes(&pool);
+  ASSERT_NE(descriptor, nullptr);
+
+  google::protobuf::DynamicMessageFactory factory;
+  std::unique_ptr<google::protobuf::Message> message = NewMessage(descriptor, &factory);
+  ASSERT_NE(message, nullptr);
+
+  const auto* reflection = message->GetReflection();
+  reflection->SetInt32(message.get(), descriptor->FindFieldByName("f_int32"), 1);
+  reflection->SetUInt32(message.get(), descriptor->FindFieldByName("f_uint32"), 1);
+  reflection->SetInt64(message.get(), descriptor->FindFieldByName("f_int64"), 1);
+  reflection->SetUInt64(message.get(), descriptor->FindFieldByName("f_uint64"), 1);
+  reflection->SetBool(message.get(), descriptor->FindFieldByName("f_bool"), false);
+  reflection->SetEnumValue(message.get(), descriptor->FindFieldByName("f_enum"), 0);
+  reflection->SetDouble(message.get(), descriptor->FindFieldByName("f_double"), std::nan(""));
+  reflection->SetString(message.get(), descriptor->FindFieldByName("f_string"), "x");
+  reflection->SetString(message.get(), descriptor->FindFieldByName("f_bytes"), "y");
+
+  auto derived_or = index::DeriveIndexEntries(*descriptor, *message, 1);
+  ASSERT_FALSE(derived_or.ok());
+  EXPECT_EQ(derived_or.status().code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_NE(std::string(derived_or.status().message()).find("NAN_IN_INDEXED_FIELD"), std::string::npos);
+}
+
 TEST(IndexDerivationTest, AcceptsPayloadWithNonMinimalVarintOnNonIndexedField) {
   // Build a descriptor with one indexed string field ("name", field 1) and one
   // non-indexed uint32 field ("count", field 2). A payload where field 2's tag
