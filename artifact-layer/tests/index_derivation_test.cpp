@@ -213,36 +213,6 @@ const google::protobuf::Descriptor* BuildDescriptorAllScalarTypes(google::protob
   return built->FindMessageTypeByName("AllScalars");
 }
 
-const google::protobuf::Descriptor* BuildDescriptorWithPackedRepeatedVarintField(google::protobuf::DescriptorPool* pool) {
-  google::protobuf::FileDescriptorProto file;
-  file.set_name("index_derivation_packed_varint.proto");
-  file.set_syntax("proto3");
-  file.set_package("artifact_system.testing");
-  file.add_dependency("artifact_options.proto");
-
-  auto* message = file.add_message_type();
-  message->set_name("PackedArtifact");
-
-  auto* ids = message->add_field();
-  ids->set_name("ids");
-  ids->set_number(1);
-  ids->set_label(google::protobuf::FieldDescriptorProto::LABEL_REPEATED);
-  ids->set_type(google::protobuf::FieldDescriptorProto::TYPE_INT32);
-
-  auto* index = message->mutable_options()->AddExtension(artifact_system::indexes);
-  index->set_key_type("by_id");
-  index->add_key("ids");
-  auto* order = index->add_order();
-  order->set_field("artifact_id");
-  order->set_direction(artifact_system::OrderDefinition::ASCENDING);
-
-  const google::protobuf::FileDescriptor* built = pool->BuildFile(file);
-  if (built == nullptr) {
-    return nullptr;
-  }
-  return built->FindMessageTypeByName("PackedArtifact");
-}
-
 const google::protobuf::Descriptor* BuildDescriptorWithTwoRepeatedKeyFields(google::protobuf::DescriptorPool* pool) {
   google::protobuf::FileDescriptorProto file;
   file.set_name("index_derivation_two_repeated.proto");
@@ -474,43 +444,6 @@ TEST(IndexDerivationTest, DerivesEntriesForAllScalarKeyTypes) {
   EXPECT_EQ(derived_or->size(), 9U);
 }
 
-TEST(IndexDerivationTest, RejectsUnknownNonMinimalVarintTagInPayload) {
-  google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
-  const auto* descriptor = BuildDescriptorWithIndexes(&pool);
-  ASSERT_NE(descriptor, nullptr);
-
-  google::protobuf::DynamicMessageFactory factory;
-  std::unique_ptr<google::protobuf::Message> message = NewMessage(descriptor, &factory);
-  ASSERT_NE(message, nullptr);
-  message->GetReflection()->SetString(message.get(), descriptor->FindFieldByName("repo"), "alpha");
-
-  google::protobuf::FileDescriptorSet descriptor_set;
-  descriptor->file()->CopyTo(descriptor_set.add_file());
-
-  // Field 1 tag with non-minimal varint encoding (0x88 0x00 instead of 0x08), then value 1.
-  const std::string bad_payload("\x88\x00\x01", 3);
-  auto derived_or = index::DeriveIndexEntriesFromPayload(descriptor_set, std::string(descriptor->full_name()), bad_payload, 1, {});
-  ASSERT_FALSE(derived_or.ok());
-  EXPECT_EQ(derived_or.status().code(), absl::StatusCode::kInvalidArgument);
-  EXPECT_EQ(std::string(derived_or.status().message()), "NON_MINIMAL_VARINT");
-}
-
-TEST(IndexDerivationTest, RejectsNonMinimalVarintsInPackedRepeatedFields) {
-  google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
-  const auto* descriptor = BuildDescriptorWithPackedRepeatedVarintField(&pool);
-  ASSERT_NE(descriptor, nullptr);
-
-  google::protobuf::FileDescriptorSet descriptor_set;
-  descriptor->file()->CopyTo(descriptor_set.add_file());
-
-  // packed ids field (tag=1, wire=2), len=2, value=1 encoded non-minimally (0x81 0x00).
-  const std::string bad_payload("\x0A\x02\x81\x00", 4);
-  auto derived_or = index::DeriveIndexEntriesFromPayload(descriptor_set, std::string(descriptor->full_name()), bad_payload, 1, {});
-  ASSERT_FALSE(derived_or.ok());
-  EXPECT_EQ(derived_or.status().code(), absl::StatusCode::kInvalidArgument);
-  EXPECT_EQ(std::string(derived_or.status().message()), "NON_MINIMAL_VARINT");
-}
-
 TEST(IndexDerivationTest, RejectsIndexesWithMoreThanOneRepeatedField) {
   google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
   const auto* descriptor = BuildDescriptorWithTwoRepeatedKeyFields(&pool);
@@ -554,6 +487,124 @@ TEST(IndexDerivationTest, DeriveFromPayloadSupportsUnorderedDescriptorSet) {
   ASSERT_TRUE(derived_or.ok()) << derived_or.status();
   ASSERT_EQ(derived_or->size(), 1U);
   EXPECT_EQ(derived_or->at(0).index_def_id, 1U);
+}
+
+TEST(IndexDerivationTest, AcceptsPayloadWithNonMinimalVarintOnNonIndexedField) {
+  // Build a descriptor with one indexed string field ("name", field 1) and one
+  // non-indexed uint32 field ("count", field 2). A payload where field 2's tag
+  // uses a non-minimal varint encoding is valid protobuf and must be accepted.
+  google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
+
+  google::protobuf::FileDescriptorProto file;
+  file.set_name("non_minimal_wire_test.proto");
+  file.set_syntax("proto3");
+  file.set_package("artifact_system.testing");
+  file.add_dependency("artifact_options.proto");
+
+  auto* message = file.add_message_type();
+  message->set_name("NonMinimalWireArtifact");
+
+  auto* name_field = message->add_field();
+  name_field->set_name("name");
+  name_field->set_number(1);
+  name_field->set_label(google::protobuf::FieldDescriptorProto::LABEL_OPTIONAL);
+  name_field->set_type(google::protobuf::FieldDescriptorProto::TYPE_STRING);
+
+  auto* count_field = message->add_field();
+  count_field->set_name("count");
+  count_field->set_number(2);
+  count_field->set_label(google::protobuf::FieldDescriptorProto::LABEL_OPTIONAL);
+  count_field->set_type(google::protobuf::FieldDescriptorProto::TYPE_UINT32);
+
+  auto* index = message->mutable_options()->AddExtension(artifact_system::indexes);
+  index->set_key_type("by_name");
+  index->add_key("name");
+  auto* order = index->add_order();
+  order->set_field("artifact_id");
+  order->set_direction(artifact_system::OrderDefinition::ASCENDING);
+
+  const auto* built = pool.BuildFile(file);
+  ASSERT_NE(built, nullptr);
+  const auto* descriptor = built->FindMessageTypeByName("NonMinimalWireArtifact");
+  ASSERT_NE(descriptor, nullptr);
+
+  google::protobuf::FileDescriptorSet descriptor_set;
+  descriptor->file()->CopyTo(descriptor_set.add_file());
+
+  // Hand-craft a payload:
+  //   field 1 (name), wire type 2: tag=0x0A, len=2, "hi"
+  //   field 2 (count), wire type 0: tag encoded non-minimally as 0x90 0x00
+  //     (field_number=2, wire_type=0 -> tag value=16=0x10, but encoded as 2-byte varint)
+  //     value = 0x05
+  // Protobuf parsers accept non-minimal varints; this payload is valid.
+  const std::string payload("\x0A\x02hi\x90\x00\x05", 7);
+  auto derived_or = index::DeriveIndexEntriesFromPayload(descriptor_set, std::string(descriptor->full_name()), payload, 42, {{"by_name", 100}});
+  ASSERT_TRUE(derived_or.ok()) << derived_or.status();
+  ASSERT_EQ(derived_or->size(), 1U);
+  EXPECT_EQ(derived_or->at(0).key_type, "by_name");
+  EXPECT_EQ(derived_or->at(0).index_def_id, 100U);
+}
+
+TEST(IndexDerivationTest, AcceptsPayloadWithNonMinimalVarintOnIndexedFieldProducesCorrectKey) {
+  // A string field that IS an index key is encoded with a non-minimal length
+  // prefix in the protobuf wire format. The protobuf library parses the logical
+  // value correctly, and our key codec re-encodes the length prefix minimally.
+  // The derivation must succeed and produce deterministic encoded_key bytes.
+  google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
+
+  google::protobuf::FileDescriptorProto file;
+  file.set_name("non_minimal_indexed_wire_test.proto");
+  file.set_syntax("proto3");
+  file.set_package("artifact_system.testing");
+  file.add_dependency("artifact_options.proto");
+
+  auto* message = file.add_message_type();
+  message->set_name("NonMinimalIndexedWireArtifact");
+
+  auto* name_field = message->add_field();
+  name_field->set_name("name");
+  name_field->set_number(1);
+  name_field->set_label(google::protobuf::FieldDescriptorProto::LABEL_OPTIONAL);
+  name_field->set_type(google::protobuf::FieldDescriptorProto::TYPE_STRING);
+
+  auto* index = message->mutable_options()->AddExtension(artifact_system::indexes);
+  index->set_key_type("by_name");
+  index->add_key("name");
+  auto* order = index->add_order();
+  order->set_field("artifact_id");
+  order->set_direction(artifact_system::OrderDefinition::ASCENDING);
+
+  const auto* built = pool.BuildFile(file);
+  ASSERT_NE(built, nullptr);
+  const auto* descriptor = built->FindMessageTypeByName("NonMinimalIndexedWireArtifact");
+  ASSERT_NE(descriptor, nullptr);
+
+  google::protobuf::FileDescriptorSet descriptor_set;
+  descriptor->file()->CopyTo(descriptor_set.add_file());
+
+  // Hand-craft a payload where the string field's wire-format length prefix is
+  // non-minimal: field 1 tag = 0x0A (minimal), length = 2 encoded as 0x82 0x00
+  // (non-minimal 2-byte varint for value 2), then "hi".
+  const std::string non_minimal_payload("\x0A\x82\x00hi", 5);
+
+  // Also build the canonical (minimal-varint) payload for comparison.
+  const std::string canonical_payload("\x0A\x02hi", 4);
+
+  auto non_minimal_or = index::DeriveIndexEntriesFromPayload(descriptor_set, std::string(descriptor->full_name()), non_minimal_payload, 42, {});
+  ASSERT_TRUE(non_minimal_or.ok()) << non_minimal_or.status();
+  ASSERT_EQ(non_minimal_or->size(), 1U);
+
+  auto canonical_or = index::DeriveIndexEntriesFromPayload(descriptor_set, std::string(descriptor->full_name()), canonical_payload, 42, {});
+  ASSERT_TRUE(canonical_or.ok()) << canonical_or.status();
+  ASSERT_EQ(canonical_or->size(), 1U);
+
+  // Both payloads encode the same logical value ("hi"), so the key codec must
+  // produce identical encoded_key bytes (minimal varint length prefix + "hi").
+  EXPECT_EQ(non_minimal_or->at(0).encoded_key, canonical_or->at(0).encoded_key);
+
+  // Verify the encoded key uses minimal varint: length=2 -> 0x02, then "hi".
+  const std::vector<uint8_t> expected_key = {0x02, 'h', 'i'};
+  EXPECT_EQ(canonical_or->at(0).encoded_key, expected_key);
 }
 
 } // namespace artifact_system::testing

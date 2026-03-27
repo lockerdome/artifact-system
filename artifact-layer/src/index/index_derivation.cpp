@@ -6,7 +6,6 @@
 #include <memory>
 #include <optional>
 #include <set>
-#include <span>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -23,143 +22,6 @@
 
 namespace artifact_system::index {
 namespace {
-
-constexpr uint64_t kWireTypeVarint = 0;
-constexpr uint64_t kWireTypeFixed64 = 1;
-constexpr uint64_t kWireTypeLengthDelimited = 2;
-constexpr uint64_t kWireTypeStartGroup = 3;
-constexpr uint64_t kWireTypeEndGroup = 4;
-constexpr uint64_t kWireTypeFixed32 = 5;
-
-absl::StatusOr<std::pair<uint64_t, size_t>> DecodeVarintAt(std::span<const uint8_t> bytes, size_t offset) {
-  if (offset >= bytes.size()) {
-    return absl::InvalidArgumentError("unexpected end of payload while decoding varint");
-  }
-  size_t bytes_read = 0;
-  auto value_or = encoding::DecodeVarint(bytes.subspan(offset), &bytes_read);
-  if (!value_or.ok()) {
-    return value_or.status();
-  }
-  return std::make_pair(*value_or, bytes_read);
-}
-
-absl::Status ValidatePackedFieldEncoding(const google::protobuf::FieldDescriptor& field, std::span<const uint8_t> bytes) {
-  using Field = google::protobuf::FieldDescriptor;
-  switch (field.type()) {
-  case Field::TYPE_INT32:
-  case Field::TYPE_INT64:
-  case Field::TYPE_UINT32:
-  case Field::TYPE_UINT64:
-  case Field::TYPE_SINT32:
-  case Field::TYPE_SINT64:
-  case Field::TYPE_BOOL:
-  case Field::TYPE_ENUM: {
-    size_t cursor = 0;
-    while (cursor < bytes.size()) {
-      auto value_or = DecodeVarintAt(bytes, cursor);
-      if (!value_or.ok()) {
-        return value_or.status();
-      }
-      cursor += value_or->second;
-    }
-    return absl::OkStatus();
-  }
-  case Field::TYPE_FIXED64:
-  case Field::TYPE_SFIXED64:
-  case Field::TYPE_DOUBLE:
-    if (bytes.size() % 8 != 0) {
-      return absl::InvalidArgumentError("invalid packed fixed64 payload length");
-    }
-    return absl::OkStatus();
-  case Field::TYPE_FIXED32:
-  case Field::TYPE_SFIXED32:
-  case Field::TYPE_FLOAT:
-    if (bytes.size() % 4 != 0) {
-      return absl::InvalidArgumentError("invalid packed fixed32 payload length");
-    }
-    return absl::OkStatus();
-  default:
-    return absl::InvalidArgumentError("invalid packed field type");
-  }
-}
-
-absl::Status ValidateMessageWireMinimalVarints(const google::protobuf::Descriptor& descriptor, std::span<const uint8_t> bytes) {
-  size_t cursor = 0;
-  while (cursor < bytes.size()) {
-    auto tag_or = DecodeVarintAt(bytes, cursor);
-    if (!tag_or.ok()) {
-      return tag_or.status();
-    }
-    const uint64_t tag = tag_or->first;
-    cursor += tag_or->second;
-
-    if (tag == 0) {
-      return absl::InvalidArgumentError("invalid protobuf tag 0");
-    }
-
-    const int field_number = static_cast<int>(tag >> 3U);
-    const uint64_t wire_type = tag & 0x07U;
-    const google::protobuf::FieldDescriptor* field = descriptor.FindFieldByNumber(field_number);
-
-    switch (wire_type) {
-    case kWireTypeVarint: {
-      auto value_or = DecodeVarintAt(bytes, cursor);
-      if (!value_or.ok()) {
-        return value_or.status();
-      }
-      cursor += value_or->second;
-      break;
-    }
-    case kWireTypeFixed64:
-      if (cursor + 8 > bytes.size()) {
-        return absl::InvalidArgumentError("truncated fixed64 field in payload");
-      }
-      cursor += 8;
-      break;
-    case kWireTypeLengthDelimited: {
-      auto length_or = DecodeVarintAt(bytes, cursor);
-      if (!length_or.ok()) {
-        return length_or.status();
-      }
-      cursor += length_or->second;
-
-      const uint64_t length = length_or->first;
-      if (length > bytes.size() - cursor) {
-        return absl::InvalidArgumentError("length-delimited field exceeds payload size");
-      }
-      const auto field_bytes = bytes.subspan(cursor, static_cast<size_t>(length));
-
-      if (field != nullptr && field->cpp_type() == google::protobuf::FieldDescriptor::CPPTYPE_MESSAGE && !field->is_map()) {
-        absl::Status nested_status = ValidateMessageWireMinimalVarints(*field->message_type(), field_bytes);
-        if (!nested_status.ok()) {
-          return nested_status;
-        }
-      } else if (field != nullptr && field->is_packed()) {
-        absl::Status packed_status = ValidatePackedFieldEncoding(*field, field_bytes);
-        if (!packed_status.ok()) {
-          return packed_status;
-        }
-      }
-
-      cursor += static_cast<size_t>(length);
-      break;
-    }
-    case kWireTypeStartGroup:
-    case kWireTypeEndGroup:
-      return absl::InvalidArgumentError("groups are not supported");
-    case kWireTypeFixed32:
-      if (cursor + 4 > bytes.size()) {
-        return absl::InvalidArgumentError("truncated fixed32 field in payload");
-      }
-      cursor += 4;
-      break;
-    default:
-      return absl::InvalidArgumentError("invalid protobuf wire type");
-    }
-  }
-
-  return absl::OkStatus();
-}
 
 absl::StatusOr<std::vector<const google::protobuf::FieldDescriptor*>> ResolveFieldPath(const google::protobuf::Descriptor& descriptor,
                                                                                        const std::string& path) {
@@ -660,15 +522,6 @@ absl::StatusOr<std::vector<DerivedIndexEntry>> DeriveIndexEntriesFromPayload(con
   const auto* descriptor = pool.FindMessageTypeByName(message_full_name);
   if (descriptor == nullptr) {
     return absl::InvalidArgumentError(absl::StrCat("message not found in descriptor set: ", message_full_name));
-  }
-
-  absl::Status validation_status =
-      ValidateMessageWireMinimalVarints(*descriptor, std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(payload.data()), payload.size()));
-  if (!validation_status.ok()) {
-    if (validation_status.message() == "NON_MINIMAL_VARINT") {
-      return absl::InvalidArgumentError("NON_MINIMAL_VARINT");
-    }
-    return validation_status;
   }
 
   google::protobuf::DynamicMessageFactory factory;
