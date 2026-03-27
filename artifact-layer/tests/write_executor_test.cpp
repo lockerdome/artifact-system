@@ -9,6 +9,10 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/time/time.h"
+#include "artifact_options.pb.h"
+#include "encoding/artifact_path.h"
+#include "index/index_object.h"
+#include "index/index_schema_generator.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
@@ -58,6 +62,29 @@ MergeResult BuildMergeConflict(std::initializer_list<std::string> paths) {
   conflict.target_commit_id = "target";
   result.result = std::move(conflict);
   return result;
+}
+
+absl::StatusOr<artifact_system::IndexDefinition> FindIndexDefinitionByKeyType(const google::protobuf::Descriptor& descriptor, const std::string& key_type) {
+  const auto& options = descriptor.options();
+  for (int i = 0; i < options.ExtensionSize(artifact_system::indexes); ++i) {
+    const auto& definition = options.GetExtension(artifact_system::indexes, i);
+    if (definition.key_type() == key_type) {
+      return definition;
+    }
+  }
+  return absl::NotFoundError("index definition not found");
+}
+
+absl::StatusOr<std::string> BuildIndexObjectBytes(const artifact_system::IndexDefinition& definition, const google::protobuf::Descriptor& descriptor,
+                                                  std::initializer_list<uint64_t> /*artifact_ids*/) {
+  auto schema_or = artifact_system::index::GenerateIndexSchema(definition, descriptor);
+  if (!schema_or.ok()) {
+    return schema_or.status();
+  }
+
+  artifact_system::index::IndexObject object;
+
+  return artifact_system::index::SerializeIndexObject(*schema_or, definition, object);
 }
 
 TEST(WriteExecutorTest, SuccessfulWriteUpdatesTransactionBranchHead) {
@@ -214,6 +241,109 @@ TEST(WriteExecutorTest, RetryExhaustionReturnsNonRetryableConflict) {
   EXPECT_FALSE(conflict.detail.retryable());
   EXPECT_EQ(conflict.detail.attempts(), 3);
   EXPECT_EQ(sleep_calls, 2);
+}
+
+TEST(WriteExecutorTest, DefaultResolverMergesNonUniqueIndexConflictThenRetrySucceeds) {
+  StrictMock<MockStorage> storage;
+
+  auto index_definition_or = FindIndexDefinitionByKeyType(*artifact_system::IndexDefinition::descriptor(), "all_index_definitions");
+  ASSERT_TRUE(index_definition_or.ok());
+  const artifact_system::IndexDefinition index_definition = *index_definition_or;
+  const uint64_t index_definition_id = 9001;
+  const std::string index_definition_path = encoding::ArtifactPath(index_definition_id);
+  const std::string index_path = encoding::IndexPath(index_definition_id, {});
+  const std::string index_definition_payload = index_definition.SerializeAsString();
+
+  auto base_bytes_or = BuildIndexObjectBytes(index_definition, *artifact_system::IndexDefinition::descriptor(), {1});
+  ASSERT_TRUE(base_bytes_or.ok());
+  auto ours_bytes_or = BuildIndexObjectBytes(index_definition, *artifact_system::IndexDefinition::descriptor(), {1, 2});
+  ASSERT_TRUE(ours_bytes_or.ok());
+  auto theirs_bytes_or = BuildIndexObjectBytes(index_definition, *artifact_system::IndexDefinition::descriptor(), {1, 3});
+  ASSERT_TRUE(theirs_bytes_or.ok());
+  auto merged_bytes_or = BuildIndexObjectBytes(index_definition, *artifact_system::IndexDefinition::descriptor(), {1, 2, 3});
+  ASSERT_TRUE(merged_bytes_or.ok());
+
+  WriteExecutorOptions options;
+  options.sleep_for = [](absl::Duration) {};
+  WriteExecutor executor(&storage, options);
+
+  std::string child_branch;
+
+  InSequence seq;
+  EXPECT_CALL(storage, GetBranchHead("txn-1")).WillOnce(Return(absl::StatusOr<std::string>("tx-head")));
+  EXPECT_CALL(storage, CreateBranch(_, "tx-head")).WillOnce(DoAll(SaveArg<0>(&child_branch), Invoke([](const std::string& name, const std::string&) {
+                                                                    return absl::StatusOr<std::string>(name);
+                                                                  })));
+  EXPECT_CALL(storage, Commit(_, _)).WillOnce(Return(absl::StatusOr<std::string>("child-commit")));
+  EXPECT_CALL(storage, Merge(_, "txn-1")).WillOnce(Return(absl::StatusOr<MergeResult>(BuildMergeConflict({index_path}))));
+  EXPECT_CALL(storage, GetObject("source", index_definition_path)).WillOnce(Return(absl::StatusOr<std::string>(index_definition_payload)));
+  EXPECT_CALL(storage, GetObject("base", index_path)).WillOnce(Return(absl::StatusOr<std::string>(*base_bytes_or)));
+  EXPECT_CALL(storage, GetObject("source", index_path)).WillOnce(Return(absl::StatusOr<std::string>(*ours_bytes_or)));
+  EXPECT_CALL(storage, GetObject("target", index_path)).WillOnce(Return(absl::StatusOr<std::string>(*theirs_bytes_or)));
+  EXPECT_CALL(storage, PutObject(_, index_path, *merged_bytes_or)).WillOnce(Return(absl::OkStatus()));
+  EXPECT_CALL(storage, Commit(_, "deterministic index conflict resolution attempt 1")).WillOnce(Return(absl::StatusOr<std::string>("resolved")));
+  EXPECT_CALL(storage, Merge(_, "txn-1")).WillOnce(Return(absl::StatusOr<MergeResult>(BuildMergeSuccess("merged-2"))));
+  EXPECT_CALL(storage, DeleteBranch(_)).WillOnce(Return(absl::OkStatus()));
+
+  auto result_or = executor.ExecuteWrite("txn-1", [](const std::string&) { return absl::OkStatus(); });
+  ASSERT_TRUE(result_or.ok());
+  ASSERT_TRUE(std::holds_alternative<WriteExecutor::WriteSuccess>(*result_or));
+  const auto& success = std::get<WriteExecutor::WriteSuccess>(*result_or);
+  EXPECT_EQ(success.commit_id, "merged-2");
+  EXPECT_EQ(success.attempts, 2);
+}
+
+TEST(WriteExecutorTest, DefaultResolverDoesNotPersistPartialStateForMixedConflicts) {
+  StrictMock<MockStorage> storage;
+
+  auto non_unique_definition_or = FindIndexDefinitionByKeyType(*artifact_system::IndexDefinition::descriptor(), "all_index_definitions");
+  ASSERT_TRUE(non_unique_definition_or.ok());
+  const artifact_system::IndexDefinition non_unique_definition = *non_unique_definition_or;
+  const uint64_t non_unique_definition_id = 9010;
+  const std::string non_unique_definition_path = encoding::ArtifactPath(non_unique_definition_id);
+  const std::string non_unique_index_path = encoding::IndexPath(non_unique_definition_id, {});
+  const std::string non_unique_definition_payload = non_unique_definition.SerializeAsString();
+
+  auto unique_definition_or = FindIndexDefinitionByKeyType(*artifact_system::IndexDefinition::descriptor(), "index_key_type_unique");
+  ASSERT_TRUE(unique_definition_or.ok());
+  const artifact_system::IndexDefinition unique_definition = *unique_definition_or;
+  const uint64_t unique_definition_id = 9011;
+  const std::string unique_definition_path = encoding::ArtifactPath(unique_definition_id);
+  const std::string unique_index_path = encoding::IndexPath(unique_definition_id, {});
+  const std::string unique_definition_payload = unique_definition.SerializeAsString();
+
+  auto base_bytes_or = BuildIndexObjectBytes(non_unique_definition, *artifact_system::IndexDefinition::descriptor(), {1});
+  ASSERT_TRUE(base_bytes_or.ok());
+  auto ours_bytes_or = BuildIndexObjectBytes(non_unique_definition, *artifact_system::IndexDefinition::descriptor(), {1, 2});
+  ASSERT_TRUE(ours_bytes_or.ok());
+  auto theirs_bytes_or = BuildIndexObjectBytes(non_unique_definition, *artifact_system::IndexDefinition::descriptor(), {1, 3});
+  ASSERT_TRUE(theirs_bytes_or.ok());
+
+  WriteExecutorOptions options;
+  options.sleep_for = [](absl::Duration) {};
+  WriteExecutor executor(&storage, options);
+
+  InSequence seq;
+  EXPECT_CALL(storage, GetBranchHead("txn-1")).WillOnce(Return(absl::StatusOr<std::string>("tx-head")));
+  EXPECT_CALL(storage, CreateBranch(_, "tx-head")).WillOnce(Invoke([](const std::string& name, const std::string&) {
+    return absl::StatusOr<std::string>(name);
+  }));
+  EXPECT_CALL(storage, Commit(_, _)).WillOnce(Return(absl::StatusOr<std::string>("child-commit")));
+  EXPECT_CALL(storage, Merge(_, "txn-1")).WillOnce(Return(absl::StatusOr<MergeResult>(BuildMergeConflict({non_unique_index_path, unique_index_path}))));
+  EXPECT_CALL(storage, GetObject("source", non_unique_definition_path)).WillOnce(Return(absl::StatusOr<std::string>(non_unique_definition_payload)));
+  EXPECT_CALL(storage, GetObject("base", non_unique_index_path)).WillOnce(Return(absl::StatusOr<std::string>(*base_bytes_or)));
+  EXPECT_CALL(storage, GetObject("source", non_unique_index_path)).WillOnce(Return(absl::StatusOr<std::string>(*ours_bytes_or)));
+  EXPECT_CALL(storage, GetObject("target", non_unique_index_path)).WillOnce(Return(absl::StatusOr<std::string>(*theirs_bytes_or)));
+  EXPECT_CALL(storage, GetObject("source", unique_definition_path)).WillOnce(Return(absl::StatusOr<std::string>(unique_definition_payload)));
+  EXPECT_CALL(storage, PutObject(_, _, _)).Times(0);
+  EXPECT_CALL(storage, DeleteBranch(_)).WillOnce(Return(absl::OkStatus()));
+
+  auto result_or = executor.ExecuteWrite("txn-1", [](const std::string&) { return absl::OkStatus(); });
+  ASSERT_TRUE(result_or.ok());
+  ASSERT_TRUE(std::holds_alternative<WriteExecutor::WriteConflict>(*result_or));
+  const auto& conflict = std::get<WriteExecutor::WriteConflict>(*result_or);
+  EXPECT_FALSE(conflict.detail.retryable());
+  EXPECT_EQ(conflict.attempts, 1);
 }
 
 TEST(WriteExecutorTest, RetryableConflictCanBeResolvedByCallback) {

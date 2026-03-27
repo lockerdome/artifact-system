@@ -3,9 +3,16 @@
 #include <optional>
 #include <string>
 #include <variant>
+#include <vector>
 
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/time/time.h"
+#include "artifact_options.pb.h"
+#include "encoding/artifact_path.h"
+#include "encoding/index_key_encoder.h"
+#include "index/index_object.h"
+#include "index/index_schema_generator.h"
 #include "storage/memory_storage.h"
 #include "gtest/gtest.h"
 
@@ -14,6 +21,30 @@ namespace {
 
 using artifact_system::transaction::PathConflictKind;
 using artifact_system::transaction::TransactionManager;
+
+absl::StatusOr<artifact_system::IndexDefinition> FindIndexDefinitionByKeyType(const google::protobuf::Descriptor& descriptor, const std::string& key_type) {
+  const auto& options = descriptor.options();
+  for (int i = 0; i < options.ExtensionSize(artifact_system::indexes); ++i) {
+    const auto& definition = options.GetExtension(artifact_system::indexes, i);
+    if (definition.key_type() == key_type) {
+      return definition;
+    }
+  }
+  return absl::NotFoundError("index definition not found");
+}
+
+absl::StatusOr<std::string> BuildIndexObjectBytes(const artifact_system::IndexDefinition& definition, const google::protobuf::Descriptor& descriptor,
+                                                  const std::string& serialized_key, std::initializer_list<uint64_t> /*artifact_ids*/) {
+  auto schema_or = artifact_system::index::GenerateIndexSchema(definition, descriptor);
+  if (!schema_or.ok()) {
+    return schema_or.status();
+  }
+
+  artifact_system::index::IndexObject object;
+  object.serialized_key = serialized_key;
+
+  return artifact_system::index::SerializeIndexObject(*schema_or, definition, object);
+}
 
 TEST(TransactionManagerTest, CreateSnapshotFromCanonicalAndTransaction) {
   MemoryStorage storage;
@@ -235,6 +266,99 @@ TEST(TransactionManagerTest, CommitTransactionRetriesUntilExhaustedForRetryableC
   EXPECT_FALSE(conflict.detail.retryable());
   EXPECT_EQ(conflict.detail.attempts(), 3);
   EXPECT_EQ(conflict.detail.conflict_type(), CommitConflict::INDEX_CONFLICT);
+}
+
+TEST(TransactionManagerTest, DefaultResolverDoesNotAutoResolveUniqueIndexConflict) {
+  MemoryStorage storage;
+
+  auto index_definition_or = FindIndexDefinitionByKeyType(*artifact_system::IndexDefinition::descriptor(), "index_key_type_unique");
+  ASSERT_TRUE(index_definition_or.ok());
+  const artifact_system::IndexDefinition index_definition = *index_definition_or;
+
+  const uint64_t index_definition_id = 7002;
+  artifact_system::IndexDefinition index_payload = index_definition;
+  const std::string index_definition_path = encoding::ArtifactPath(index_definition_id);
+
+  const std::string index_path = encoding::IndexPath(index_definition_id, {});
+
+  ASSERT_TRUE(storage.PutObject(storage.GetCanonicalBranch(), index_definition_path, index_payload.SerializeAsString()).ok());
+  ASSERT_TRUE(storage.PutObject(storage.GetCanonicalBranch(), index_path, "base").ok());
+  ASSERT_TRUE(storage.Commit(storage.GetCanonicalBranch(), "seed unique index base").ok());
+
+  TransactionManager::Options options;
+  options.sleep_for = [](absl::Duration) {};
+  TransactionManager manager(&storage, options);
+
+  auto transaction_id_or = manager.CreateTransaction();
+  ASSERT_TRUE(transaction_id_or.ok());
+  auto transaction_meta_or = manager.GetTransactionMetadata(*transaction_id_or);
+  ASSERT_TRUE(transaction_meta_or.ok());
+
+  ASSERT_TRUE(storage.PutObject(transaction_meta_or->branch_name, index_path, "ours").ok());
+
+  ASSERT_TRUE(storage.PutObject(storage.GetCanonicalBranch(), index_path, "theirs").ok());
+  ASSERT_TRUE(storage.Commit(storage.GetCanonicalBranch(), "canonical unique update").ok());
+
+  auto commit_or = manager.CommitTransaction(*transaction_id_or);
+  ASSERT_TRUE(commit_or.ok());
+  ASSERT_TRUE(std::holds_alternative<TransactionManager::CommitConflict>(*commit_or));
+  const auto& conflict = std::get<TransactionManager::CommitConflict>(*commit_or);
+  EXPECT_FALSE(conflict.detail.retryable());
+  EXPECT_EQ(conflict.detail.conflict_type(), CommitConflict::INDEX_CONFLICT);
+  EXPECT_EQ(conflict.detail.attempts(), 1);
+}
+
+TEST(TransactionManagerTest, DefaultResolverDoesNotAutoResolveNonIndexConflict) {
+  MemoryStorage storage;
+  TransactionManager::Options options;
+  options.sleep_for = [](absl::Duration) {};
+  TransactionManager manager(&storage, options);
+
+  auto transaction_id_or = manager.CreateTransaction();
+  ASSERT_TRUE(transaction_id_or.ok());
+  auto transaction_meta_or = manager.GetTransactionMetadata(*transaction_id_or);
+  ASSERT_TRUE(transaction_meta_or.ok());
+
+  ASSERT_TRUE(storage.PutObject(transaction_meta_or->branch_name, "payload/object-1", "txn-value").ok());
+  ASSERT_TRUE(storage.PutObject(storage.GetCanonicalBranch(), "payload/object-1", "canonical-value").ok());
+  ASSERT_TRUE(storage.Commit(storage.GetCanonicalBranch(), "canonical payload update").ok());
+
+  auto commit_or = manager.CommitTransaction(*transaction_id_or);
+  ASSERT_TRUE(commit_or.ok());
+  ASSERT_TRUE(std::holds_alternative<TransactionManager::CommitConflict>(*commit_or));
+  const auto& conflict = std::get<TransactionManager::CommitConflict>(*commit_or);
+  EXPECT_FALSE(conflict.detail.retryable());
+  EXPECT_EQ(conflict.detail.conflict_type(), CommitConflict::PAYLOAD_CONFLICT);
+  EXPECT_EQ(conflict.detail.attempts(), 1);
+}
+
+TEST(TransactionManagerTest, DefaultResolverFailureSurfacesStatus) {
+  MemoryStorage storage;
+
+  const uint64_t index_definition_id = 7003;
+  const std::string index_definition_path = encoding::ArtifactPath(index_definition_id);
+  const std::string index_path = encoding::IndexPath(index_definition_id, {});
+
+  ASSERT_TRUE(storage.PutObject(storage.GetCanonicalBranch(), index_definition_path, "not-a-valid-index-definition").ok());
+  ASSERT_TRUE(storage.PutObject(storage.GetCanonicalBranch(), index_path, "base").ok());
+  ASSERT_TRUE(storage.Commit(storage.GetCanonicalBranch(), "seed malformed index definition").ok());
+
+  TransactionManager::Options options;
+  options.sleep_for = [](absl::Duration) {};
+  TransactionManager manager(&storage, options);
+
+  auto transaction_id_or = manager.CreateTransaction();
+  ASSERT_TRUE(transaction_id_or.ok());
+  auto transaction_meta_or = manager.GetTransactionMetadata(*transaction_id_or);
+  ASSERT_TRUE(transaction_meta_or.ok());
+
+  ASSERT_TRUE(storage.PutObject(transaction_meta_or->branch_name, index_path, "txn-value").ok());
+  ASSERT_TRUE(storage.PutObject(storage.GetCanonicalBranch(), index_path, "canonical-value").ok());
+  ASSERT_TRUE(storage.Commit(storage.GetCanonicalBranch(), "canonical malformed index update").ok());
+
+  auto commit_or = manager.CommitTransaction(*transaction_id_or);
+  ASSERT_FALSE(commit_or.ok());
+  EXPECT_EQ(commit_or.status().code(), absl::StatusCode::kInvalidArgument);
 }
 
 TEST(TransactionManagerTest, ImplicitTransactionRejectsNullCallback) {
