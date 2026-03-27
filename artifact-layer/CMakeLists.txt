@@ -103,6 +103,7 @@ add_library(artifact_layer_lib
   src/index/index_object.cpp
   src/index/index_merge.cpp
   src/index/index_derivation.cpp
+  src/index/index_conflict_resolver.cpp
   src/transaction/conflict_resolver.cpp
   src/transaction/write_executor.cpp
   src/transaction/transaction_manager.cpp

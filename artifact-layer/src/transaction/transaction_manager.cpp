@@ -10,6 +10,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/time/clock.h"
+#include "index/index_conflict_resolver.h"
 #include "transaction/conflict_resolver.h"
 
 namespace artifact_system::transaction {
@@ -25,6 +26,13 @@ TransactionManager::TransactionManager(StorageInterface* storage) : TransactionM
 }
 
 TransactionManager::TransactionManager(StorageInterface* storage, Options options) : storage_(storage), options_(std::move(options)) {
+  const bool using_default_classifier = options_.path_conflict_classifier == nullptr;
+  if (using_default_classifier) {
+    options_.path_conflict_classifier = index::IndexPathConflictClassifier;
+  }
+  if (using_default_classifier && options_.retry_conflict_resolver == nullptr) {
+    options_.retry_conflict_resolver = index::BuildDeterministicIndexRetryConflictResolver(storage_);
+  }
   if (options_.sleep_for == nullptr) {
     options_.sleep_for = [](absl::Duration d) { absl::SleepFor(d); };
   }
