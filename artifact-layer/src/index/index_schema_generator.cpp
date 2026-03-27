@@ -120,10 +120,17 @@ absl::StatusOr<GeneratedIndexSchema> GenerateIndexSchema(const artifact_system::
   if (index_definition.order().empty()) {
     return absl::InvalidArgumentError("index_definition.order must contain at least one field");
   }
+  int artifact_id_order_count = 0;
   for (const auto& order : index_definition.order()) {
     if (order.direction() == artifact_system::OrderDefinition::ORDER_BY_UNSPECIFIED) {
       return absl::InvalidArgumentError("index_definition.order direction must be ASCENDING or DESCENDING");
     }
+    if (order.field() == "artifact_id") {
+      ++artifact_id_order_count;
+    }
+  }
+  if (artifact_id_order_count != 1) {
+    return absl::InvalidArgumentError("index_definition.order must include artifact_id");
   }
 
   const std::string suffix = SanitizeForIdentifier(absl::StrCat(parent_descriptor.full_name(), "_", index_definition.key_type()));

@@ -105,5 +105,40 @@ TEST(IndexSchemaGeneratorTest, SupportsEnumsDefinedInImportedFiles) {
   EXPECT_EQ(key_field->enum_type()->full_name(), "artifact_system.testing.Status");
 }
 
+TEST(IndexSchemaGeneratorTest, RejectsOrderWithoutArtifactId) {
+  const auto* descriptor = artifact_system::TypeDefinition::descriptor();
+  ASSERT_NE(descriptor, nullptr);
+
+  const auto& options = descriptor->options();
+  ASSERT_GT(options.ExtensionSize(artifact_system::indexes), 0);
+  artifact_system::IndexDefinition definition = options.GetExtension(artifact_system::indexes, 0);
+
+  definition.clear_order();
+  auto* order = definition.add_order();
+  order->set_field("type_name");
+  order->set_direction(artifact_system::OrderDefinition::ASCENDING);
+
+  auto schema_or = index::GenerateIndexSchema(definition, *descriptor);
+  ASSERT_FALSE(schema_or.ok());
+  EXPECT_EQ(schema_or.status().code(), absl::StatusCode::kInvalidArgument);
+}
+
+TEST(IndexSchemaGeneratorTest, RejectsDuplicateArtifactIdOrderFields) {
+  const auto* descriptor = artifact_system::TypeDefinition::descriptor();
+  ASSERT_NE(descriptor, nullptr);
+
+  const auto& options = descriptor->options();
+  ASSERT_GT(options.ExtensionSize(artifact_system::indexes), 0);
+  artifact_system::IndexDefinition definition = options.GetExtension(artifact_system::indexes, 0);
+
+  auto* duplicate = definition.add_order();
+  duplicate->set_field("artifact_id");
+  duplicate->set_direction(artifact_system::OrderDefinition::ASCENDING);
+
+  auto schema_or = index::GenerateIndexSchema(definition, *descriptor);
+  ASSERT_FALSE(schema_or.ok());
+  EXPECT_EQ(schema_or.status().code(), absl::StatusCode::kInvalidArgument);
+}
+
 } // namespace
 } // namespace artifact_system::testing

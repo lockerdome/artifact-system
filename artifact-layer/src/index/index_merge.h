@@ -1,7 +1,5 @@
 #pragma once
 
-#include <optional>
-
 #include "absl/status/statusor.h"
 #include "artifact_options.pb.h"
 #include "index/index_object.h"
@@ -9,7 +7,6 @@
 namespace artifact_system::index {
 
 struct IndexMergeResult {
-  bool unique_conflict = false;
   IndexObject merged;
 };
 

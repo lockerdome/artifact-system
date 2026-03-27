@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <unordered_set>
 
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
@@ -158,6 +159,21 @@ absl::Status WriteCell(const IndexCell& cell, const google::protobuf::Reflection
   }
 }
 
+absl::Status ValidateCompleteKey(const google::protobuf::Message& key_message, const artifact_system::IndexDefinition& index_definition) {
+  const google::protobuf::Descriptor* key_descriptor = key_message.GetDescriptor();
+  const google::protobuf::Reflection* key_reflection = key_message.GetReflection();
+  for (int i = 0; i < index_definition.key_size(); ++i) {
+    const auto* key_field = key_descriptor->FindFieldByNumber(i + 1);
+    if (key_field == nullptr) {
+      return absl::InternalError("generated key schema missing key field");
+    }
+    if (!key_reflection->HasField(key_message, key_field)) {
+      return absl::InvalidArgumentError("serialized key is missing one or more required key fields");
+    }
+  }
+  return absl::OkStatus();
+}
+
 } // namespace
 
 absl::StatusOr<int> CompareIndexCellAscending(const IndexCell& lhs, const IndexCell& rhs) {
@@ -222,7 +238,7 @@ absl::StatusOr<std::string> SerializeIndexObject(const GeneratedIndexSchema& sch
   if (schema.index_descriptor == nullptr || schema.key_descriptor == nullptr || schema.value_descriptor == nullptr) {
     return absl::InvalidArgumentError("schema is not initialized");
   }
-  bool has_artifact_id_order = false;
+  int artifact_id_order_count = 0;
   int artifact_id_order_index = -1;
   for (int i = 0; i < index_definition.order_size(); ++i) {
     const auto& order = index_definition.order(i);
@@ -230,13 +246,12 @@ absl::StatusOr<std::string> SerializeIndexObject(const GeneratedIndexSchema& sch
       return absl::InvalidArgumentError("index definition must include explicit order direction");
     }
     if (order.field() == "artifact_id") {
-      has_artifact_id_order = true;
+      ++artifact_id_order_count;
       artifact_id_order_index = i;
-      break;
     }
   }
-  if (!has_artifact_id_order) {
-    return absl::InvalidArgumentError("index definition must include artifact_id in order fields");
+  if (artifact_id_order_count != 1 || artifact_id_order_index < 0) {
+    return absl::InvalidArgumentError("index definition must include artifact_id exactly once in order fields");
   }
 
   google::protobuf::DynamicMessageFactory factory;
@@ -262,6 +277,11 @@ absl::StatusOr<std::string> SerializeIndexObject(const GeneratedIndexSchema& sch
   }
   if (object.serialized_key.empty()) {
     key_message->Clear();
+  } else {
+    absl::Status key_status = ValidateCompleteKey(*key_message, index_definition);
+    if (!key_status.ok()) {
+      return key_status;
+    }
   }
 
   google::protobuf::Message* value_message = index_reflection->MutableMessage(index_message.get(), value_field);
@@ -277,7 +297,12 @@ absl::StatusOr<std::string> SerializeIndexObject(const GeneratedIndexSchema& sch
     return absl::InvalidArgumentError("row_count exceeds protobuf repeated-field index range");
   }
   std::vector<IndexRow> rows = object.rows;
+  std::unordered_set<uint64_t> seen_artifact_ids;
+  seen_artifact_ids.reserve(rows.size());
   for (const IndexRow& row : rows) {
+    if (!seen_artifact_ids.insert(row.artifact_id).second) {
+      return absl::InvalidArgumentError("duplicate artifact_id rows are not allowed");
+    }
     if (row.order_values.size() != static_cast<size_t>(index_definition.order_size())) {
       return absl::InvalidArgumentError("row order value count does not match index definition");
     }
@@ -351,18 +376,17 @@ absl::StatusOr<IndexObject> DeserializeIndexObject(const GeneratedIndexSchema& s
     return absl::InvalidArgumentError("schema is not initialized");
   }
 
-  bool has_artifact_id_order = false;
+  int artifact_id_order_count = 0;
   for (const auto& order : index_definition.order()) {
     if (order.direction() == artifact_system::OrderDefinition::ORDER_BY_UNSPECIFIED) {
       return absl::InvalidArgumentError("index definition must include explicit order direction");
     }
     if (order.field() == "artifact_id") {
-      has_artifact_id_order = true;
-      break;
+      ++artifact_id_order_count;
     }
   }
-  if (!has_artifact_id_order) {
-    return absl::InvalidArgumentError("index definition must include artifact_id in order fields");
+  if (artifact_id_order_count != 1) {
+    return absl::InvalidArgumentError("index definition must include artifact_id exactly once in order fields");
   }
 
   google::protobuf::DynamicMessageFactory factory;
@@ -389,6 +413,10 @@ absl::StatusOr<IndexObject> DeserializeIndexObject(const GeneratedIndexSchema& s
       return serialized_key_or.status();
     }
     out.serialized_key = *serialized_key_or;
+    absl::Status key_status = ValidateCompleteKey(index_reflection->GetMessage(*index_message, key_field), index_definition);
+    if (!key_status.ok()) {
+      return key_status;
+    }
   }
   if (index_definition.key_size() > 0 && out.serialized_key.empty()) {
     return absl::InvalidArgumentError("serialized key missing for index with non-empty key");
@@ -420,6 +448,8 @@ absl::StatusOr<IndexObject> DeserializeIndexObject(const GeneratedIndexSchema& s
   }
 
   out.rows.reserve(row_count);
+  std::unordered_set<uint64_t> seen_artifact_ids;
+  seen_artifact_ids.reserve(static_cast<size_t>(row_count));
   for (uint64_t row_index = 0; row_index < row_count; ++row_index) {
     IndexRow row;
     bool row_has_artifact_id = false;
@@ -441,6 +471,9 @@ absl::StatusOr<IndexObject> DeserializeIndexObject(const GeneratedIndexSchema& s
     }
     if (!row_has_artifact_id) {
       return absl::InvalidArgumentError("artifact_id order field value missing from row");
+    }
+    if (!seen_artifact_ids.insert(row.artifact_id).second) {
+      return absl::InvalidArgumentError("duplicate artifact_id rows are not allowed");
     }
     out.rows.push_back(std::move(row));
   }

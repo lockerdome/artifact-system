@@ -104,17 +104,20 @@ absl::StatusOr<IndexMergeResult> MergeIndexObjects(const artifact_system::IndexD
     return absl::InvalidArgumentError("index merge requires base/ours/theirs to have same key");
   }
 
-  bool has_artifact_id_order = false;
-  for (const auto& order : index_definition.order()) {
+  int artifact_id_order_count = 0;
+  int artifact_id_order_index = -1;
+  for (int i = 0; i < index_definition.order_size(); ++i) {
+    const auto& order = index_definition.order(i);
     if (order.field() == "artifact_id") {
-      has_artifact_id_order = true;
+      ++artifact_id_order_count;
+      artifact_id_order_index = i;
     }
     if (order.direction() == artifact_system::OrderDefinition::ORDER_BY_UNSPECIFIED) {
       return absl::InvalidArgumentError("index merge requires explicit order direction");
     }
   }
-  if (!has_artifact_id_order) {
-    return absl::InvalidArgumentError("index merge requires artifact_id order field");
+  if (artifact_id_order_count != 1 || artifact_id_order_index < 0) {
+    return absl::InvalidArgumentError("index merge requires artifact_id order field exactly once");
   }
 
   auto base_map_or = ToRowMap(base);
@@ -175,6 +178,13 @@ absl::StatusOr<IndexMergeResult> MergeIndexObjects(const artifact_system::IndexD
     if (row.order_values.size() != expected_order_count) {
       return absl::InvalidArgumentError("merged row order value count does not match index definition");
     }
+    const IndexCell& artifact_id_cell = row.order_values[static_cast<size_t>(artifact_id_order_index)];
+    if (!std::holds_alternative<uint64_t>(artifact_id_cell)) {
+      return absl::InvalidArgumentError("artifact_id order field value must be uint64");
+    }
+    if (std::get<uint64_t>(artifact_id_cell) != artifact_id) {
+      return absl::InvalidArgumentError("merged row artifact_id does not match artifact_id order field value");
+    }
     for (const auto& cell : row.order_values) {
       auto self_cmp_or = CompareIndexCellAscending(cell, cell);
       if (!self_cmp_or.ok()) {
@@ -205,7 +215,7 @@ absl::StatusOr<IndexMergeResult> MergeIndexObjects(const artifact_system::IndexD
   IndexMergeResult result;
   result.merged = std::move(merged_object);
   if (index_definition.unique() && result.merged.rows.size() > 1) {
-    result.unique_conflict = true;
+    return absl::AbortedError("unique index conflict");
   }
   return result;
 }

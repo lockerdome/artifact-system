@@ -2,6 +2,7 @@
 
 #include <cstdint>
 
+#include "absl/status/status.h"
 #include "artifact_options.pb.h"
 #include "gtest/gtest.h"
 
@@ -30,7 +31,6 @@ TEST(IndexMergeTest, MergeNoConflictKeepsRows) {
 
   auto merged_or = index::MergeIndexObjects(definition, base, ours, theirs);
   ASSERT_TRUE(merged_or.ok()) << merged_or.status();
-  EXPECT_FALSE(merged_or->unique_conflict);
   ASSERT_EQ(merged_or->merged.rows.size(), 1U);
   EXPECT_EQ(merged_or->merged.rows[0].artifact_id, 1U);
 }
@@ -43,7 +43,6 @@ TEST(IndexMergeTest, MergeAddAddNonUniqueProducesBothRows) {
 
   auto merged_or = index::MergeIndexObjects(definition, base, ours, theirs);
   ASSERT_TRUE(merged_or.ok()) << merged_or.status();
-  EXPECT_FALSE(merged_or->unique_conflict);
   ASSERT_EQ(merged_or->merged.rows.size(), 2U);
   EXPECT_EQ(merged_or->merged.rows[0].artifact_id, 1U);
   EXPECT_EQ(merged_or->merged.rows[1].artifact_id, 2U);
@@ -57,7 +56,6 @@ TEST(IndexMergeTest, MergeAddRemoveKeepsAdd) {
 
   auto merged_or = index::MergeIndexObjects(definition, base, ours, theirs);
   ASSERT_TRUE(merged_or.ok()) << merged_or.status();
-  EXPECT_FALSE(merged_or->unique_conflict);
   ASSERT_EQ(merged_or->merged.rows.size(), 1U);
   EXPECT_EQ(merged_or->merged.rows[0].artifact_id, 2U);
 }
@@ -70,7 +68,6 @@ TEST(IndexMergeTest, MergeRemoveRemoveProducesEmptyRows) {
 
   auto merged_or = index::MergeIndexObjects(definition, base, ours, theirs);
   ASSERT_TRUE(merged_or.ok()) << merged_or.status();
-  EXPECT_FALSE(merged_or->unique_conflict);
   EXPECT_TRUE(merged_or->merged.rows.empty());
 }
 
@@ -100,8 +97,8 @@ TEST(IndexMergeTest, UniqueIndexConflictIsReported) {
   index::IndexObject theirs{.serialized_key = "k", .rows = {MakeRow(11)}};
 
   auto merged_or = index::MergeIndexObjects(definition, base, ours, theirs);
-  ASSERT_TRUE(merged_or.ok()) << merged_or.status();
-  EXPECT_TRUE(merged_or->unique_conflict);
+  ASSERT_FALSE(merged_or.ok());
+  EXPECT_EQ(merged_or.status().code(), absl::StatusCode::kAborted);
 }
 
 TEST(IndexMergeTest, DeduplicatesConflictingConcurrentUpdatesForSameArtifactId) {
@@ -127,6 +124,38 @@ TEST(IndexMergeTest, DeduplicatesConflictingConcurrentUpdatesForSameArtifactId) 
   ASSERT_EQ(merged_or->merged.rows.size(), 1U);
   EXPECT_EQ(merged_or->merged.rows[0].artifact_id, 7U);
   EXPECT_EQ(std::get<int32_t>(merged_or->merged.rows[0].order_values[1]), 2);
+}
+
+TEST(IndexMergeTest, RejectsMismatchedArtifactIdOrderValue) {
+  const artifact_system::IndexDefinition definition = BuildIndexDefinition(false);
+  index::IndexObject base{.serialized_key = "k", .rows = {index::IndexRow{.artifact_id = 7, .order_values = {static_cast<uint64_t>(8)}}}};
+  index::IndexObject ours = base;
+  index::IndexObject theirs = base;
+
+  auto merged_or = index::MergeIndexObjects(definition, base, ours, theirs);
+  ASSERT_FALSE(merged_or.ok());
+  EXPECT_EQ(merged_or.status().code(), absl::StatusCode::kInvalidArgument);
+}
+
+TEST(IndexMergeTest, RejectsDuplicateArtifactIdOrderFields) {
+  artifact_system::IndexDefinition definition;
+  definition.set_key_type("test_index");
+  definition.set_unique(false);
+  auto* order0 = definition.add_order();
+  order0->set_field("artifact_id");
+  order0->set_direction(artifact_system::OrderDefinition::ASCENDING);
+  auto* order1 = definition.add_order();
+  order1->set_field("artifact_id");
+  order1->set_direction(artifact_system::OrderDefinition::ASCENDING);
+
+  index::IndexObject base{.serialized_key = "k",
+                          .rows = {index::IndexRow{.artifact_id = 7, .order_values = {static_cast<uint64_t>(7), static_cast<uint64_t>(7)}}}};
+  index::IndexObject ours = base;
+  index::IndexObject theirs = base;
+
+  auto merged_or = index::MergeIndexObjects(definition, base, ours, theirs);
+  ASSERT_FALSE(merged_or.ok());
+  EXPECT_EQ(merged_or.status().code(), absl::StatusCode::kInvalidArgument);
 }
 
 } // namespace
