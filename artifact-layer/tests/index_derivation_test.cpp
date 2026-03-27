@@ -280,6 +280,54 @@ const google::protobuf::Descriptor* BuildDescriptorWithTwoRepeatedKeyFields(goog
   return built->FindMessageTypeByName("TwoRepeatedArtifact");
 }
 
+const google::protobuf::Descriptor* BuildDescriptorWithDependency(google::protobuf::DescriptorPool* pool) {
+  google::protobuf::FileDescriptorProto dep_file;
+  dep_file.set_name("index_derivation_dep.proto");
+  dep_file.set_syntax("proto3");
+  dep_file.set_package("artifact_system.testing");
+
+  auto* dep_message = dep_file.add_message_type();
+  dep_message->set_name("DepMessage");
+  auto* dep_repo = dep_message->add_field();
+  dep_repo->set_name("repo");
+  dep_repo->set_number(1);
+  dep_repo->set_label(google::protobuf::FieldDescriptorProto::LABEL_OPTIONAL);
+  dep_repo->set_type(google::protobuf::FieldDescriptorProto::TYPE_STRING);
+
+  if (pool->BuildFile(dep_file) == nullptr) {
+    return nullptr;
+  }
+
+  google::protobuf::FileDescriptorProto root_file;
+  root_file.set_name("index_derivation_dep_root.proto");
+  root_file.set_syntax("proto3");
+  root_file.set_package("artifact_system.testing");
+  root_file.add_dependency("artifact_options.proto");
+  root_file.add_dependency("index_derivation_dep.proto");
+
+  auto* root_message = root_file.add_message_type();
+  root_message->set_name("DependentArtifact");
+  auto* dep_field = root_message->add_field();
+  dep_field->set_name("dep");
+  dep_field->set_number(1);
+  dep_field->set_label(google::protobuf::FieldDescriptorProto::LABEL_OPTIONAL);
+  dep_field->set_type(google::protobuf::FieldDescriptorProto::TYPE_MESSAGE);
+  dep_field->set_type_name("DepMessage");
+
+  auto* index = root_message->mutable_options()->AddExtension(artifact_system::indexes);
+  index->set_key_type("by_dep_repo");
+  index->add_key("dep.repo");
+  auto* order = index->add_order();
+  order->set_field("artifact_id");
+  order->set_direction(artifact_system::OrderDefinition::ASCENDING);
+
+  const google::protobuf::FileDescriptor* built = pool->BuildFile(root_file);
+  if (built == nullptr) {
+    return nullptr;
+  }
+  return built->FindMessageTypeByName("DependentArtifact");
+}
+
 } // namespace
 
 TEST(IndexDerivationTest, DerivesSimpleRepeatedOptionalAndMultipleIndexes) {
@@ -480,6 +528,32 @@ TEST(IndexDerivationTest, RejectsIndexesWithMoreThanOneRepeatedField) {
   ASSERT_FALSE(derived_or.ok());
   EXPECT_EQ(derived_or.status().code(), absl::StatusCode::kInvalidArgument);
   EXPECT_NE(std::string(derived_or.status().message()).find("INVALID_INDEX_DEFINITION"), std::string::npos);
+}
+
+TEST(IndexDerivationTest, DeriveFromPayloadSupportsUnorderedDescriptorSet) {
+  google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
+  const auto* descriptor = BuildDescriptorWithDependency(&pool);
+  ASSERT_NE(descriptor, nullptr);
+
+  google::protobuf::DynamicMessageFactory factory;
+  std::unique_ptr<google::protobuf::Message> message = NewMessage(descriptor, &factory);
+  ASSERT_NE(message, nullptr);
+  const auto* reflection = message->GetReflection();
+  google::protobuf::Message* dep = reflection->MutableMessage(message.get(), descriptor->FindFieldByName("dep"));
+  dep->GetReflection()->SetString(dep, dep->GetDescriptor()->FindFieldByName("repo"), "alpha");
+
+  std::string payload;
+  ASSERT_TRUE(message->SerializeToString(&payload));
+
+  google::protobuf::FileDescriptorSet descriptor_set;
+  const auto* root_file = descriptor->file();
+  root_file->CopyTo(descriptor_set.add_file());
+  root_file->dependency(1)->CopyTo(descriptor_set.add_file());
+
+  auto derived_or = index::DeriveIndexEntriesFromPayload(descriptor_set, std::string(descriptor->full_name()), payload, 42, {{"by_dep_repo", 1}});
+  ASSERT_TRUE(derived_or.ok()) << derived_or.status();
+  ASSERT_EQ(derived_or->size(), 1U);
+  EXPECT_EQ(derived_or->at(0).index_def_id, 1U);
 }
 
 } // namespace artifact_system::testing

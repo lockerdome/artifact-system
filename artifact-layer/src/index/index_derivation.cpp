@@ -626,12 +626,34 @@ absl::StatusOr<std::vector<DerivedIndexEntry>> DeriveIndexEntriesFromPayload(con
                                                                              uint64_t artifact_id,
                                                                              const std::unordered_map<std::string, uint64_t>& index_def_ids_by_key_type) {
   google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
-  for (const auto& file : descriptor_set.file()) {
-    if (pool.FindFileByName(file.name()) != nullptr) {
-      continue;
+  std::vector<bool> built(descriptor_set.file_size(), false);
+  int built_count = 0;
+  bool made_progress = true;
+  while (built_count < descriptor_set.file_size() && made_progress) {
+    made_progress = false;
+    for (int i = 0; i < descriptor_set.file_size(); ++i) {
+      if (built[static_cast<size_t>(i)]) {
+        continue;
+      }
+      const auto& file = descriptor_set.file(i);
+      if (pool.FindFileByName(file.name()) != nullptr) {
+        built[static_cast<size_t>(i)] = true;
+        ++built_count;
+        made_progress = true;
+        continue;
+      }
+      if (pool.BuildFile(file) != nullptr) {
+        built[static_cast<size_t>(i)] = true;
+        ++built_count;
+        made_progress = true;
+      }
     }
-    if (pool.BuildFile(file) == nullptr) {
-      return absl::InvalidArgumentError(absl::StrCat("failed to build descriptor file: ", file.name()));
+  }
+  if (built_count < descriptor_set.file_size()) {
+    for (int i = 0; i < descriptor_set.file_size(); ++i) {
+      if (!built[static_cast<size_t>(i)]) {
+        return absl::InvalidArgumentError(absl::StrCat("failed to build descriptor file: ", descriptor_set.file(i).name()));
+      }
     }
   }
 
