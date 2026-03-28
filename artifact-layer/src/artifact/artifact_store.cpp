@@ -361,8 +361,8 @@ absl::Status ArtifactStore::StageUpdate(const std::string& branch, uint64_t arti
   // Use the old artifact's version_id to get the correct descriptor_set
   // for deriving old entries, in case the schema changed between versions.
   std::vector<index::DerivedIndexEntry> old_entries;
+  google::protobuf::FileDescriptorSet old_descriptor_set = descriptor_set;
   if (!existing_or->payload().empty()) {
-    google::protobuf::FileDescriptorSet old_descriptor_set = descriptor_set;
     // Try to read the old version's descriptor_set.
     auto old_tvd_or = ReadStoredArtifact(storage_, branch, existing_or->version_id());
     if (old_tvd_or.ok()) {
@@ -390,57 +390,58 @@ absl::Status ArtifactStore::StageUpdate(const std::string& branch, uint64_t arti
   if (!new_entries_or.ok())
     return new_entries_or.status();
 
-  // 5. Build descriptor pool for index operations.
+  // 5. Build descriptor pool for new-schema index operations.
   google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
   const auto* descriptor = BuildPoolAndFindMessage(descriptor_set, type_name, &pool);
   if (descriptor == nullptr) {
     return absl::InternalError(absl::StrCat("message '", type_name, "' not found in descriptor set for index operations"));
   }
 
-  // 6. Remove old index entries.
-  for (const auto& old_entry : old_entries) {
-    const std::string index_path = encoding::IndexPath(old_entry.index_def_id, old_entry.encoded_key);
+  // 6. Remove old index entries using the old descriptor set.
+  // We must use the old descriptor because index definitions (key_type, key
+  // fields) may differ between schema versions.
+  if (!old_entries.empty()) {
+    google::protobuf::DescriptorPool old_pool(google::protobuf::DescriptorPool::generated_pool());
+    const auto* old_descriptor = BuildPoolAndFindMessage(old_descriptor_set, type_name, &old_pool);
+    // If the old descriptor can't be resolved, skip cleanup (best-effort).
+    if (old_descriptor != nullptr) {
+      for (const auto& old_entry : old_entries) {
+        const std::string index_path = encoding::IndexPath(old_entry.index_def_id, old_entry.encoded_key);
 
-    IndexDefinition index_def;
-    const auto& options = descriptor->options();
-    bool found = false;
-    for (int i = 0; i < options.ExtensionSize(artifact_system::indexes); ++i) {
-      const auto& def = options.GetExtension(artifact_system::indexes, i);
-      if (def.key_type() == old_entry.key_type) {
-        index_def = def;
-        found = true;
-        break;
-      }
-    }
-    if (!found)
-      continue;
+        IndexDefinition index_def;
+        const auto& options = old_descriptor->options();
+        bool found = false;
+        for (int i = 0; i < options.ExtensionSize(artifact_system::indexes); ++i) {
+          const auto& def = options.GetExtension(artifact_system::indexes, i);
+          if (def.key_type() == old_entry.key_type) {
+            index_def = def;
+            found = true;
+            break;
+          }
+        }
+        if (!found)
+          continue;
 
-    auto schema_or = index::GenerateIndexSchema(index_def, *descriptor);
-    if (!schema_or.ok())
-      continue;
+        auto schema_or = index::GenerateIndexSchema(index_def, *old_descriptor);
+        if (!schema_or.ok())
+          continue;
 
-    auto existing_idx_or = storage_->GetObject(branch, index_path);
-    if (!existing_idx_or.ok())
-      continue;
+        auto existing_idx_or = storage_->GetObject(branch, index_path);
+        if (!existing_idx_or.ok())
+          continue;
 
-    auto deser_or = index::DeserializeIndexObject(*schema_or, index_def, *existing_idx_or);
-    if (!deser_or.ok())
-      continue;
+        auto deser_or = index::DeserializeIndexObject(*schema_or, index_def, *existing_idx_or);
+        if (!deser_or.ok())
+          continue;
 
-    auto& idx_obj = *deser_or;
-    // Remove the row with this artifact_id.
-    std::erase_if(idx_obj.rows, [artifact_id](const index::IndexRow& row) { return row.artifact_id == artifact_id; });
+        auto& idx_obj = *deser_or;
+        std::erase_if(idx_obj.rows, [artifact_id](const index::IndexRow& row) { return row.artifact_id == artifact_id; });
 
-    if (idx_obj.rows.empty()) {
-      // Tombstone: write empty index object (zero rows).
-      auto ser_or = index::SerializeIndexObject(*schema_or, index_def, idx_obj);
-      if (ser_or.ok()) {
-        (void)storage_->PutObject(branch, index_path, *ser_or);
-      }
-    } else {
-      auto ser_or = index::SerializeIndexObject(*schema_or, index_def, idx_obj);
-      if (ser_or.ok()) {
-        (void)storage_->PutObject(branch, index_path, *ser_or);
+        // Write back (even if empty — tombstoned index per PRD).
+        auto ser_or = index::SerializeIndexObject(*schema_or, index_def, idx_obj);
+        if (ser_or.ok()) {
+          (void)storage_->PutObject(branch, index_path, *ser_or);
+        }
       }
     }
   }
@@ -590,27 +591,17 @@ absl::StatusOr<CreateResult> ArtifactStore::CreateArtifact(uint64_t version_id, 
 
   // Run validation pipeline (phases 1-5).
   ValidationContext vctx{storage_, read_ref, options_.bypass_mutation_check};
-  auto violations_or = ValidateCreateOrUpdate(WriteOperation::kCreate, version_id, payload, vctx, std::nullopt, options_.index_def_ids_by_key_type);
-  if (!violations_or.ok())
-    return violations_or.status();
+  auto val_result_or = ValidateCreateOrUpdate(WriteOperation::kCreate, version_id, payload, vctx, std::nullopt, options_.index_def_ids_by_key_type);
+  if (!val_result_or.ok())
+    return val_result_or.status();
 
-  // If phases 1-4 short-circuited, return immediately.
-  bool has_short_circuit = false;
-  for (const auto& v : *violations_or) {
-    if (v.category() == ArtifactWriteViolation::INVALID_VERSION_ID || v.category() == ArtifactWriteViolation::MUTATION_DENIED ||
-        v.category() == ArtifactWriteViolation::EMPTY_PAYLOAD || v.category() == ArtifactWriteViolation::PAYLOAD_VALIDATION_FAILURE) {
-      has_short_circuit = true;
-      break;
-    }
+  auto& val_result = *val_result_or;
+
+  // If phases 1-4 short-circuited (no resolved_type), return immediately.
+  if (!val_result.resolved_type.has_value()) {
+    return MakeWriteError(val_result.violations);
   }
-  if (has_short_circuit)
-    return MakeWriteError(*violations_or);
-
-  // Resolve type once (reuse for both referential integrity and staging).
-  auto resolved_or = ResolveVersionId(version_id, vctx);
-  if (!resolved_or.ok())
-    return resolved_or.status();
-  const ResolvedType& resolved = *resolved_or;
+  const ResolvedType& resolved = *val_result.resolved_type;
 
   // Run referential integrity validation (phase 6) — runs independently
   // of phase 5 (NaN/varint). Both phases' violations are collected.
@@ -623,14 +614,14 @@ absl::StatusOr<CreateResult> ArtifactStore::CreateArtifact(uint64_t version_id, 
     if (msg->ParseFromString(payload)) {
       RefIntegrityContext ri_ctx{storage_, read_ref};
       auto ref_violations_or = ValidateReferences(*msg, *descriptor, ri_ctx);
-      if (ref_violations_or.ok()) {
-        violations_or->insert(violations_or->end(), ref_violations_or->begin(), ref_violations_or->end());
-      }
+      if (!ref_violations_or.ok())
+        return ref_violations_or.status();
+      val_result.violations.insert(val_result.violations.end(), ref_violations_or->begin(), ref_violations_or->end());
     }
   }
 
-  if (!violations_or->empty())
-    return MakeWriteError(*violations_or);
+  if (!val_result.violations.empty())
+    return MakeWriteError(val_result.violations);
 
   // Stage the write.
   auto snapshot_or = ExecuteWrite(transaction_id, [&](const std::string& branch) -> absl::Status {
@@ -663,27 +654,17 @@ absl::StatusOr<WriteResult> ArtifactStore::UpdateArtifact(uint64_t artifact_id, 
 
   // Run validation pipeline (phases 1-5).
   ValidationContext vctx{storage_, read_ref, options_.bypass_mutation_check};
-  auto violations_or = ValidateCreateOrUpdate(WriteOperation::kUpdate, version_id, payload, vctx, artifact_id, options_.index_def_ids_by_key_type);
-  if (!violations_or.ok())
-    return violations_or.status();
+  auto val_result_or = ValidateCreateOrUpdate(WriteOperation::kUpdate, version_id, payload, vctx, artifact_id, options_.index_def_ids_by_key_type);
+  if (!val_result_or.ok())
+    return val_result_or.status();
 
-  // If phases 1-4 short-circuited, return immediately.
-  bool has_short_circuit = false;
-  for (const auto& v : *violations_or) {
-    if (v.category() == ArtifactWriteViolation::INVALID_VERSION_ID || v.category() == ArtifactWriteViolation::MUTATION_DENIED ||
-        v.category() == ArtifactWriteViolation::EMPTY_PAYLOAD || v.category() == ArtifactWriteViolation::PAYLOAD_VALIDATION_FAILURE) {
-      has_short_circuit = true;
-      break;
-    }
+  auto& val_result = *val_result_or;
+
+  // If phases 1-4 short-circuited (no resolved_type), return immediately.
+  if (!val_result.resolved_type.has_value()) {
+    return MakeWriteError(val_result.violations);
   }
-  if (has_short_circuit)
-    return MakeWriteError(*violations_or);
-
-  // Resolve type once for referential integrity and staging.
-  auto resolved_or = ResolveVersionId(version_id, vctx);
-  if (!resolved_or.ok())
-    return resolved_or.status();
-  const ResolvedType& resolved = *resolved_or;
+  const ResolvedType& resolved = *val_result.resolved_type;
 
   // Referential integrity validation (phase 6) — independent of phase 5.
   google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
@@ -695,14 +676,14 @@ absl::StatusOr<WriteResult> ArtifactStore::UpdateArtifact(uint64_t artifact_id, 
     if (msg->ParseFromString(payload)) {
       RefIntegrityContext ri_ctx{storage_, read_ref};
       auto ref_violations_or = ValidateReferences(*msg, *descriptor, ri_ctx);
-      if (ref_violations_or.ok()) {
-        violations_or->insert(violations_or->end(), ref_violations_or->begin(), ref_violations_or->end());
-      }
+      if (!ref_violations_or.ok())
+        return ref_violations_or.status();
+      val_result.violations.insert(val_result.violations.end(), ref_violations_or->begin(), ref_violations_or->end());
     }
   }
 
-  if (!violations_or->empty())
-    return MakeWriteError(*violations_or);
+  if (!val_result.violations.empty())
+    return MakeWriteError(val_result.violations);
 
   auto snapshot_or = ExecuteWrite(transaction_id, [&](const std::string& branch) -> absl::Status {
     return StageUpdate(branch, artifact_id, version_id, resolved.type_name, payload, resolved.descriptor_set);

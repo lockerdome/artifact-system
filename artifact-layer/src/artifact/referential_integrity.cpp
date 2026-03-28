@@ -15,6 +15,7 @@
 #include "encoding/artifact_path.h"
 #include "encoding/index_key_encoder.h"
 #include "google/protobuf/descriptor.h"
+#include "google/protobuf/descriptor.pb.h"
 #include "google/protobuf/message.h"
 #include "google/protobuf/reflection.h"
 #include "index/index_object.h"
@@ -150,6 +151,93 @@ std::vector<uint8_t> EncodeStringKey(const std::string& value) {
   return out;
 }
 
+// Build a DescriptorPool from a FileDescriptorSet and find a message by name.
+const google::protobuf::Descriptor* BuildPoolAndFindMessage(const google::protobuf::FileDescriptorSet& descriptor_set, const std::string& message_full_name,
+                                                            google::protobuf::DescriptorPool* pool) {
+  std::vector<bool> built(descriptor_set.file_size(), false);
+  int built_count = 0;
+  bool made_progress = true;
+  while (built_count < descriptor_set.file_size() && made_progress) {
+    made_progress = false;
+    for (int i = 0; i < descriptor_set.file_size(); ++i) {
+      if (built[static_cast<size_t>(i)])
+        continue;
+      const auto& file = descriptor_set.file(i);
+      if (pool->FindFileByName(file.name()) != nullptr) {
+        built[static_cast<size_t>(i)] = true;
+        ++built_count;
+        made_progress = true;
+        continue;
+      }
+      if (pool->BuildFile(file) != nullptr) {
+        built[static_cast<size_t>(i)] = true;
+        ++built_count;
+        made_progress = true;
+      }
+    }
+  }
+  return pool->FindMessageTypeByName(message_full_name);
+}
+
+// Resolve the referencing type's descriptor for a ReferenceDefinition.
+// Path: referencing_type_name → type_name_unique index → TypeDefinition
+//       → current_version_id → TypeVersionDefinition → descriptor_set.
+// Returns nullptr if any step fails (best-effort).
+struct ResolvedReferencingType {
+  google::protobuf::FileDescriptorSet descriptor_set;
+  std::unique_ptr<google::protobuf::DescriptorPool> pool;
+  const google::protobuf::Descriptor* descriptor = nullptr;
+};
+
+std::optional<ResolvedReferencingType> ResolveReferencingType(const std::string& referencing_type_name, const RefIntegrityContext& ctx,
+                                                              const std::unordered_map<std::string, uint64_t>& index_def_ids_by_key_type) {
+  // Step 1: Find the type_name_unique index to look up the TypeDefinition.
+  auto tnu_it = index_def_ids_by_key_type.find("type_name_unique");
+  if (tnu_it == index_def_ids_by_key_type.end()) {
+    return std::nullopt;
+  }
+
+  const auto* td_descriptor = TypeDefinition::descriptor();
+  const IndexDefinition tnu_def = MakeIndexDefinition("type_name_unique", {"type_name"}, true);
+  const std::vector<uint8_t> tnu_key = EncodeStringKey(referencing_type_name);
+
+  auto td_ids_or = ReadIndexArtifactIds(tnu_it->second, tnu_key, tnu_def, *td_descriptor, ctx);
+  if (!td_ids_or.ok() || td_ids_or->empty()) {
+    return std::nullopt;
+  }
+  const uint64_t type_def_id = (*td_ids_or)[0];
+
+  // Step 2: Read the TypeDefinition to get current_version_id.
+  auto td_stored_or = ReadStoredArtifact(type_def_id, ctx);
+  if (!td_stored_or.ok() || !td_stored_or->has_value() || td_stored_or->value().payload().empty()) {
+    return std::nullopt;
+  }
+  TypeDefinition td;
+  if (!td.ParseFromString(td_stored_or->value().payload())) {
+    return std::nullopt;
+  }
+
+  // Step 3: Read the TypeVersionDefinition to get the descriptor_set.
+  auto tvd_stored_or = ReadStoredArtifact(td.current_version_id(), ctx);
+  if (!tvd_stored_or.ok() || !tvd_stored_or->has_value() || tvd_stored_or->value().payload().empty()) {
+    return std::nullopt;
+  }
+  TypeVersionDefinition tvd;
+  if (!tvd.ParseFromString(tvd_stored_or->value().payload())) {
+    return std::nullopt;
+  }
+
+  // Step 4: Build pool and find the message descriptor.
+  ResolvedReferencingType result;
+  result.descriptor_set = tvd.descriptor_set();
+  result.pool = std::make_unique<google::protobuf::DescriptorPool>(google::protobuf::DescriptorPool::generated_pool());
+  result.descriptor = BuildPoolAndFindMessage(result.descriptor_set, referencing_type_name, result.pool.get());
+  if (result.descriptor == nullptr) {
+    return std::nullopt;
+  }
+  return result;
+}
+
 } // namespace
 
 absl::StatusOr<std::vector<ArtifactWriteViolation>> ValidateReferences(const google::protobuf::Message& message, const google::protobuf::Descriptor& descriptor,
@@ -239,22 +327,12 @@ absl::StatusOr<DeleteEnforcementResult> EnforceDeleteIntegrity(uint64_t artifact
   // Use the "references_by_target_type" index.
   const auto refs_idx_it = index_def_ids_by_key_type.find("references_by_target_type");
   if (refs_idx_it == index_def_ids_by_key_type.end()) {
-    // No index definition ID provided for references_by_target_type.
-    // This means no reference definitions are registered, so nothing to enforce.
     return result;
   }
 
   const uint64_t refs_index_def_id = refs_idx_it->second;
-
-  // Encode the key for the references_by_target_type index: key is
-  // [target_type_name] (a string field).
   const std::vector<uint8_t> refs_encoded_key = EncodeStringKey(type_name);
-
-  // Build the IndexDefinition for "references_by_target_type" to use with
-  // GenerateIndexSchema and DeserializeIndexObject.
   const IndexDefinition refs_index_def = MakeIndexDefinition("references_by_target_type", {"target_type_name"}, false);
-
-  // We need the ReferenceDefinition descriptor for GenerateIndexSchema.
   const auto* ref_def_descriptor = ReferenceDefinition::descriptor();
 
   auto ref_def_ids_or = ReadIndexArtifactIds(refs_index_def_id, refs_encoded_key, refs_index_def, *ref_def_descriptor, ctx);
@@ -269,7 +347,7 @@ absl::StatusOr<DeleteEnforcementResult> EnforceDeleteIntegrity(uint64_t artifact
       return stored_or.status();
     }
     if (!stored_or->has_value() || stored_or->value().payload().empty()) {
-      continue; // missing or tombstoned reference definition, skip
+      continue;
     }
 
     ReferenceDefinition ref_def;
@@ -277,7 +355,6 @@ absl::StatusOr<DeleteEnforcementResult> EnforceDeleteIntegrity(uint64_t artifact
       return absl::InternalError(absl::StrCat("failed to parse ReferenceDefinition artifact ", ref_def_id));
     }
 
-    // Verify this reference definition actually targets our type.
     if (ref_def.target_type_name() != type_name) {
       continue;
     }
@@ -286,60 +363,21 @@ absl::StatusOr<DeleteEnforcementResult> EnforceDeleteIntegrity(uint64_t artifact
     const std::string& covering_key_type = ref_def.covering_index_key_type();
     const auto covering_idx_it = index_def_ids_by_key_type.find(covering_key_type);
     if (covering_idx_it == index_def_ids_by_key_type.end()) {
-      // Cannot look up the covering index; skip this reference.
       continue;
     }
     const uint64_t covering_idx_def_id = covering_idx_it->second;
-
-    // The covering index key is the deleted artifact_id encoded as uint64.
     const std::vector<uint8_t> covering_encoded_key = EncodeUint64Key(artifact_id);
-
-    // Build an IndexDefinition for the covering index.
-    // The covering index has key = [field_name] which is a uint64 field
-    // referencing the target artifact.
     const IndexDefinition covering_index_def = MakeIndexDefinition(covering_key_type, {ref_def.field_name()}, false);
 
-    // We need the referencing type's descriptor for GenerateIndexSchema.
-    // Since we don't have the dynamic descriptor for the referencing type,
-    // we use the ReferenceDefinition's referencing_type_name to find it.
-    // However, the covering index was registered against the referencing type.
-    // For now, we read the index directly using the covering index definition
-    // and the ReferenceDefinition descriptor as a proxy (the covering index
-    // only has key=[uint64 field] and order=[artifact_id ASC], so any message
-    // with a uint64 field at the right path works).
-    //
-    // A cleaner approach: the covering index is keyed by a uint64 field, so
-    // we can use the ReferenceDefinition descriptor itself (which also has
-    // uint64 fields) as a stand-in for schema generation when the key field
-    // is a simple uint64.  But GenerateIndexSchema needs the field_name to
-    // exist on the descriptor.  Instead, we just read the raw index object
-    // path and deserialize it.
-    //
-    // Simplification: read the index object directly at the path and
-    // deserialize using a synthetic schema.  The covering index key is a
-    // single uint64 field, so we construct a minimal IndexDefinition and
-    // use ReferenceDefinition's descriptor which has the needed uint64 field
-    // at "artifact_id" position... but that won't work for arbitrary field
-    // names.
-    //
-    // Best approach: use the index path directly and try to deserialize.
-    // We construct a covering IndexDefinition with key=[field_name]. Since
-    // field_name refers to a field on the *referencing type's* descriptor
-    // (not ReferenceDefinition), we need that descriptor. We don't have it
-    // at this layer. So we use a two-step approach:
-    //   1. Read the raw bytes at the index path
-    //   2. Use a generic single-uint64-key index schema for deserialization
+    // Resolve the referencing type's descriptor via type_name_unique index
+    // so GenerateIndexSchema can determine field types for deserialization.
+    auto resolved = ResolveReferencingType(ref_def.referencing_type_name(), ctx, index_def_ids_by_key_type);
+    if (!resolved.has_value()) {
+      continue; // can't resolve — skip this reference (best effort)
+    }
 
-    // For the covering index, construct an IndexDefinition that references
-    // the "type_id" field from ReferenceDefinition (a uint64), since we
-    // just need a descriptor with a uint64 field at position matching the
-    // key field. The actual key encoding uses the raw uint64 value regardless
-    // of field name, so this works for deserialization.
-    const IndexDefinition covering_deser_def = MakeIndexDefinition(covering_key_type, {"type_id"}, false);
-
-    auto referencing_ids_or = ReadIndexArtifactIds(covering_idx_def_id, covering_encoded_key, covering_deser_def, *ref_def_descriptor, ctx);
+    auto referencing_ids_or = ReadIndexArtifactIds(covering_idx_def_id, covering_encoded_key, covering_index_def, *resolved->descriptor, ctx);
     if (!referencing_ids_or.ok()) {
-      // If the index doesn't exist or can't be read, skip.
       if (absl::IsNotFound(referencing_ids_or.status()) || absl::IsInvalidArgument(referencing_ids_or.status())) {
         continue;
       }
@@ -358,7 +396,6 @@ absl::StatusOr<DeleteEnforcementResult> EnforceDeleteIntegrity(uint64_t artifact
       continue;
     }
 
-    // Apply on_delete policy.
     switch (ref_def.on_delete()) {
     case ReferenceOption::RESTRICT:
       result.violations.push_back(
@@ -366,11 +403,40 @@ absl::StatusOr<DeleteEnforcementResult> EnforceDeleteIntegrity(uint64_t artifact
                         absl::StrCat("delete restricted: ", active_referencing.size(), " referencing artifact(s) exist via ", ref_def.key_type())));
       break;
 
-    case ReferenceOption::CASCADE:
+    case ReferenceOption::CASCADE: {
+      // Recursively enforce referential integrity on cascaded artifacts
+      // (PRD: "recursively applying referential integrity").
       for (const uint64_t ref_artifact_id : active_referencing) {
         result.side_effects.push_back(CascadeDelete{ref_artifact_id});
       }
+      // Recurse: each cascaded artifact may itself have references.
+      std::set<uint64_t> updated_scheduled = scheduled_deletes;
+      for (const uint64_t ref_artifact_id : active_referencing) {
+        updated_scheduled.insert(ref_artifact_id);
+      }
+      for (const uint64_t ref_artifact_id : active_referencing) {
+        // Read the cascaded artifact to get its type_name.
+        auto cascade_stored_or = ReadStoredArtifact(ref_artifact_id, ctx);
+        if (!cascade_stored_or.ok() || !cascade_stored_or->has_value() || cascade_stored_or->value().payload().empty()) {
+          continue;
+        }
+        auto cascade_result_or =
+            EnforceDeleteIntegrity(ref_artifact_id, cascade_stored_or->value().type_name(), ctx, updated_scheduled, index_def_ids_by_key_type);
+        if (!cascade_result_or.ok()) {
+          return cascade_result_or.status();
+        }
+        // Propagate violations and side effects from the recursive call.
+        result.violations.insert(result.violations.end(), cascade_result_or->violations.begin(), cascade_result_or->violations.end());
+        result.side_effects.insert(result.side_effects.end(), cascade_result_or->side_effects.begin(), cascade_result_or->side_effects.end());
+        // Track all newly scheduled deletes from the recursive call.
+        for (const auto& effect : cascade_result_or->side_effects) {
+          if (std::holds_alternative<CascadeDelete>(effect)) {
+            updated_scheduled.insert(std::get<CascadeDelete>(effect).artifact_id);
+          }
+        }
+      }
       break;
+    }
 
     case ReferenceOption::SET_NULL:
       for (const uint64_t ref_artifact_id : active_referencing) {
@@ -379,7 +445,6 @@ absl::StatusOr<DeleteEnforcementResult> EnforceDeleteIntegrity(uint64_t artifact
       break;
 
     default:
-      // ON_DELETE_UNSPECIFIED or unknown: treat as RESTRICT.
       result.violations.push_back(
           MakeViolation(ArtifactWriteViolation::REFERENCE_DELETE_RESTRICTED, absl::StrCat("reference: ", ref_def.key_type()),
                         absl::StrCat("delete restricted: ", active_referencing.size(), " referencing artifact(s) exist via ", ref_def.key_type())));

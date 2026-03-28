@@ -1,6 +1,7 @@
 #include "artifact/referential_integrity.h"
 
 #include <cstdint>
+#include <functional>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -14,6 +15,7 @@
 #include "artifact_types.pb.h"
 #include "encoding/artifact_path.h"
 #include "encoding/index_key_encoder.h"
+#include "google/protobuf/descriptor.pb.h"
 #include "google/protobuf/dynamic_message.h"
 #include "index/index_object.h"
 #include "index/index_schema_generator.h"
@@ -175,6 +177,24 @@ absl::StatusOr<std::string> BuildIndexObjectBytes(const IndexDefinition& definit
   return index::SerializeIndexObject(*schema_or, definition, object);
 }
 
+// Build a FileDescriptorSet covering the given message descriptor and all its
+// transitive file dependencies.
+google::protobuf::FileDescriptorSet BuildDescriptorSet(const google::protobuf::Descriptor* desc) {
+  google::protobuf::FileDescriptorSet fds;
+  std::set<const google::protobuf::FileDescriptor*> seen;
+  std::function<void(const google::protobuf::FileDescriptor*)> add_file;
+  add_file = [&](const google::protobuf::FileDescriptor* fd) {
+    if (!seen.insert(fd).second)
+      return;
+    for (int i = 0; i < fd->dependency_count(); ++i) {
+      add_file(fd->dependency(i));
+    }
+    fd->CopyTo(fds.add_file());
+  };
+  add_file(desc->file());
+  return fds;
+}
+
 // Write a "references_by_target_type" index object to storage.
 void WriteReferencesByTargetTypeIndex(MemoryStorage& storage, uint64_t index_def_id, const std::string& target_type_name,
                                       const std::vector<uint64_t>& ref_def_artifact_ids) {
@@ -225,6 +245,55 @@ void WriteCoveringIndex(MemoryStorage& storage, uint64_t index_def_id, uint64_t 
   const std::vector<uint8_t> encoded_key = EncodeUint64Key(target_artifact_id);
   const std::string path = encoding::IndexPath(index_def_id, encoded_key);
   ASSERT_TRUE(storage.PutObject("main", path, *bytes_or).ok());
+}
+
+// Write a "type_name_unique" index object to storage.
+// Maps type_name -> TypeDefinition artifact_id using TypeDefinition::descriptor().
+void WriteTypeNameUniqueIndex(MemoryStorage& storage, uint64_t index_def_id, const std::string& type_name, const std::vector<uint64_t>& type_def_artifact_ids) {
+  const auto* td_descriptor = TypeDefinition::descriptor();
+  auto idx_def_or = FindIndexDefinitionByKeyType(*td_descriptor, "type_name_unique");
+  ASSERT_TRUE(idx_def_or.ok()) << idx_def_or.status();
+
+  TypeDefinition key_source;
+  key_source.set_type_name(type_name);
+  auto serialized_key_or = BuildSerializedKey(*idx_def_or, *td_descriptor, key_source);
+  ASSERT_TRUE(serialized_key_or.ok()) << serialized_key_or.status();
+
+  auto bytes_or = BuildIndexObjectBytes(*idx_def_or, *td_descriptor, *serialized_key_or, type_def_artifact_ids);
+  ASSERT_TRUE(bytes_or.ok()) << bytes_or.status();
+
+  const std::vector<uint8_t> encoded_key = EncodeStringKey(type_name);
+  const std::string path = encoding::IndexPath(index_def_id, encoded_key);
+  ASSERT_TRUE(storage.PutObject("main", path, *bytes_or).ok());
+}
+
+// Set up the full referencing type resolution chain needed by
+// EnforceDeleteIntegrity's ResolveReferencingType function:
+//   type_name_unique index -> TypeDefinition -> TypeVersionDefinition (with descriptor_set)
+//
+// Parameters:
+//   referencing_type_name: the full protobuf name of the referencing type
+//   referencing_descriptor: the Descriptor* for the referencing type
+//   tnu_index_def_id: artifact ID for the type_name_unique index definition
+//   type_def_id: artifact ID for the TypeDefinition artifact
+//   type_version_def_id: artifact ID for the TypeVersionDefinition artifact
+void SetupReferencingTypeResolution(MemoryStorage& storage, const std::string& referencing_type_name,
+                                    const google::protobuf::Descriptor* referencing_descriptor, uint64_t tnu_index_def_id, uint64_t type_def_id,
+                                    uint64_t type_version_def_id) {
+  // 1. Write the type_name_unique index entry.
+  WriteTypeNameUniqueIndex(storage, tnu_index_def_id, referencing_type_name, {type_def_id});
+
+  // 2. Write the TypeDefinition artifact with current_version_id.
+  TypeDefinition td;
+  td.set_type_name(referencing_type_name);
+  td.set_current_version_id(type_version_def_id);
+  WriteArtifact(storage, type_def_id, "TypeDefinition", /*version_id=*/1, td.SerializeAsString());
+
+  // 3. Write the TypeVersionDefinition artifact with the descriptor_set.
+  TypeVersionDefinition tvd;
+  tvd.set_type_id(type_def_id);
+  *tvd.mutable_descriptor_set() = BuildDescriptorSet(referencing_descriptor);
+  WriteArtifact(storage, type_version_def_id, "TypeVersionDefinition", /*version_id=*/1, tvd.SerializeAsString());
 }
 
 // Write a ReferenceDefinition artifact to storage.
@@ -482,122 +551,158 @@ TEST(ReferentialIntegrityTest, EnforceDeleteRefDefTargetMismatchSkipped) {
 }
 
 TEST(ReferentialIntegrityTest, EnforceDeleteRestrict) {
-  // Full RESTRICT enforcement path. We set up the references_by_target_type
-  // index and a covering index. The covering index is serialized using the
-  // TypeVersionDefinition descriptor (which has type_id), and the
-  // implementation deserializes it using the ReferenceDefinition descriptor
-  // with a hardcoded key=["type_id"]. Since ReferenceDefinition does not have
-  // a "type_id" field, GenerateIndexSchema returns INVALID_ARGUMENT which
-  // the implementation catches and gracefully skips. This test verifies that
-  // graceful degradation.
-  //
-  // NOTE: When the covering index deserialization is fixed to use the correct
-  // descriptor, update this test to expect REFERENCE_DELETE_RESTRICTED.
+  // Full RESTRICT enforcement path. The implementation resolves the referencing
+  // type's descriptor via: type_name_unique index -> TypeDefinition ->
+  // TypeVersionDefinition (descriptor_set) -> message descriptor. This test
+  // sets up the full chain and verifies REFERENCE_DELETE_RESTRICTED is returned.
   MemoryStorage storage;
 
   constexpr uint64_t kRefsIndexDefId = 5000;
   constexpr uint64_t kCoveringIndexDefId = 5001;
+  constexpr uint64_t kTnuIndexDefId = 5002;
   constexpr uint64_t kRefDefId = 6000;
   constexpr uint64_t kTargetId = 100;
   constexpr uint64_t kReferencingId = 200;
+  constexpr uint64_t kTvdTypeDefId = 7000;
+  constexpr uint64_t kTvdTypeVersionDefId = 7001;
   const std::string kCoveringKeyType = "type_versions_by_type";
+  const std::string kReferencingTypeName = "artifact_system.TypeVersionDefinition";
 
-  WriteReferenceDefinition(storage, kRefDefId, kCoveringKeyType, "TypeDefinition", "TypeVersionDefinition", "type_id", kCoveringKeyType,
+  // Set up the referencing type resolution chain.
+  SetupReferencingTypeResolution(storage, kReferencingTypeName, TypeVersionDefinition::descriptor(), kTnuIndexDefId, kTvdTypeDefId, kTvdTypeVersionDefId);
+
+  // Write the ReferenceDefinition.
+  WriteReferenceDefinition(storage, kRefDefId, kCoveringKeyType, "TypeDefinition", kReferencingTypeName, "type_id", kCoveringKeyType,
                            ReferenceOption::RESTRICT);
 
+  // Write the references_by_target_type index.
   WriteReferencesByTargetTypeIndex(storage, kRefsIndexDefId, "TypeDefinition", {kRefDefId});
-  // Note: covering index is not written here because the implementation
-  // currently uses ReferenceDefinition descriptor which lacks "type_id",
-  // so GenerateIndexSchema returns INVALID_ARGUMENT and the reference is
-  // skipped. This test verifies that graceful degradation.
+
+  // Write the covering index with one referencing artifact.
+  WriteCoveringIndex(storage, kCoveringIndexDefId, kTargetId, {kReferencingId}, kCoveringKeyType);
 
   auto ctx = MakeContext(storage);
   std::unordered_map<std::string, uint64_t> index_map = {
       {"references_by_target_type", kRefsIndexDefId},
       {kCoveringKeyType, kCoveringIndexDefId},
+      {"type_name_unique", kTnuIndexDefId},
   };
 
   auto result_or = EnforceDeleteIntegrity(kTargetId, "TypeDefinition", ctx, /*scheduled_deletes=*/{}, index_map);
   ASSERT_TRUE(result_or.ok()) << result_or.status();
 
-  // Covering index deserialization silently fails; reference is skipped.
-  EXPECT_TRUE(result_or->violations.empty());
+  // RESTRICT: should produce a violation, no side effects.
+  ASSERT_EQ(result_or->violations.size(), 1);
+  EXPECT_EQ(result_or->violations[0].category(), ArtifactWriteViolation::REFERENCE_DELETE_RESTRICTED);
   EXPECT_TRUE(result_or->side_effects.empty());
 }
 
 TEST(ReferentialIntegrityTest, EnforceDeleteCascade) {
-  // CASCADE enforcement -- same covering index limitation as RESTRICT.
+  // CASCADE enforcement: deleting a TypeDefinition that is referenced by a
+  // TypeVersionDefinition should produce a CascadeDelete side effect.
   MemoryStorage storage;
 
   constexpr uint64_t kRefsIndexDefId = 5000;
   constexpr uint64_t kCoveringIndexDefId = 5001;
+  constexpr uint64_t kTnuIndexDefId = 5002;
   constexpr uint64_t kRefDefId = 6000;
   constexpr uint64_t kTargetId = 100;
+  constexpr uint64_t kReferencingId = 200;
+  constexpr uint64_t kTvdTypeDefId = 7000;
+  constexpr uint64_t kTvdTypeVersionDefId = 7001;
   const std::string kCoveringKeyType = "type_versions_by_type";
+  const std::string kReferencingTypeName = "artifact_system.TypeVersionDefinition";
 
-  WriteReferenceDefinition(storage, kRefDefId, kCoveringKeyType, "TypeDefinition", "TypeVersionDefinition", "type_id", kCoveringKeyType,
-                           ReferenceOption::CASCADE);
+  SetupReferencingTypeResolution(storage, kReferencingTypeName, TypeVersionDefinition::descriptor(), kTnuIndexDefId, kTvdTypeDefId, kTvdTypeVersionDefId);
+
+  WriteReferenceDefinition(storage, kRefDefId, kCoveringKeyType, "TypeDefinition", kReferencingTypeName, "type_id", kCoveringKeyType, ReferenceOption::CASCADE);
 
   WriteReferencesByTargetTypeIndex(storage, kRefsIndexDefId, "TypeDefinition", {kRefDefId});
+  WriteCoveringIndex(storage, kCoveringIndexDefId, kTargetId, {kReferencingId}, kCoveringKeyType);
+
+  // Write the referencing artifact so CASCADE recursion can read its type_name.
+  WriteArtifact(storage, kReferencingId, "TypeVersionDefinition", /*version_id=*/1, "some_payload");
 
   auto ctx = MakeContext(storage);
   std::unordered_map<std::string, uint64_t> index_map = {
       {"references_by_target_type", kRefsIndexDefId},
       {kCoveringKeyType, kCoveringIndexDefId},
+      {"type_name_unique", kTnuIndexDefId},
   };
 
   auto result_or = EnforceDeleteIntegrity(kTargetId, "TypeDefinition", ctx, /*scheduled_deletes=*/{}, index_map);
   ASSERT_TRUE(result_or.ok()) << result_or.status();
 
-  // Covering index deserialization silently fails; reference is skipped.
+  // CASCADE: no violations, one CascadeDelete side effect.
   EXPECT_TRUE(result_or->violations.empty());
-  EXPECT_TRUE(result_or->side_effects.empty());
+  ASSERT_GE(result_or->side_effects.size(), 1);
+  ASSERT_TRUE(std::holds_alternative<CascadeDelete>(result_or->side_effects[0]));
+  EXPECT_EQ(std::get<CascadeDelete>(result_or->side_effects[0]).artifact_id, kReferencingId);
 }
 
 TEST(ReferentialIntegrityTest, EnforceDeleteSetNull) {
-  // SET_NULL enforcement -- same covering index limitation as RESTRICT.
-  // See EnforceDeleteRestrict comment for details.
+  // SET_NULL enforcement: deleting a TypeDefinition that is referenced by a
+  // TypeVersionDefinition should produce a SetNullUpdate side effect.
   MemoryStorage storage;
 
   constexpr uint64_t kRefsIndexDefId = 5000;
   constexpr uint64_t kCoveringIndexDefId = 5001;
+  constexpr uint64_t kTnuIndexDefId = 5002;
   constexpr uint64_t kRefDefId = 6000;
   constexpr uint64_t kTargetId = 100;
   constexpr uint64_t kReferencingId = 200;
+  constexpr uint64_t kTvdTypeDefId = 7000;
+  constexpr uint64_t kTvdTypeVersionDefId = 7001;
   const std::string kCoveringKeyType = "type_versions_by_type";
+  const std::string kReferencingTypeName = "artifact_system.TypeVersionDefinition";
 
-  WriteReferenceDefinition(storage, kRefDefId, kCoveringKeyType, "TypeDefinition", "TypeVersionDefinition", "type_id", kCoveringKeyType,
+  SetupReferencingTypeResolution(storage, kReferencingTypeName, TypeVersionDefinition::descriptor(), kTnuIndexDefId, kTvdTypeDefId, kTvdTypeVersionDefId);
+
+  WriteReferenceDefinition(storage, kRefDefId, kCoveringKeyType, "TypeDefinition", kReferencingTypeName, "type_id", kCoveringKeyType,
                            ReferenceOption::SET_NULL);
 
   WriteReferencesByTargetTypeIndex(storage, kRefsIndexDefId, "TypeDefinition", {kRefDefId});
+  WriteCoveringIndex(storage, kCoveringIndexDefId, kTargetId, {kReferencingId}, kCoveringKeyType);
 
   auto ctx = MakeContext(storage);
   std::unordered_map<std::string, uint64_t> index_map = {
       {"references_by_target_type", kRefsIndexDefId},
       {kCoveringKeyType, kCoveringIndexDefId},
+      {"type_name_unique", kTnuIndexDefId},
   };
 
   auto result_or = EnforceDeleteIntegrity(kTargetId, "TypeDefinition", ctx, /*scheduled_deletes=*/{}, index_map);
   ASSERT_TRUE(result_or.ok()) << result_or.status();
 
-  // Covering index deserialization silently fails; reference is skipped.
+  // SET_NULL: no violations, one SetNullUpdate side effect.
   EXPECT_TRUE(result_or->violations.empty());
-  EXPECT_TRUE(result_or->side_effects.empty());
+  ASSERT_EQ(result_or->side_effects.size(), 1);
+  ASSERT_TRUE(std::holds_alternative<SetNullUpdate>(result_or->side_effects[0]));
+  const auto& snu = std::get<SetNullUpdate>(result_or->side_effects[0]);
+  EXPECT_EQ(snu.referencing_artifact_id, kReferencingId);
+  EXPECT_EQ(snu.field_name, "type_id");
+  EXPECT_EQ(snu.removed_reference_id, kTargetId);
 }
 
 TEST(ReferentialIntegrityTest, EnforceDeleteScheduledDeletesFiltered) {
-  // Verify scheduled_deletes filtering does not interfere when the covering
-  // index path gracefully degrades.
+  // When the referencing artifact is in scheduled_deletes, it should be
+  // filtered out and produce no violations or side effects.
   MemoryStorage storage;
 
   constexpr uint64_t kRefsIndexDefId = 5000;
   constexpr uint64_t kCoveringIndexDefId = 5001;
+  constexpr uint64_t kTnuIndexDefId = 5002;
   constexpr uint64_t kRefDefId = 6000;
   constexpr uint64_t kTargetId = 100;
   constexpr uint64_t kReferencingId = 200;
+  constexpr uint64_t kTvdTypeDefId = 7000;
+  constexpr uint64_t kTvdTypeVersionDefId = 7001;
   const std::string kCoveringKeyType = "type_versions_by_type";
+  const std::string kReferencingTypeName = "artifact_system.TypeVersionDefinition";
 
-  WriteReferenceDefinition(storage, kRefDefId, kCoveringKeyType, "TypeDefinition", "TypeVersionDefinition", "type_id", kCoveringKeyType,
+  SetupReferencingTypeResolution(storage, kReferencingTypeName, TypeVersionDefinition::descriptor(), kTnuIndexDefId, kTvdTypeDefId, kTvdTypeVersionDefId);
+
+  WriteReferenceDefinition(storage, kRefDefId, kCoveringKeyType, "TypeDefinition", kReferencingTypeName, "type_id", kCoveringKeyType,
                            ReferenceOption::RESTRICT);
 
   WriteReferencesByTargetTypeIndex(storage, kRefsIndexDefId, "TypeDefinition", {kRefDefId});
@@ -607,14 +712,246 @@ TEST(ReferentialIntegrityTest, EnforceDeleteScheduledDeletesFiltered) {
   std::unordered_map<std::string, uint64_t> index_map = {
       {"references_by_target_type", kRefsIndexDefId},
       {kCoveringKeyType, kCoveringIndexDefId},
+      {"type_name_unique", kTnuIndexDefId},
   };
 
+  // The referencing artifact is already scheduled for deletion.
   std::set<uint64_t> scheduled_deletes = {kReferencingId};
 
   auto result_or = EnforceDeleteIntegrity(kTargetId, "TypeDefinition", ctx, scheduled_deletes, index_map);
   ASSERT_TRUE(result_or.ok()) << result_or.status();
   EXPECT_TRUE(result_or->violations.empty());
   EXPECT_TRUE(result_or->side_effects.empty());
+}
+
+TEST(ReferentialIntegrityTest, EnforceDeleteCascadeRecursive) {
+  // Test that CASCADE recursively enforces referential integrity on cascaded
+  // artifacts. We set up two levels:
+  //   TypeDefinition (kTargetId) <- TypeVersionDefinition (kMiddleId) [CASCADE]
+  //   TypeVersionDefinition (kMiddleId) <- "ChildArtifact" (kLeafId) [RESTRICT]
+  //
+  // Deleting the TypeDefinition should cascade to the TypeVersionDefinition,
+  // which in turn should find a RESTRICT reference from the ChildArtifact,
+  // producing both a CascadeDelete side effect and a RESTRICT violation.
+  MemoryStorage storage;
+
+  // Index definition IDs.
+  constexpr uint64_t kRefsIndexDefId = 5000;
+  constexpr uint64_t kCoveringIndexDefId1 = 5001; // type_versions_by_type
+  constexpr uint64_t kTnuIndexDefId = 5002;
+  constexpr uint64_t kCoveringIndexDefId2 = 5003; // child_by_tvd
+  // ReferenceDefinition IDs.
+  constexpr uint64_t kRefDefId1 = 6000; // TVD -> TD (CASCADE)
+  constexpr uint64_t kRefDefId2 = 6001; // Child -> TVD (RESTRICT)
+  // Artifact IDs.
+  constexpr uint64_t kTargetId = 100; // TypeDefinition being deleted
+  constexpr uint64_t kMiddleId = 200; // TypeVersionDefinition (cascaded)
+  constexpr uint64_t kLeafId = 300;   // ChildArtifact (restricts middle)
+  // Type resolution IDs.
+  constexpr uint64_t kTvdTypeDefId = 7000;
+  constexpr uint64_t kTvdTypeVersionDefId = 7001;
+  const std::string kCoveringKeyType1 = "type_versions_by_type";
+  const std::string kCoveringKeyType2 = "child_by_tvd";
+  const std::string kReferencingTypeName = "artifact_system.TypeVersionDefinition";
+
+  // Set up type resolution for TypeVersionDefinition.
+  SetupReferencingTypeResolution(storage, kReferencingTypeName, TypeVersionDefinition::descriptor(), kTnuIndexDefId, kTvdTypeDefId, kTvdTypeVersionDefId);
+
+  // Level 1: TypeVersionDefinition references TypeDefinition via CASCADE.
+  WriteReferenceDefinition(storage, kRefDefId1, kCoveringKeyType1, "TypeDefinition", kReferencingTypeName, "type_id", kCoveringKeyType1,
+                           ReferenceOption::CASCADE);
+
+  // Level 2: ChildArtifact references TypeVersionDefinition via RESTRICT.
+  // We use TypeVersionDefinition as the referencing type for level 2 as well
+  // (self-referential for simplicity -- "child_by_tvd" covering index).
+  WriteReferenceDefinition(storage, kRefDefId2, kCoveringKeyType2, "TypeVersionDefinition", kReferencingTypeName, "type_id", kCoveringKeyType2,
+                           ReferenceOption::RESTRICT);
+
+  // Write references_by_target_type for both target types.
+  WriteReferencesByTargetTypeIndex(storage, kRefsIndexDefId, "TypeDefinition", {kRefDefId1});
+  // For the recursive step, "TypeVersionDefinition" is the target type.
+  // We need a separate index entry for "TypeVersionDefinition".
+  // The implementation uses EncodeStringKey("TypeVersionDefinition") for path.
+  // We reuse the same index_def_id since it's the same index type.
+  WriteReferencesByTargetTypeIndex(storage, kRefsIndexDefId, "TypeVersionDefinition", {kRefDefId2});
+
+  // Write covering indexes.
+  WriteCoveringIndex(storage, kCoveringIndexDefId1, kTargetId, {kMiddleId}, kCoveringKeyType1);
+  WriteCoveringIndex(storage, kCoveringIndexDefId2, kMiddleId, {kLeafId}, kCoveringKeyType2);
+
+  // Write the middle artifact so CASCADE recursion can read its type_name.
+  WriteArtifact(storage, kMiddleId, "TypeVersionDefinition", /*version_id=*/1, "middle_payload");
+
+  auto ctx = MakeContext(storage);
+  std::unordered_map<std::string, uint64_t> index_map = {
+      {"references_by_target_type", kRefsIndexDefId},
+      {kCoveringKeyType1, kCoveringIndexDefId1},
+      {kCoveringKeyType2, kCoveringIndexDefId2},
+      {"type_name_unique", kTnuIndexDefId},
+  };
+
+  auto result_or = EnforceDeleteIntegrity(kTargetId, "TypeDefinition", ctx, /*scheduled_deletes=*/{}, index_map);
+  ASSERT_TRUE(result_or.ok()) << result_or.status();
+
+  // Should have a CascadeDelete for kMiddleId (from level 1 CASCADE).
+  bool found_cascade = false;
+  for (const auto& effect : result_or->side_effects) {
+    if (std::holds_alternative<CascadeDelete>(effect) && std::get<CascadeDelete>(effect).artifact_id == kMiddleId) {
+      found_cascade = true;
+    }
+  }
+  EXPECT_TRUE(found_cascade) << "Expected CascadeDelete for middle artifact";
+
+  // Should have a RESTRICT violation from level 2 (kLeafId references kMiddleId).
+  ASSERT_GE(result_or->violations.size(), 1);
+  EXPECT_EQ(result_or->violations[0].category(), ArtifactWriteViolation::REFERENCE_DELETE_RESTRICTED);
+}
+
+TEST(ReferentialIntegrityTest, EnforceDeleteCycleDetection) {
+  // Test that mutually-referencing types don't cause infinite recursion.
+  // We set up: TypeDefinition (A) <-CASCADE- TypeVersionDefinition (B)
+  //            TypeVersionDefinition (B) <-CASCADE- (points back to A)
+  // When B is in scheduled_deletes during the recursive call, it should
+  // be filtered and not recurse further.
+  MemoryStorage storage;
+
+  constexpr uint64_t kRefsIndexDefId = 5000;
+  constexpr uint64_t kCoveringIndexDefId1 = 5001;
+  constexpr uint64_t kCoveringIndexDefId2 = 5003;
+  constexpr uint64_t kTnuIndexDefId = 5002;
+  constexpr uint64_t kRefDefId1 = 6000;
+  constexpr uint64_t kRefDefId2 = 6001;
+  constexpr uint64_t kArtifactA = 100;
+  constexpr uint64_t kArtifactB = 200;
+  constexpr uint64_t kTvdTypeDefId = 7000;
+  constexpr uint64_t kTvdTypeVersionDefId = 7001;
+  const std::string kCoveringKeyType1 = "type_versions_by_type";
+  const std::string kCoveringKeyType2 = "td_by_tvd";
+  const std::string kReferencingTypeName = "artifact_system.TypeVersionDefinition";
+
+  // Set up type resolution for TypeVersionDefinition.
+  SetupReferencingTypeResolution(storage, kReferencingTypeName, TypeVersionDefinition::descriptor(), kTnuIndexDefId, kTvdTypeDefId, kTvdTypeVersionDefId);
+
+  // A (TypeDefinition) is referenced by B (TypeVersionDefinition) via CASCADE.
+  WriteReferenceDefinition(storage, kRefDefId1, kCoveringKeyType1, "TypeDefinition", kReferencingTypeName, "type_id", kCoveringKeyType1,
+                           ReferenceOption::CASCADE);
+
+  // B (TypeVersionDefinition) is referenced by A back via CASCADE.
+  // This creates a cycle: deleting A cascades to B, deleting B would try to
+  // cascade back to A. scheduled_deletes prevents this.
+  WriteReferenceDefinition(storage, kRefDefId2, kCoveringKeyType2, "TypeVersionDefinition", kReferencingTypeName, "type_id", kCoveringKeyType2,
+                           ReferenceOption::CASCADE);
+
+  WriteReferencesByTargetTypeIndex(storage, kRefsIndexDefId, "TypeDefinition", {kRefDefId1});
+  WriteReferencesByTargetTypeIndex(storage, kRefsIndexDefId, "TypeVersionDefinition", {kRefDefId2});
+
+  WriteCoveringIndex(storage, kCoveringIndexDefId1, kArtifactA, {kArtifactB}, kCoveringKeyType1);
+  WriteCoveringIndex(storage, kCoveringIndexDefId2, kArtifactB, {kArtifactA}, kCoveringKeyType2);
+
+  // Write both artifacts so CASCADE recursion can read type_name.
+  WriteArtifact(storage, kArtifactA, "TypeDefinition", /*version_id=*/1, "payload_a");
+  WriteArtifact(storage, kArtifactB, "TypeVersionDefinition", /*version_id=*/1, "payload_b");
+
+  auto ctx = MakeContext(storage);
+  std::unordered_map<std::string, uint64_t> index_map = {
+      {"references_by_target_type", kRefsIndexDefId},
+      {kCoveringKeyType1, kCoveringIndexDefId1},
+      {kCoveringKeyType2, kCoveringIndexDefId2},
+      {"type_name_unique", kTnuIndexDefId},
+  };
+
+  // Should not hang or crash. The implementation filters kArtifactA out of
+  // the recursive call's active_referencing because it is the artifact being
+  // deleted (artifact_id == ref_artifact_id check).
+  auto result_or = EnforceDeleteIntegrity(kArtifactA, "TypeDefinition", ctx, /*scheduled_deletes=*/{}, index_map);
+  ASSERT_TRUE(result_or.ok()) << result_or.status();
+
+  // Should have CascadeDelete for B.
+  bool found_cascade_b = false;
+  for (const auto& effect : result_or->side_effects) {
+    if (std::holds_alternative<CascadeDelete>(effect) && std::get<CascadeDelete>(effect).artifact_id == kArtifactB) {
+      found_cascade_b = true;
+    }
+  }
+  EXPECT_TRUE(found_cascade_b) << "Expected CascadeDelete for artifact B";
+
+  // No violations expected -- A is filtered from B's recursive enforcement
+  // because the CASCADE code adds cascaded artifacts to updated_scheduled,
+  // and the self-reference (artifact_id == ref_artifact_id) is also filtered.
+  EXPECT_TRUE(result_or->violations.empty());
+}
+
+TEST(ReferentialIntegrityTest, ValidateReferencesRepeatedDuplicateValue) {
+  // A repeated uint64 reference field containing duplicate artifact_ids must
+  // produce REFERENCE_DUPLICATE_VALUE violations.
+  MemoryStorage storage;
+
+  // Write valid target artifacts so the duplicate check is exercised before
+  // (or alongside) reference-target validation.
+  TypeDefinition td1;
+  td1.set_type_name("SomeType");
+  WriteArtifact(storage, /*id=*/100, "TypeDefinition", /*version_id=*/1, td1.SerializeAsString());
+  TypeDefinition td2;
+  td2.set_type_name("AnotherType");
+  WriteArtifact(storage, /*id=*/200, "TypeDefinition", /*version_id=*/1, td2.SerializeAsString());
+
+  // Build a dynamic message type with a repeated uint64 field annotated with
+  // the (references) extension, using a DescriptorPool backed by the generated
+  // pool so artifact_options.proto extensions are available.
+  google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
+
+  google::protobuf::FileDescriptorProto file;
+  file.set_name("dup_ref_test.proto");
+  file.set_syntax("proto3");
+  file.set_package("artifact_system.testing");
+  file.add_dependency("artifact_options.proto");
+
+  auto* message = file.add_message_type();
+  message->set_name("DupRefTestArtifact");
+
+  auto* ref_field = message->add_field();
+  ref_field->set_name("target_ids");
+  ref_field->set_number(1);
+  ref_field->set_label(google::protobuf::FieldDescriptorProto::LABEL_REPEATED);
+  ref_field->set_type(google::protobuf::FieldDescriptorProto::TYPE_UINT64);
+
+  // Set the (references) extension on the field options.
+  auto* ref_option = ref_field->mutable_options()->MutableExtension(artifact_system::references);
+  ref_option->set_target_type_name("TypeDefinition");
+  ref_option->set_on_delete(artifact_system::ReferenceOption::RESTRICT);
+
+  const auto* built_file = pool.BuildFile(file);
+  ASSERT_NE(built_file, nullptr);
+  const auto* descriptor = built_file->FindMessageTypeByName("DupRefTestArtifact");
+  ASSERT_NE(descriptor, nullptr);
+
+  // Create a DynamicMessage instance and populate the repeated field with
+  // duplicate values: [100, 200, 100].
+  google::protobuf::DynamicMessageFactory factory;
+  const auto* prototype = factory.GetPrototype(descriptor);
+  ASSERT_NE(prototype, nullptr);
+  std::unique_ptr<google::protobuf::Message> msg(prototype->New());
+  const auto* reflection = msg->GetReflection();
+  const auto* field = descriptor->FindFieldByName("target_ids");
+  ASSERT_NE(field, nullptr);
+
+  reflection->AddUInt64(msg.get(), field, 100);
+  reflection->AddUInt64(msg.get(), field, 200);
+  reflection->AddUInt64(msg.get(), field, 100); // duplicate
+
+  auto ctx = MakeContext(storage);
+  auto result_or = ValidateReferences(*msg, *descriptor, ctx);
+  ASSERT_TRUE(result_or.ok()) << result_or.status();
+
+  // Expect exactly one REFERENCE_DUPLICATE_VALUE violation (for the second 100).
+  bool found_duplicate = false;
+  for (const auto& v : *result_or) {
+    if (v.category() == ArtifactWriteViolation::REFERENCE_DUPLICATE_VALUE) {
+      found_duplicate = true;
+      EXPECT_EQ(v.subject(), "field: target_ids");
+    }
+  }
+  EXPECT_TRUE(found_duplicate) << "Expected REFERENCE_DUPLICATE_VALUE violation";
 }
 
 } // namespace

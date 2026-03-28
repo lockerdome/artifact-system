@@ -46,12 +46,19 @@ struct ValidationContext {
 // unexpected I/O errors that are NOT validation failures.
 absl::StatusOr<ResolvedType> ResolveVersionId(uint64_t version_id, const ValidationContext& ctx);
 
+// Result of ValidateCreateOrUpdate: violations + resolved type info (when
+// phases 1-4 pass, the resolved type is available for downstream use).
+struct ValidationResult {
+  std::vector<ArtifactWriteViolation> violations;
+  std::optional<ResolvedType> resolved_type; // populated when phases 1-4 pass
+};
+
 // Full validation for Create/Update.
-// Returns an empty vector on success, or collected violations on failure.
-absl::StatusOr<std::vector<ArtifactWriteViolation>> ValidateCreateOrUpdate(WriteOperation op, uint64_t version_id, const std::string& payload,
-                                                                           const ValidationContext& ctx,
-                                                                           std::optional<uint64_t> existing_artifact_id = std::nullopt,
-                                                                           const std::unordered_map<std::string, uint64_t>& index_def_ids_by_key_type = {});
+// Returns empty violations on success, or collected violations on failure.
+// When phases 1-4 pass, resolved_type is populated so the caller can reuse it.
+absl::StatusOr<ValidationResult> ValidateCreateOrUpdate(WriteOperation op, uint64_t version_id, const std::string& payload, const ValidationContext& ctx,
+                                                        std::optional<uint64_t> existing_artifact_id = std::nullopt,
+                                                        const std::unordered_map<std::string, uint64_t>& index_def_ids_by_key_type = {});
 
 // Validation for Delete (mutation check only; referential integrity is
 // handled separately).

@@ -184,10 +184,10 @@ absl::StatusOr<ResolvedType> ResolveVersionId(uint64_t version_id, const Validat
   return resolved;
 }
 
-absl::StatusOr<std::vector<ArtifactWriteViolation>> ValidateCreateOrUpdate(WriteOperation op, uint64_t version_id, const std::string& payload,
-                                                                           const ValidationContext& ctx, std::optional<uint64_t> existing_artifact_id,
-                                                                           const std::unordered_map<std::string, uint64_t>& index_def_ids_by_key_type) {
-  std::vector<ArtifactWriteViolation> violations;
+absl::StatusOr<ValidationResult> ValidateCreateOrUpdate(WriteOperation op, uint64_t version_id, const std::string& payload, const ValidationContext& ctx,
+                                                        std::optional<uint64_t> existing_artifact_id,
+                                                        const std::unordered_map<std::string, uint64_t>& index_def_ids_by_key_type) {
+  ValidationResult result;
 
   // ── Phase 1: INVALID_VERSION_ID ───────────────────────────────────────────
   auto resolved_or = ResolveVersionId(version_id, ctx);
@@ -195,9 +195,9 @@ absl::StatusOr<std::vector<ArtifactWriteViolation>> ValidateCreateOrUpdate(Write
     // Distinguish between I/O errors (NOT_FOUND from storage is a validation
     // failure) and truly unexpected errors.
     if (absl::IsNotFound(resolved_or.status()) || absl::IsInvalidArgument(resolved_or.status())) {
-      violations.push_back(MakeViolation(ArtifactWriteViolation::INVALID_VERSION_ID, absl::StrCat("version_id: ", version_id),
-                                         absl::StrCat("version_id ", version_id, " does not resolve to a valid TypeVersionDefinition")));
-      return violations; // short-circuit
+      result.violations.push_back(MakeViolation(ArtifactWriteViolation::INVALID_VERSION_ID, absl::StrCat("version_id: ", version_id),
+                                                absl::StrCat("version_id ", version_id, " does not resolve to a valid TypeVersionDefinition")));
+      return result; // short-circuit
     }
     return resolved_or.status(); // unexpected error
   }
@@ -208,59 +208,62 @@ absl::StatusOr<std::vector<ArtifactWriteViolation>> ValidateCreateOrUpdate(Write
     auto existing_or = ReadStoredArtifact(*existing_artifact_id, ctx);
     if (!existing_or.ok()) {
       if (absl::IsNotFound(existing_or.status())) {
-        violations.push_back(MakeViolation(ArtifactWriteViolation::INVALID_VERSION_ID, absl::StrCat("version_id: ", version_id),
-                                           absl::StrCat("type_name mismatch on update: existing artifact ", *existing_artifact_id, " not found")));
-        return violations; // short-circuit
+        result.violations.push_back(MakeViolation(ArtifactWriteViolation::INVALID_VERSION_ID, absl::StrCat("version_id: ", version_id),
+                                                  absl::StrCat("type_name mismatch on update: existing artifact ", *existing_artifact_id, " not found")));
+        return result; // short-circuit
       }
       return existing_or.status();
     }
     if (existing_or->type_name() != resolved.type_name) {
-      violations.push_back(
+      result.violations.push_back(
           MakeViolation(ArtifactWriteViolation::INVALID_VERSION_ID, absl::StrCat("version_id: ", version_id),
                         absl::StrCat("type_name mismatch on update: expected '", existing_or->type_name(), "', got '", resolved.type_name, "'")));
-      return violations; // short-circuit
+      return result; // short-circuit
     }
   }
 
   // ── Phase 2: MUTATION_DENIED ──────────────────────────────────────────────
   if (!ctx.bypass_mutation_check) {
     if (op == WriteOperation::kCreate && resolved.deny_create) {
-      violations.push_back(MakeViolation(ArtifactWriteViolation::MUTATION_DENIED, absl::StrCat("type: ", resolved.type_name),
-                                         absl::StrCat("CreateArtifact denied: type '", resolved.type_name, "' has deny_create = true")));
-      return violations; // short-circuit
+      result.violations.push_back(MakeViolation(ArtifactWriteViolation::MUTATION_DENIED, absl::StrCat("type: ", resolved.type_name),
+                                                absl::StrCat("CreateArtifact denied: type '", resolved.type_name, "' has deny_create = true")));
+      return result; // short-circuit
     }
     if (op == WriteOperation::kUpdate && resolved.deny_update) {
-      violations.push_back(MakeViolation(ArtifactWriteViolation::MUTATION_DENIED, absl::StrCat("type: ", resolved.type_name),
-                                         absl::StrCat("UpdateArtifact denied: type '", resolved.type_name, "' has deny_update = true")));
-      return violations; // short-circuit
+      result.violations.push_back(MakeViolation(ArtifactWriteViolation::MUTATION_DENIED, absl::StrCat("type: ", resolved.type_name),
+                                                absl::StrCat("UpdateArtifact denied: type '", resolved.type_name, "' has deny_update = true")));
+      return result; // short-circuit
     }
   }
 
   // ── Phase 3: EMPTY_PAYLOAD ────────────────────────────────────────────────
   if (payload.empty()) {
-    violations.push_back(MakeViolation(ArtifactWriteViolation::EMPTY_PAYLOAD, absl::StrCat("type: ", resolved.type_name),
-                                       "empty payload: zero-length payloads are reserved for tombstones"));
-    return violations; // short-circuit
+    result.violations.push_back(MakeViolation(ArtifactWriteViolation::EMPTY_PAYLOAD, absl::StrCat("type: ", resolved.type_name),
+                                              "empty payload: zero-length payloads are reserved for tombstones"));
+    return result; // short-circuit
   }
 
   // ── Phase 4: PAYLOAD_VALIDATION_FAILURE ───────────────────────────────────
   auto parse_violation = ValidatePayloadParsing(resolved.descriptor_set, resolved.type_name, payload);
   if (parse_violation.has_value()) {
-    violations.push_back(std::move(*parse_violation));
-    return violations; // short-circuit
+    result.violations.push_back(std::move(*parse_violation));
+    return result; // short-circuit
   }
 
+  // Phases 1-4 passed; populate the resolved type for the caller.
+  result.resolved_type = std::move(*resolved_or);
+
   // ── Phase 5: NAN_IN_INDEXED_FIELD, NON_MINIMAL_VARINT ────────────────────
-  auto index_violations = ValidateIndexDerivation(resolved.descriptor_set, resolved.type_name, payload, index_def_ids_by_key_type);
+  auto index_violations = ValidateIndexDerivation(result.resolved_type->descriptor_set, result.resolved_type->type_name, payload, index_def_ids_by_key_type);
 
   // ── Phase 6: Referential integrity (collected, not short-circuited) ───────
   // Referential integrity checking is handled externally by the referential
   // integrity module.  This function does not perform it.
 
   // Collect all violations from phases 5 and 6.
-  violations.insert(violations.end(), std::make_move_iterator(index_violations.begin()), std::make_move_iterator(index_violations.end()));
+  result.violations.insert(result.violations.end(), std::make_move_iterator(index_violations.begin()), std::make_move_iterator(index_violations.end()));
 
-  return violations;
+  return result;
 }
 
 absl::StatusOr<std::vector<ArtifactWriteViolation>> ValidateDelete(uint64_t artifact_id, const ValidationContext& ctx) {
