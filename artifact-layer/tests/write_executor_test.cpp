@@ -11,6 +11,7 @@
 #include "absl/time/time.h"
 #include "artifact_options.pb.h"
 #include "encoding/artifact_path.h"
+#include "index/index_conflict_resolver.h"
 #include "index/index_object.h"
 #include "index/index_schema_generator.h"
 #include "gmock/gmock.h"
@@ -264,6 +265,8 @@ TEST(WriteExecutorTest, DefaultResolverMergesNonUniqueIndexConflictThenRetrySucc
   ASSERT_TRUE(merged_bytes_or.ok());
 
   WriteExecutorOptions options;
+  options.path_conflict_classifier = artifact_system::index::IndexPathConflictClassifier;
+  options.retry_conflict_resolver = artifact_system::index::BuildDeterministicIndexRetryConflictResolver(&storage);
   options.sleep_for = [](absl::Duration) {};
   WriteExecutor executor(&storage, options);
 
@@ -320,6 +323,8 @@ TEST(WriteExecutorTest, DefaultResolverDoesNotPersistPartialStateForMixedConflic
   ASSERT_TRUE(theirs_bytes_or.ok());
 
   WriteExecutorOptions options;
+  options.path_conflict_classifier = artifact_system::index::IndexPathConflictClassifier;
+  options.retry_conflict_resolver = artifact_system::index::BuildDeterministicIndexRetryConflictResolver(&storage);
   options.sleep_for = [](absl::Duration) {};
   WriteExecutor executor(&storage, options);
 
@@ -430,6 +435,17 @@ TEST(WriteExecutorTest, CleanupFailureInvokesErrorHandler) {
   ASSERT_TRUE(result_or.ok());
   ASSERT_TRUE(std::holds_alternative<WriteExecutor::WriteSuccess>(*result_or));
   EXPECT_TRUE(cleanup_failure_seen);
+}
+
+TEST(WriteExecutorTest, RejectsZeroMaxAttempts) {
+  StrictMock<MockStorage> storage;
+  WriteExecutorOptions options;
+  options.conflict_options.max_attempts = 0;
+  WriteExecutor executor(&storage, options);
+
+  auto result_or = executor.ExecuteWrite("txn-1", [](const std::string&) { return absl::OkStatus(); });
+  ASSERT_FALSE(result_or.ok());
+  EXPECT_EQ(result_or.status().code(), absl::StatusCode::kInvalidArgument);
 }
 
 } // namespace

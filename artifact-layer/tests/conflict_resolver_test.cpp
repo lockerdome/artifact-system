@@ -126,5 +126,15 @@ TEST(ConflictResolverTest, PayloadConflictDecodesArtifactPathId) {
   EXPECT_EQ(proto_conflict.payload_detail().artifact_id(), 42);
 }
 
+TEST(ConflictResolverTest, IndexConflictIncludesPathKeyTypeForRealIndexPath) {
+  const MergeResult::Conflict conflict = BuildConflict({"indexes/prefix/hash"});
+  const ConflictResolverOptions options;
+
+  const CommitConflict proto_conflict = transaction::BuildCommitConflict(conflict, 1, options, nullptr);
+  EXPECT_EQ(proto_conflict.conflict_type(), CommitConflict::INDEX_CONFLICT);
+  EXPECT_TRUE(proto_conflict.has_index_detail());
+  EXPECT_EQ(proto_conflict.index_detail().key_type(), "indexes/prefix/hash");
+}
+
 } // namespace
 } // namespace artifact_system::testing

@@ -332,7 +332,7 @@ TEST(TransactionManagerTest, DefaultResolverDoesNotAutoResolveNonIndexConflict) 
   EXPECT_EQ(conflict.detail.attempts(), 1);
 }
 
-TEST(TransactionManagerTest, DefaultResolverFailureSurfacesStatus) {
+TEST(TransactionManagerTest, DefaultResolverTreatsMalformedIndexDefinitionAsNonRetryableConflict) {
   MemoryStorage storage;
 
   const uint64_t index_definition_id = 7003;
@@ -357,8 +357,11 @@ TEST(TransactionManagerTest, DefaultResolverFailureSurfacesStatus) {
   ASSERT_TRUE(storage.Commit(storage.GetCanonicalBranch(), "canonical malformed index update").ok());
 
   auto commit_or = manager.CommitTransaction(*transaction_id_or);
-  ASSERT_FALSE(commit_or.ok());
-  EXPECT_EQ(commit_or.status().code(), absl::StatusCode::kInvalidArgument);
+  ASSERT_TRUE(commit_or.ok());
+  ASSERT_TRUE(std::holds_alternative<TransactionManager::CommitConflict>(*commit_or));
+  const auto& conflict = std::get<TransactionManager::CommitConflict>(*commit_or);
+  EXPECT_FALSE(conflict.detail.retryable());
+  EXPECT_EQ(conflict.detail.conflict_type(), CommitConflict::CONFLICT_TYPE_UNSPECIFIED);
 }
 
 TEST(TransactionManagerTest, ImplicitTransactionRejectsNullCallback) {
@@ -407,6 +410,21 @@ TEST(TransactionManagerTest, CommitTransactionInvokesRetryConflictResolver) {
   EXPECT_FALSE(conflict.detail.retryable());
   EXPECT_EQ(conflict.detail.attempts(), 1);
   EXPECT_EQ(resolver_calls, 1);
+}
+
+TEST(TransactionManagerTest, CommitTransactionRejectsZeroMaxAttempts) {
+  MemoryStorage storage;
+
+  TransactionManager::Options options;
+  options.conflict_options.max_attempts = 0;
+  TransactionManager manager(&storage, options);
+
+  auto transaction_id_or = manager.CreateTransaction();
+  ASSERT_TRUE(transaction_id_or.ok());
+
+  auto commit_or = manager.CommitTransaction(*transaction_id_or);
+  ASSERT_FALSE(commit_or.ok());
+  EXPECT_EQ(commit_or.status().code(), absl::StatusCode::kInvalidArgument);
 }
 
 } // namespace
