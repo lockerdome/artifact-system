@@ -195,9 +195,7 @@ CommitConflict BuildCommitConflict(const MergeResult::Conflict& merge_conflict, 
     auto* detail = conflict.mutable_index_detail();
     if (!merge_conflict.conflicting_paths.empty()) {
       const std::string& path = merge_conflict.conflicting_paths.front();
-      if (path.rfind("idx/", 0) == 0) {
-        detail->set_key_type(path);
-      }
+      detail->set_key_type(path);
     }
   }
   if (decision.conflict_type == CommitConflict::REFERENTIAL_INTEGRITY_VIOLATION) {
