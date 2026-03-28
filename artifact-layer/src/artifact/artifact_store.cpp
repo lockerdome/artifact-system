@@ -274,49 +274,6 @@ absl::StatusOr<uint64_t> ArtifactStore::ExecuteWrite(std::optional<uint64_t> tra
   return *snap_or;
 }
 
-// ── Index operations ────────────────────────────────────────────────────────
-
-absl::Status ArtifactStore::WriteIndexEntries(const std::string& branch, const std::vector<index::DerivedIndexEntry>& entries, uint64_t artifact_id, bool add) {
-  for (const auto& entry : entries) {
-    const std::string path = encoding::IndexPath(entry.index_def_id, entry.encoded_key);
-
-    // Read existing index object at this path (may not exist).
-    index::IndexObject object;
-    object.serialized_key = std::string(entry.encoded_key.begin(), entry.encoded_key.end());
-
-    // We need the IndexDefinition and parent descriptor to use
-    // Serialize/DeserializeIndexObject. For the MVP, we build these from
-    // the key_type. We need to find the IndexDefinition proto for this
-    // key_type. Since we don't have it readily available, we construct a
-    // minimal one.
-    //
-    // Actually, we need to know the parent message descriptor for
-    // GenerateIndexSchema. For now, we try to read/modify the index object
-    // using direct serialization matching what the index system uses.
-
-    auto existing_or = storage_->GetObject(branch, path);
-    if (existing_or.ok()) {
-      // There's an existing index object — we need to deserialize, modify,
-      // and reserialize. However, we need the schema to do that. For a
-      // simpler approach in the CRUD layer, we'll re-derive the full index
-      // object from scratch during staging operations (StageCreate,
-      // StageUpdate, StageDelete) rather than doing incremental updates here.
-      //
-      // This is a placeholder — the actual index read/modify/write is done
-      // in the staging methods below using the full context.
-    }
-
-    // For add: read existing, add row, write back.
-    // For remove: read existing, remove row, write back (or tombstone if empty).
-    // This method is called with the full schema context from the staging methods.
-    //
-    // Since we need the schema for proper serialization, we pass through to
-    // the caller-managed index update logic. This WriteIndexEntries is a
-    // convenience wrapper — the real work happens in StageCreate/Update/Delete.
-  }
-  return absl::OkStatus();
-}
-
 // ── Staging operations ──────────────────────────────────────────────────────
 
 absl::Status ArtifactStore::StageCreate(const std::string& branch, uint64_t artifact_id, uint64_t version_id, const std::string& type_name,
@@ -401,14 +358,24 @@ absl::Status ArtifactStore::StageUpdate(const std::string& branch, uint64_t arti
     return existing_or.status();
 
   // 2. Derive old index entries (for removal).
+  // Use the old artifact's version_id to get the correct descriptor_set
+  // for deriving old entries, in case the schema changed between versions.
   std::vector<index::DerivedIndexEntry> old_entries;
   if (!existing_or->payload().empty()) {
-    auto old_or = index::DeriveIndexEntriesFromPayload(descriptor_set, type_name, existing_or->payload(), artifact_id, options_.index_def_ids_by_key_type);
+    google::protobuf::FileDescriptorSet old_descriptor_set = descriptor_set;
+    // Try to read the old version's descriptor_set.
+    auto old_tvd_or = ReadStoredArtifact(storage_, branch, existing_or->version_id());
+    if (old_tvd_or.ok()) {
+      TypeVersionDefinition old_tvd;
+      if (old_tvd.ParseFromString(old_tvd_or->payload())) {
+        old_descriptor_set = old_tvd.descriptor_set();
+      }
+    }
+    auto old_or = index::DeriveIndexEntriesFromPayload(old_descriptor_set, type_name, existing_or->payload(), artifact_id, options_.index_def_ids_by_key_type);
     if (old_or.ok()) {
       old_entries = std::move(*old_or);
     }
-    // If derivation fails for old payload, we continue — the old entries
-    // may have been written with a different schema version.
+    // If derivation fails for old payload, we continue — best effort cleanup.
   }
 
   // 3. Write the new StoredArtifact envelope.
@@ -621,38 +588,43 @@ absl::StatusOr<CreateResult> ArtifactStore::CreateArtifact(uint64_t version_id, 
     return branch_or.status();
   const std::string& read_ref = *branch_or;
 
-  // Run validation pipeline.
+  // Run validation pipeline (phases 1-5).
   ValidationContext vctx{storage_, read_ref, options_.bypass_mutation_check};
   auto violations_or = ValidateCreateOrUpdate(WriteOperation::kCreate, version_id, payload, vctx, std::nullopt, options_.index_def_ids_by_key_type);
   if (!violations_or.ok())
     return violations_or.status();
 
-  // Resolve type for referential integrity and staging.
-  auto resolved_or = ResolveVersionId(version_id, vctx);
-  if (!resolved_or.ok()) {
-    // If resolve fails but ValidateCreateOrUpdate already caught it,
-    // violations_or should be non-empty.
-    if (!violations_or->empty())
-      return MakeWriteError(*violations_or);
-    return resolved_or.status();
+  // If phases 1-4 short-circuited, return immediately.
+  bool has_short_circuit = false;
+  for (const auto& v : *violations_or) {
+    if (v.category() == ArtifactWriteViolation::INVALID_VERSION_ID || v.category() == ArtifactWriteViolation::MUTATION_DENIED ||
+        v.category() == ArtifactWriteViolation::EMPTY_PAYLOAD || v.category() == ArtifactWriteViolation::PAYLOAD_VALIDATION_FAILURE) {
+      has_short_circuit = true;
+      break;
+    }
   }
+  if (has_short_circuit)
+    return MakeWriteError(*violations_or);
+
+  // Resolve type once (reuse for both referential integrity and staging).
+  auto resolved_or = ResolveVersionId(version_id, vctx);
+  if (!resolved_or.ok())
+    return resolved_or.status();
   const ResolvedType& resolved = *resolved_or;
 
-  // Run referential integrity validation (phase 6).
-  if (violations_or->empty()) {
-    // Parse the payload to a dynamic message for reference checking.
-    google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
-    const auto* descriptor = BuildPoolAndFindMessage(resolved.descriptor_set, resolved.type_name, &pool);
-    if (descriptor != nullptr) {
-      google::protobuf::DynamicMessageFactory factory;
-      const auto* prototype = factory.GetPrototype(descriptor);
-      std::unique_ptr<google::protobuf::Message> msg(prototype->New());
-      if (msg->ParseFromString(payload)) {
-        RefIntegrityContext ri_ctx{storage_, read_ref};
-        auto ref_violations_or = ValidateReferences(*msg, *descriptor, ri_ctx);
-        if (ref_violations_or.ok()) {
-          violations_or->insert(violations_or->end(), ref_violations_or->begin(), ref_violations_or->end());
-        }
+  // Run referential integrity validation (phase 6) — runs independently
+  // of phase 5 (NaN/varint). Both phases' violations are collected.
+  google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
+  const auto* descriptor = BuildPoolAndFindMessage(resolved.descriptor_set, resolved.type_name, &pool);
+  if (descriptor != nullptr) {
+    google::protobuf::DynamicMessageFactory factory;
+    const auto* prototype = factory.GetPrototype(descriptor);
+    std::unique_ptr<google::protobuf::Message> msg(prototype->New());
+    if (msg->ParseFromString(payload)) {
+      RefIntegrityContext ri_ctx{storage_, read_ref};
+      auto ref_violations_or = ValidateReferences(*msg, *descriptor, ri_ctx);
+      if (ref_violations_or.ok()) {
+        violations_or->insert(violations_or->end(), ref_violations_or->begin(), ref_violations_or->end());
       }
     }
   }
@@ -689,35 +661,42 @@ absl::StatusOr<WriteResult> ArtifactStore::UpdateArtifact(uint64_t artifact_id, 
     return MakeNotFoundError(artifact_id, true);
   }
 
-  // Run validation pipeline.
+  // Run validation pipeline (phases 1-5).
   ValidationContext vctx{storage_, read_ref, options_.bypass_mutation_check};
   auto violations_or = ValidateCreateOrUpdate(WriteOperation::kUpdate, version_id, payload, vctx, artifact_id, options_.index_def_ids_by_key_type);
   if (!violations_or.ok())
     return violations_or.status();
 
-  // Resolve type for referential integrity and staging.
-  auto resolved_or = ResolveVersionId(version_id, vctx);
-  if (!resolved_or.ok()) {
-    if (!violations_or->empty())
-      return MakeWriteError(*violations_or);
-    return resolved_or.status();
+  // If phases 1-4 short-circuited, return immediately.
+  bool has_short_circuit = false;
+  for (const auto& v : *violations_or) {
+    if (v.category() == ArtifactWriteViolation::INVALID_VERSION_ID || v.category() == ArtifactWriteViolation::MUTATION_DENIED ||
+        v.category() == ArtifactWriteViolation::EMPTY_PAYLOAD || v.category() == ArtifactWriteViolation::PAYLOAD_VALIDATION_FAILURE) {
+      has_short_circuit = true;
+      break;
+    }
   }
+  if (has_short_circuit)
+    return MakeWriteError(*violations_or);
+
+  // Resolve type once for referential integrity and staging.
+  auto resolved_or = ResolveVersionId(version_id, vctx);
+  if (!resolved_or.ok())
+    return resolved_or.status();
   const ResolvedType& resolved = *resolved_or;
 
-  // Referential integrity validation.
-  if (violations_or->empty()) {
-    google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
-    const auto* descriptor = BuildPoolAndFindMessage(resolved.descriptor_set, resolved.type_name, &pool);
-    if (descriptor != nullptr) {
-      google::protobuf::DynamicMessageFactory factory;
-      const auto* prototype = factory.GetPrototype(descriptor);
-      std::unique_ptr<google::protobuf::Message> msg(prototype->New());
-      if (msg->ParseFromString(payload)) {
-        RefIntegrityContext ri_ctx{storage_, read_ref};
-        auto ref_violations_or = ValidateReferences(*msg, *descriptor, ri_ctx);
-        if (ref_violations_or.ok()) {
-          violations_or->insert(violations_or->end(), ref_violations_or->begin(), ref_violations_or->end());
-        }
+  // Referential integrity validation (phase 6) — independent of phase 5.
+  google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
+  const auto* descriptor = BuildPoolAndFindMessage(resolved.descriptor_set, resolved.type_name, &pool);
+  if (descriptor != nullptr) {
+    google::protobuf::DynamicMessageFactory factory;
+    const auto* prototype = factory.GetPrototype(descriptor);
+    std::unique_ptr<google::protobuf::Message> msg(prototype->New());
+    if (msg->ParseFromString(payload)) {
+      RefIntegrityContext ri_ctx{storage_, read_ref};
+      auto ref_violations_or = ValidateReferences(*msg, *descriptor, ri_ctx);
+      if (ref_violations_or.ok()) {
+        violations_or->insert(violations_or->end(), ref_violations_or->begin(), ref_violations_or->end());
       }
     }
   }

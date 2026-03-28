@@ -107,9 +107,6 @@ private:
   // Stage tombstone + index removal for a delete operation.
   absl::Status StageDelete(const std::string& branch, uint64_t artifact_id, const StoredArtifact& existing);
 
-  // Write derived index entries to storage.
-  absl::Status WriteIndexEntries(const std::string& branch, const std::vector<index::DerivedIndexEntry>& entries, uint64_t artifact_id, bool add);
-
   StorageInterface* storage_;
   transaction::TransactionManager* transaction_manager_;
   IdAllocatorInterface* id_allocator_;
