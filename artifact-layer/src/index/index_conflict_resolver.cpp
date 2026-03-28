@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "artifact_options.pb.h"
 #include "artifact_types.pb.h"
@@ -229,9 +230,6 @@ absl::StatusOr<std::optional<ResolvedIndexPath>> ResolveSinglePath(StorageInterf
   if (!merged_or.ok()) {
     return merged_or.status();
   }
-  if (merged_or->unique_conflict) {
-    return std::optional<ResolvedIndexPath>{};
-  }
 
   auto merged_bytes_or = SerializeIndexObject(*schema_or, index_definition, merged_or->merged);
   if (!merged_bytes_or.ok()) {
@@ -251,6 +249,34 @@ PathConflictKind IndexPathConflictClassifier(const std::string& path) {
     return PathConflictKind::kRetryableNonUniqueIndex;
   }
   return transaction::DefaultPathConflictClassifier(path);
+}
+
+transaction::PathConflictClassifier BuildIndexPathConflictClassifier(StorageInterface* storage) {
+  return [storage](const std::string& path) -> PathConflictKind {
+    if (path.rfind("indexes/", 0) != 0) {
+      return transaction::DefaultPathConflictClassifier(path);
+    }
+    if (storage == nullptr) {
+      return PathConflictKind::kNonRetryableUnknown;
+    }
+
+    auto index_definition_id_or = ParseIndexDefinitionIdFromPath(path);
+    if (!index_definition_id_or.ok()) {
+      return PathConflictKind::kNonRetryableUnknown;
+    }
+
+    auto definition_bytes_or = storage->GetObject(storage->GetCanonicalBranch(), encoding::ArtifactPath(*index_definition_id_or));
+    if (!definition_bytes_or.ok()) {
+      return PathConflictKind::kNonRetryableUnknown;
+    }
+
+    artifact_system::IndexDefinition definition;
+    if (!definition.ParseFromString(*definition_bytes_or)) {
+      return PathConflictKind::kNonRetryableUnknown;
+    }
+
+    return definition.unique() ? PathConflictKind::kNonRetryableUniqueIndex : PathConflictKind::kRetryableNonUniqueIndex;
+  };
 }
 
 transaction::RetryConflictResolver BuildDeterministicIndexRetryConflictResolver(StorageInterface* storage) {

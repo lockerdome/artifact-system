@@ -10,6 +10,8 @@ namespace artifact_system::index {
 
 transaction::PathConflictKind IndexPathConflictClassifier(const std::string& path);
 
+transaction::PathConflictClassifier BuildIndexPathConflictClassifier(StorageInterface* storage);
+
 transaction::RetryConflictResolver BuildDeterministicIndexRetryConflictResolver(StorageInterface* storage);
 
 } // namespace artifact_system::index

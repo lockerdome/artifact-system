@@ -16,7 +16,7 @@ namespace artifact_system::transaction {
 WriteExecutor::WriteExecutor(StorageInterface* storage, WriteExecutorOptions options) : storage_(storage), options_(std::move(options)) {
   const bool using_default_classifier = options_.path_conflict_classifier == nullptr;
   if (using_default_classifier) {
-    options_.path_conflict_classifier = index::IndexPathConflictClassifier;
+    options_.path_conflict_classifier = index::BuildIndexPathConflictClassifier(storage_);
   }
   if (using_default_classifier && options_.retry_conflict_resolver == nullptr) {
     options_.retry_conflict_resolver = index::BuildDeterministicIndexRetryConflictResolver(storage_);

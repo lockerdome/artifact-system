@@ -28,7 +28,7 @@ TransactionManager::TransactionManager(StorageInterface* storage) : TransactionM
 TransactionManager::TransactionManager(StorageInterface* storage, Options options) : storage_(storage), options_(std::move(options)) {
   const bool using_default_classifier = options_.path_conflict_classifier == nullptr;
   if (using_default_classifier) {
-    options_.path_conflict_classifier = index::IndexPathConflictClassifier;
+    options_.path_conflict_classifier = index::BuildIndexPathConflictClassifier(storage_);
   }
   if (using_default_classifier && options_.retry_conflict_resolver == nullptr) {
     options_.retry_conflict_resolver = index::BuildDeterministicIndexRetryConflictResolver(storage_);
@@ -182,6 +182,10 @@ absl::StatusOr<TransactionManager::CommitResult> TransactionManager::CommitTrans
     return absl::InvalidArgumentError(absl::StrCat("transaction has active nested children: ", transaction_id));
   }
 
+  if (options_.conflict_options.max_attempts == 0) {
+    return absl::InvalidArgumentError("max attempts must be greater than zero");
+  }
+
   auto commit_or = storage_->Commit(transaction.branch_name, absl::StrCat("transaction commit ", transaction_id));
   if (!commit_or.ok()) {
     return commit_or.status();
@@ -196,10 +200,6 @@ absl::StatusOr<TransactionManager::CommitResult> TransactionManager::CommitTrans
     target_branch = parent_it->second.branch_name;
   } else {
     target_branch = storage_->GetCanonicalBranch();
-  }
-
-  if (options_.conflict_options.max_attempts == 0) {
-    return absl::InvalidArgumentError("max attempts must be greater than zero");
   }
 
   for (uint32_t attempts_performed = 1; attempts_performed <= options_.conflict_options.max_attempts; ++attempts_performed) {
