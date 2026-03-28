@@ -201,7 +201,10 @@ absl::StatusOr<ValidationResult> ValidateCreateOrUpdate(WriteOperation op, uint6
     }
     return resolved_or.status(); // unexpected error
   }
-  const ResolvedType& resolved = *resolved_or;
+  // Move the resolved type into the result immediately to avoid dangling
+  // references.  All subsequent phases access it via result.resolved_type.
+  result.resolved_type = std::move(*resolved_or);
+  const ResolvedType& resolved = *result.resolved_type;
 
   // For Update: verify type_name matches the existing artifact.
   if (op == WriteOperation::kUpdate && existing_artifact_id.has_value()) {
@@ -210,7 +213,8 @@ absl::StatusOr<ValidationResult> ValidateCreateOrUpdate(WriteOperation op, uint6
       if (absl::IsNotFound(existing_or.status())) {
         result.violations.push_back(MakeViolation(ArtifactWriteViolation::INVALID_VERSION_ID, absl::StrCat("version_id: ", version_id),
                                                   absl::StrCat("type_name mismatch on update: existing artifact ", *existing_artifact_id, " not found")));
-        return result; // short-circuit
+        result.resolved_type.reset(); // short-circuit: phases 1-4 did not fully pass
+        return result;
       }
       return existing_or.status();
     }
@@ -218,7 +222,8 @@ absl::StatusOr<ValidationResult> ValidateCreateOrUpdate(WriteOperation op, uint6
       result.violations.push_back(
           MakeViolation(ArtifactWriteViolation::INVALID_VERSION_ID, absl::StrCat("version_id: ", version_id),
                         absl::StrCat("type_name mismatch on update: expected '", existing_or->type_name(), "', got '", resolved.type_name, "'")));
-      return result; // short-circuit
+      result.resolved_type.reset(); // short-circuit: phases 1-4 did not fully pass
+      return result;
     }
   }
 
@@ -227,11 +232,13 @@ absl::StatusOr<ValidationResult> ValidateCreateOrUpdate(WriteOperation op, uint6
     if (op == WriteOperation::kCreate && resolved.deny_create) {
       result.violations.push_back(MakeViolation(ArtifactWriteViolation::MUTATION_DENIED, absl::StrCat("type: ", resolved.type_name),
                                                 absl::StrCat("CreateArtifact denied: type '", resolved.type_name, "' has deny_create = true")));
+      result.resolved_type.reset();
       return result; // short-circuit
     }
     if (op == WriteOperation::kUpdate && resolved.deny_update) {
       result.violations.push_back(MakeViolation(ArtifactWriteViolation::MUTATION_DENIED, absl::StrCat("type: ", resolved.type_name),
                                                 absl::StrCat("UpdateArtifact denied: type '", resolved.type_name, "' has deny_update = true")));
+      result.resolved_type.reset();
       return result; // short-circuit
     }
   }
@@ -240,6 +247,7 @@ absl::StatusOr<ValidationResult> ValidateCreateOrUpdate(WriteOperation op, uint6
   if (payload.empty()) {
     result.violations.push_back(MakeViolation(ArtifactWriteViolation::EMPTY_PAYLOAD, absl::StrCat("type: ", resolved.type_name),
                                               "empty payload: zero-length payloads are reserved for tombstones"));
+    result.resolved_type.reset();
     return result; // short-circuit
   }
 
@@ -247,14 +255,12 @@ absl::StatusOr<ValidationResult> ValidateCreateOrUpdate(WriteOperation op, uint6
   auto parse_violation = ValidatePayloadParsing(resolved.descriptor_set, resolved.type_name, payload);
   if (parse_violation.has_value()) {
     result.violations.push_back(std::move(*parse_violation));
+    result.resolved_type.reset();
     return result; // short-circuit
   }
 
-  // Phases 1-4 passed; populate the resolved type for the caller.
-  result.resolved_type = std::move(*resolved_or);
-
   // ── Phase 5: NAN_IN_INDEXED_FIELD, NON_MINIMAL_VARINT ────────────────────
-  auto index_violations = ValidateIndexDerivation(result.resolved_type->descriptor_set, result.resolved_type->type_name, payload, index_def_ids_by_key_type);
+  auto index_violations = ValidateIndexDerivation(resolved.descriptor_set, resolved.type_name, payload, index_def_ids_by_key_type);
 
   // ── Phase 6: Referential integrity (collected, not short-circuited) ───────
   // Referential integrity checking is handled externally by the referential
