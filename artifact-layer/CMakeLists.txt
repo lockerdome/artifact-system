@@ -109,6 +109,9 @@ add_library(artifact_layer_lib
   src/transaction/transaction_manager.cpp
   src/storage/memory_storage.cpp
   src/storage/lakefs_storage.cpp
+  src/artifact/validation.cpp
+  src/artifact/referential_integrity.cpp
+  src/artifact/artifact_store.cpp
 )
 target_include_directories(artifact_layer_lib PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(artifact_layer_lib

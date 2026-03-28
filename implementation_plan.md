@@ -28,7 +28,7 @@ otherwise noted.
 | P3 | Path Encoding & Index Key Encoding | :white_check_mark: Complete |
 | P4 | Index Storage & Three-Way Merge | :white_check_mark: Complete |
 | P5 | Transaction & Snapshot Manager | :white_check_mark: Complete |
-| P6 | Artifact CRUD Engine | :white_large_square: Not started |
+| P6 | Artifact CRUD Engine | :construction: In progress |
 | P7a | Registry Utilities (proto compiler, schema compat) | :white_large_square: Not started |
 | P7b | Type Registry Orchestration (RegisterTypeVersion + introspection) | :white_large_square: Not started |
 | P8 | Genesis Bootstrap | :white_large_square: Not started |
