@@ -103,6 +103,10 @@ add_library(artifact_layer_lib
   src/index/index_object.cpp
   src/index/index_merge.cpp
   src/index/index_derivation.cpp
+  src/index/index_conflict_resolver.cpp
+  src/transaction/conflict_resolver.cpp
+  src/transaction/write_executor.cpp
+  src/transaction/transaction_manager.cpp
   src/storage/memory_storage.cpp
   src/storage/lakefs_storage.cpp
 )
@@ -115,6 +119,7 @@ target_link_libraries(artifact_layer_lib
     absl::status
     absl::statusor
     absl::strings
+    absl::time
     Threads::Threads
     CURL::libcurl
     OpenSSL::Crypto

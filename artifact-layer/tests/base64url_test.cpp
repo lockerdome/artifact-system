@@ -51,4 +51,17 @@ TEST(Base64UrlTest, UsesUrlSafeAlphabetWithoutPadding) {
   EXPECT_EQ(plus_encoded.find('='), std::string::npos);
 }
 
+TEST(Base64UrlTest, DecodeRoundTrip) {
+  const std::vector<uint8_t> input = {0x00, 0x01, 0x02, 0xEF, 0xFE, 0xFD};
+  const std::string encoded = encoding::base64url::Encode(input);
+  auto decoded_or = encoding::base64url::Decode(encoded);
+  ASSERT_TRUE(decoded_or.ok());
+  EXPECT_EQ(*decoded_or, input);
+}
+
+TEST(Base64UrlTest, DecodeRejectsInvalidInput) {
+  auto decoded_or = encoding::base64url::Decode("bad*");
+  ASSERT_FALSE(decoded_or.ok());
+}
+
 } // namespace artifact_system::testing

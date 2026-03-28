@@ -27,7 +27,7 @@ otherwise noted.
 | P2b | LakeFS Storage Layer Integration | :white_check_mark: Complete |
 | P3 | Path Encoding & Index Key Encoding | :white_check_mark: Complete |
 | P4 | Index Storage & Three-Way Merge | :white_check_mark: Complete |
-| P5 | Transaction & Snapshot Manager | :white_large_square: Not started |
+| P5 | Transaction & Snapshot Manager | :white_check_mark: Complete |
 | P6 | Artifact CRUD Engine | :white_large_square: Not started |
 | P7a | Registry Utilities (proto compiler, schema compat) | :white_large_square: Not started |
 | P7b | Type Registry Orchestration (RegisterTypeVersion + introspection) | :white_large_square: Not started |
@@ -415,13 +415,13 @@ descriptors) lives here because index serialization/deserialization depends on t
    - All tests use `MemoryStorage`
 
 ### Checklist
-- [ ] `src/transaction/transaction_manager.h/.cpp` — snapshot/transaction lifecycle
-- [ ] `src/transaction/write_executor.h/.cpp` — sub-branch-per-write, conflict retry
-- [ ] `src/transaction/conflict_resolver.h/.cpp` — classify conflicts, retry policy, CommitConflict
-- [ ] `tests/transaction_manager_test.cpp` — create/commit/rollback, nested transactions
-- [ ] `tests/write_executor_test.cpp` — sub-branch isolation, concurrent writes
-- [ ] `tests/conflict_resolver_test.cpp` — retry success, exhaustion, non-retryable conflicts
-- [ ] Implicit transaction support working
+- [x] `src/transaction/transaction_manager.h/.cpp` — snapshot/transaction lifecycle
+- [x] `src/transaction/write_executor.h/.cpp` — sub-branch-per-write, conflict retry
+- [x] `src/transaction/conflict_resolver.h/.cpp` — classify conflicts, retry policy, CommitConflict
+- [x] `tests/transaction_manager_test.cpp` — create/commit/rollback, nested transactions
+- [x] `tests/write_executor_test.cpp` — sub-branch isolation, concurrent writes
+- [x] `tests/conflict_resolver_test.cpp` — retry success, exhaustion, non-retryable conflicts
+- [x] Implicit transaction support working
 - [ ] TSan preset passing (see note below)
 
 ### TSan note
