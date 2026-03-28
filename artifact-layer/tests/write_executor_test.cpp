@@ -76,6 +76,9 @@ absl::StatusOr<artifact_system::IndexDefinition> FindIndexDefinitionByKeyType(co
   return absl::NotFoundError("index definition not found");
 }
 
+// Builds a valid serialized index object for mock expectations. Rows are intentionally
+// empty — merge correctness with real row data is covered by index_merge_test.cpp.
+// These tests verify write executor plumbing (orchestration, retry, cleanup).
 absl::StatusOr<std::string> BuildIndexObjectBytes(const artifact_system::IndexDefinition& definition, const google::protobuf::Descriptor& descriptor,
                                                   std::initializer_list<uint64_t> /*artifact_ids*/) {
   auto schema_or = artifact_system::index::GenerateIndexSchema(definition, descriptor);

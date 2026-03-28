@@ -331,7 +331,7 @@ absl::StatusOr<TransactionManager::CommitResult> TransactionManager::RunImplicit
   if (!commit_or.ok()) {
     const absl::Status rollback_status = RollbackTransaction(transaction_id);
     if (!rollback_status.ok()) {
-      return absl::InternalError(absl::StrCat("commit failed and rollback failed: ", rollback_status.message()));
+      return absl::InternalError(absl::StrCat("commit failed (", commit_or.status().message(), ") and rollback failed: ", rollback_status.message()));
     }
     return commit_or.status();
   }

@@ -33,6 +33,8 @@ absl::StatusOr<artifact_system::IndexDefinition> FindIndexDefinitionByKeyType(co
   return absl::NotFoundError("index definition not found");
 }
 
+// Builds a valid serialized index object for mock expectations. Rows are intentionally
+// empty — merge correctness with real row data is covered by index_merge_test.cpp.
 absl::StatusOr<std::string> BuildIndexObjectBytes(const artifact_system::IndexDefinition& definition, const google::protobuf::Descriptor& descriptor,
                                                   const std::string& serialized_key, std::initializer_list<uint64_t> /*artifact_ids*/) {
   auto schema_or = artifact_system::index::GenerateIndexSchema(definition, descriptor);
@@ -425,6 +427,89 @@ TEST(TransactionManagerTest, CommitTransactionRejectsZeroMaxAttempts) {
   auto commit_or = manager.CommitTransaction(*transaction_id_or);
   ASSERT_FALSE(commit_or.ok());
   EXPECT_EQ(commit_or.status().code(), absl::StatusCode::kInvalidArgument);
+}
+
+TEST(TransactionManagerTest, ImplicitTransactionConflictRollsBackAndReturnsConflict) {
+  MemoryStorage storage;
+
+  TransactionManager::Options options;
+  options.path_conflict_classifier = [](const std::string& path) {
+    if (path.rfind("idx/non_unique/", 0) == 0) {
+      return PathConflictKind::kRetryableNonUniqueIndex;
+    }
+    return PathConflictKind::kNonRetryableUnknown;
+  };
+  options.conflict_options.max_attempts = 1;
+  options.sleep_for = [](absl::Duration) {};
+  TransactionManager manager(&storage, options);
+
+  std::optional<uint64_t> seen_tx_id;
+  auto implicit_or = manager.RunImplicitTransaction([&](uint64_t tx_id) {
+    seen_tx_id = tx_id;
+    auto tx_meta_or = manager.GetTransactionMetadata(tx_id);
+    if (!tx_meta_or.ok()) {
+      return tx_meta_or.status();
+    }
+    auto put_status = storage.PutObject(tx_meta_or->branch_name, "idx/non_unique/key", "tx-value");
+    if (!put_status.ok()) {
+      return put_status;
+    }
+
+    // Create a conflicting write on canonical while the transaction is open.
+    auto canonical_put = storage.PutObject(storage.GetCanonicalBranch(), "idx/non_unique/key", "canonical-value");
+    if (!canonical_put.ok()) {
+      return canonical_put;
+    }
+    return storage.Commit(storage.GetCanonicalBranch(), "canonical update").status();
+  });
+
+  ASSERT_TRUE(implicit_or.ok());
+  ASSERT_TRUE(std::holds_alternative<TransactionManager::CommitConflict>(*implicit_or));
+  const auto& conflict = std::get<TransactionManager::CommitConflict>(*implicit_or);
+  EXPECT_FALSE(conflict.detail.retryable());
+
+  // Transaction should be cleaned up after conflict.
+  ASSERT_TRUE(seen_tx_id.has_value());
+  auto tx_meta_or = manager.GetTransactionMetadata(*seen_tx_id);
+  ASSERT_FALSE(tx_meta_or.ok());
+  EXPECT_EQ(tx_meta_or.status().code(), absl::StatusCode::kNotFound);
+}
+
+TEST(TransactionManagerTest, NestedRollbackChildThenCommitParentSucceeds) {
+  MemoryStorage storage;
+  TransactionManager manager(&storage);
+
+  auto parent_tx_id_or = manager.CreateTransaction();
+  ASSERT_TRUE(parent_tx_id_or.ok());
+  auto parent_meta_or = manager.GetTransactionMetadata(*parent_tx_id_or);
+  ASSERT_TRUE(parent_meta_or.ok());
+
+  ASSERT_TRUE(storage.PutObject(parent_meta_or->branch_name, "parent/data.txt", "parent-data").ok());
+
+  auto child_tx_id_or = manager.CreateTransaction(*parent_tx_id_or);
+  ASSERT_TRUE(child_tx_id_or.ok());
+  auto child_meta_or = manager.GetTransactionMetadata(*child_tx_id_or);
+  ASSERT_TRUE(child_meta_or.ok());
+
+  ASSERT_TRUE(storage.PutObject(child_meta_or->branch_name, "child/data.txt", "child-data").ok());
+
+  // Rollback the child — its writes should not propagate.
+  ASSERT_TRUE(manager.RollbackTransaction(*child_tx_id_or).ok());
+
+  // Parent should still be committable.
+  auto parent_commit_or = manager.CommitTransaction(*parent_tx_id_or);
+  ASSERT_TRUE(parent_commit_or.ok());
+  ASSERT_TRUE(std::holds_alternative<TransactionManager::CommitSuccess>(*parent_commit_or));
+
+  // Parent's data should be on canonical.
+  auto parent_read_or = storage.GetObject(storage.GetCanonicalBranch(), "parent/data.txt");
+  ASSERT_TRUE(parent_read_or.ok());
+  EXPECT_EQ(*parent_read_or, "parent-data");
+
+  // Child's data should NOT be on canonical.
+  auto child_read_or = storage.GetObject(storage.GetCanonicalBranch(), "child/data.txt");
+  ASSERT_FALSE(child_read_or.ok());
+  EXPECT_EQ(child_read_or.status().code(), absl::StatusCode::kNotFound);
 }
 
 } // namespace
