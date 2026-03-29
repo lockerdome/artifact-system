@@ -29,6 +29,7 @@ otherwise noted.
 | P4 | Index Storage & Three-Way Merge | :white_check_mark: Complete |
 | P5 | Transaction & Snapshot Manager | :white_check_mark: Complete |
 | P6 | Artifact CRUD Engine | :white_check_mark: Complete |
+| P6.5 | String IDs for Snapshots & Transactions | :construction: In progress |
 | P7a | Registry Utilities (proto compiler, schema compat) | :white_large_square: Not started |
 | P7b | Type Registry Orchestration (RegisterTypeVersion + introspection) | :white_large_square: Not started |
 | P8 | Genesis Bootstrap | :white_large_square: Not started |
@@ -381,15 +382,18 @@ descriptors) lives here because index serialization/deserialization depends on t
 
 **Goal**: Implement the transaction/snapshot lifecycle on top of the Storage Layer abstraction.
 
+**Note**: P5 originally used `uint64_t` IDs with an internal counter and mapping layer.
+P6.5 replaced these with opaque string IDs (commit hashes for snapshots, branch names
+for transactions), eliminating the mapping layer.
+
 ### Deliverables
 
 1. **`src/transaction/transaction_manager.h/.cpp`**:
-   - `CreateSnapshot(optional<parent_id>)` -> snapshot_id (commit pointer)
-   - `CreateTransaction(optional<parent_id>)` -> transaction_id (ephemeral branch)
+   - `CreateSnapshot(optional<parent_transaction_id>)` -> snapshot_id (commit hash string)
+   - `CreateTransaction(optional<parent_snapshot_id>, optional<parent_transaction_id>)` -> transaction_id (branch name string)
    - `CommitTransaction(transaction_id)` -> merge into parent/canonical branch
    - `RollbackTransaction(transaction_id)` -> delete ephemeral branch
-   - Internal ID allocation for snapshot/transaction IDs (can use the ID allocator client
-     or a local counter for these internal IDs)
+   - UUID-based branch name generation (no counter coordination needed)
    - Nested transactions (sub-transaction merges into parent's branch)
    - Implicit transaction support (create branch, do work, commit, merge, return)
 
@@ -510,6 +514,67 @@ type_name and deny_* flags. This is plain artifact reads, not registry API calls
 - [x] `tests/validation_test.cpp` — all 11 violation categories, short-circuit behavior
 - [x] `tests/referential_integrity_test.cpp` — RESTRICT, CASCADE, SET_NULL, cycle detection
 - [x] ID allocation via mock allocator (real integration in P10)
+
+---
+
+## Phase 6.5 — String IDs for Snapshots & Transactions
+
+**Goal**: Replace synthetic `uint64_t` snapshot/transaction IDs with opaque strings from the
+Storage Layer. Snapshot IDs become commit hashes; transaction IDs become branch names. This
+eliminates the mapping layer, simplifies the code, and removes a horizontal-scaling obstacle
+(no counter coordination needed).
+
+### Motivation
+
+The original PRD specified `uint64` for snapshot_id and transaction_id. The underlying
+Storage Layer (LakeFS) uses strings natively: commit hashes for snapshots and branch names
+for transactions. The P5 implementation maintained an in-memory mapping layer
+(`next_id_++` counter, `unordered_map<uint64, Record>`) that every operation had to
+traverse. This was accidental complexity — the LakeFS strings are already unique and stable.
+
+Exposing the commit hashes also gives callers merkle-tree verification guarantees for free.
+
+### Deliverables
+
+1. **Proto changes** (`proto/artifact_service.proto`):
+   - `ReadContext`: `uint64 snapshot_id` → `string snapshot_id`, `uint64 transaction_id` → `string transaction_id`
+   - `CreateSnapshotRequest`: `optional uint64 parent_id` → `optional string parent_transaction_id`
+   - `CreateTransactionRequest`: `optional uint64 parent_id` → `oneof parent { string parent_snapshot_id; string parent_transaction_id; }`
+   - All response/request `snapshot_id` and `transaction_id` fields: `uint64` → `string`
+
+2. **TransactionManager** (`src/transaction/transaction_manager.h/.cpp`):
+   - Removed `uint64_t next_id_` counter and `NextIdLocked()` method
+   - Removed `TransactionBranchName(uint64_t)` helper
+   - Maps keyed by `std::string` instead of `uint64_t`
+   - Branch names generated via UUID (`txn-<random-hex>`) instead of sequential counter
+   - `CreateSnapshot` returns commit hash directly
+   - `CreateTransaction` returns branch name directly
+   - Metadata structs simplified: `snapshot_id == commit_id`, `transaction_id == branch_name`
+
+3. **ArtifactStore** (`src/artifact/artifact_store.h/.cpp`):
+   - `WriteResult.snapshot_id` and `CreateResult.snapshot_id`: `uint64_t` → `std::string`
+   - `ResolveReadRef`/`ResolveWriteBranch`: simplified to validation + passthrough
+   - `ExecuteWrite`: returns `std::string` snapshot_id
+   - All CRUD methods: `optional<uint64_t> transaction_id` → `optional<string>`
+
+4. **Tests**: Updated `transaction_manager_test.cpp`, `artifact_store_test.cpp`,
+   `proto_compilation_test.cpp` to use string IDs.
+
+### What did NOT change
+- `artifact_id`, `version_id`, `index_definition_id` — still `uint64` from ID Allocator
+- `WriteExecutor` — already fully string-based internally
+- `StorageInterface` — already fully string-based
+- `encoding/`, `index/` — use `uint64` artifact_id for path encoding (unchanged)
+- `validation.h/.cpp`, `referential_integrity.h/.cpp` — no snapshot/transaction ID usage
+- `StoredArtifact` (on-disk format) — unchanged
+
+### Checklist
+- [ ] Proto definitions updated (snapshot_id, transaction_id → string)
+- [ ] `CreateTransactionRequest` uses `oneof parent` instead of single `parent_id`
+- [ ] TransactionManager: removed uint64 counter/maps, UUID branch names
+- [ ] ArtifactStore: string snapshot/transaction IDs throughout
+- [ ] All tests updated and passing (292/292)
+- [ ] PRD updated with string ID definitions
 
 ---
 

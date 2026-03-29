@@ -502,12 +502,12 @@ Storage Layer branch and merge mechanics are hidden; callers interact with snaps
 
 ##### Snapshots
 
-A snapshot is an immutable, read-only pointer to a Storage Layer commit. Snapshots do not require a Storage Layer branch;
-they reference a commit directly.
+A snapshot is an immutable, read-only pointer to a Storage Layer commit. The snapshot_id is the Storage Layer commit hash
+itself (an opaque string). Snapshots do not require a Storage Layer branch; they reference a commit directly.
 
-1. `CreateSnapshot(parent_id?)` returns a snapshot_id. If parent_id is omitted, the snapshot points to the canonical
-   branch head. If parent_id is a transaction ID, the snapshot points to the transaction's current head Storage Layer
-   commit.
+1. `CreateSnapshot(parent_transaction_id?)` returns a snapshot_id (an opaque string — the Storage Layer commit hash).
+   If parent_transaction_id is omitted, the snapshot points to the canonical branch head. If parent_transaction_id is
+   provided, the snapshot points to the transaction's current head Storage Layer commit.
 1. All reads within a snapshot (GetArtifact, BatchGetArtifacts, FetchIndex) are performed against the snapshot's Storage
    Layer commit, providing a consistent, point-in-time view.
 1. Snapshots are lightweight and immutable. They serve as the read context for callers that need consistent multi-read
@@ -515,12 +515,14 @@ they reference a commit directly.
 
 ##### Transactions
 
-A transaction is a mutable, read-write context backed by an ephemeral Storage Layer branch.
+A transaction is a mutable, read-write context backed by an ephemeral Storage Layer branch. The transaction_id is the
+Storage Layer branch name itself (an opaque string).
 
-1. `CreateTransaction(parent_id?)` returns a transaction_id. If parent_id is omitted, the ephemeral branch is forked from
-   the canonical branch head. If parent_id is a snapshot ID, the branch is forked from that snapshot's Storage Layer
-   commit. If parent_id is a transaction ID, the branch is forked from the parent transaction's current head Storage Layer
-   commit, creating a sub-transaction.
+1. `CreateTransaction(parent_snapshot_id?, parent_transaction_id?)` returns a transaction_id (an opaque string — the
+   Storage Layer branch name). If both parent fields are omitted, the ephemeral branch is forked from the canonical
+   branch head. If parent_snapshot_id is provided, the branch is forked from that snapshot's Storage Layer commit. If
+   parent_transaction_id is provided, the branch is forked from the parent transaction's current head Storage Layer
+   commit, creating a sub-transaction. At most one parent field may be set.
 1. Reads within a transaction use the transaction's ephemeral branch head, which includes the transaction's own writes.
    This provides read-after-write visibility within the transaction. Snapshot isolation applies relative to other
    concurrent Artifact Layer transaction commits: reads are isolated from changes that other transactions commit to the
@@ -1034,33 +1036,37 @@ service SnapshotTransactionService {
 }
 
 message CreateSnapshotRequest {
-  optional uint64 parent_id = 1; // transaction_id; omit to snapshot the canonical branch head
+  optional string parent_transaction_id = 1; // transaction_id; omit to snapshot the canonical branch head
 }
 
 message CreateSnapshotResponse {
-  uint64 snapshot_id = 1;
+  string snapshot_id = 1;
 }
 
 message CreateTransactionRequest {
-  optional uint64 parent_id = 1; // snapshot_id or transaction_id; omit to fork from canonical branch head
+  // Fork from a snapshot or transaction; omit both to fork from canonical branch head.
+  oneof parent {
+    string parent_snapshot_id = 1;
+    string parent_transaction_id = 2;
+  }
 }
 
 message CreateTransactionResponse {
-  uint64 transaction_id = 1;
+  string transaction_id = 1;
 }
 
 message CommitTransactionRequest {
-  uint64 transaction_id = 1;
+  string transaction_id = 1;
 }
 
 message CommitTransactionResponse {
   // Conflict details are returned via gRPC error status
   // with a CommitConflict detail message (see Conflict retry policy).
-  uint64 snapshot_id = 1;      // snapshot of the canonical branch state after the merge (see Snapshot ID on write responses)
+  string snapshot_id = 1;      // snapshot of the canonical branch state after the merge (see Snapshot ID on write responses)
 }
 
 message RollbackTransactionRequest {
-  uint64 transaction_id = 1;
+  string transaction_id = 1;
 }
 
 message RollbackTransactionResponse {}
@@ -1072,12 +1078,13 @@ implicit transaction (see Implicit transactions).
 
 Error responses:
 
-1. **Invalid parent_id on CreateSnapshot**: if parent_id is provided but does not resolve to a valid transaction ID,
-   return gRPC status `NOT_FOUND` with a `SnapshotTransactionError` detail message (category `PARENT_NOT_FOUND`). The
-   description identifies the unrecognized parent_id.
-2. **Invalid parent_id on CreateTransaction**: if parent_id is provided but does not resolve to a valid snapshot ID or
-   transaction ID, return gRPC status `NOT_FOUND` with a `SnapshotTransactionError` detail message (category
-   `PARENT_NOT_FOUND`). The description identifies the unrecognized parent_id.
+1. **Invalid parent_transaction_id on CreateSnapshot**: if parent_transaction_id is provided but does not resolve to
+   a valid transaction ID, return gRPC status `NOT_FOUND` with a `SnapshotTransactionError` detail message (category
+   `PARENT_NOT_FOUND`). The description identifies the unrecognized parent_transaction_id.
+2. **Invalid parent on CreateTransaction**: if a parent_snapshot_id or parent_transaction_id is provided but does not
+   resolve to a valid snapshot ID or transaction ID respectively, return gRPC status `NOT_FOUND` with a
+   `SnapshotTransactionError` detail message (category `PARENT_NOT_FOUND`). The description identifies the unrecognized
+   parent ID.
 3. **Invalid transaction_id on CommitTransaction**: if transaction_id does not resolve to an open transaction, return
    gRPC status `NOT_FOUND` with a `SnapshotTransactionError` detail message (category `TRANSACTION_NOT_FOUND`). This
    covers non-existent IDs, already-committed transactions, and already-rolled-back transactions. On conflict, return
@@ -1130,8 +1137,8 @@ service ArtifactService {
 // and writes are wrapped in an implicit transaction (see Implicit transactions).
 message ReadContext {
   oneof context {
-    uint64 snapshot_id = 1;
-    uint64 transaction_id = 2;
+    string snapshot_id = 1;
+    string transaction_id = 2;
   }
 }
 
@@ -1140,12 +1147,12 @@ message ReadContext {
 message CreateArtifactRequest {
   uint64 version_id = 1;       // TypeVersionDefinition artifact_id (required)
   bytes payload = 2;            // serialized protobuf message for the resolved type version
-  optional uint64 transaction_id = 3; // omit for implicit transaction
+  optional string transaction_id = 3; // omit for implicit transaction
 }
 
 message CreateArtifactResponse {
   uint64 artifact_id = 1;      // allocated by the ID service
-  uint64 snapshot_id = 2;      // snapshot of the state after the write (see Snapshot ID on write responses)
+  string snapshot_id = 2;      // snapshot of the state after the write (see Snapshot ID on write responses)
 }
 
 message GetArtifactRequest {
@@ -1181,20 +1188,20 @@ message UpdateArtifactRequest {
   uint64 artifact_id = 1;
   uint64 version_id = 2;       // TypeVersionDefinition artifact_id (required)
   bytes payload = 3;            // serialized protobuf message for the resolved type version
-  optional uint64 transaction_id = 4; // omit for implicit transaction
+  optional string transaction_id = 4; // omit for implicit transaction
 }
 
 message UpdateArtifactResponse {
-  uint64 snapshot_id = 1;      // snapshot of the state after the write (see Snapshot ID on write responses)
+  string snapshot_id = 1;      // snapshot of the state after the write (see Snapshot ID on write responses)
 }
 
 message DeleteArtifactRequest {
   uint64 artifact_id = 1;
-  optional uint64 transaction_id = 2; // omit for implicit transaction
+  optional string transaction_id = 2; // omit for implicit transaction
 }
 
 message DeleteArtifactResponse {
-  uint64 snapshot_id = 1;      // snapshot of the state after the write (see Snapshot ID on write responses)
+  string snapshot_id = 1;      // snapshot of the state after the write (see Snapshot ID on write responses)
 }
 ```
 
