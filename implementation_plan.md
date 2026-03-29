@@ -28,7 +28,7 @@ otherwise noted.
 | P3 | Path Encoding & Index Key Encoding | :white_check_mark: Complete |
 | P4 | Index Storage & Three-Way Merge | :white_check_mark: Complete |
 | P5 | Transaction & Snapshot Manager | :white_check_mark: Complete |
-| P6 | Artifact CRUD Engine | :white_large_square: Not started |
+| P6 | Artifact CRUD Engine | :white_check_mark: Complete |
 | P7a | Registry Utilities (proto compiler, schema compat) | :white_large_square: Not started |
 | P7b | Type Registry Orchestration (RegisterTypeVersion + introspection) | :white_large_square: Not started |
 | P8 | Genesis Bootstrap | :white_large_square: Not started |
@@ -503,13 +503,13 @@ type_name and deny_* flags. This is plain artifact reads, not registry API calls
    - Referential integrity: all on_delete behaviors, cascading cycles
 
 ### Checklist
-- [ ] `src/artifact/artifact_store.h/.cpp` — Create/Get/BatchGet/Update/Delete
-- [ ] `src/artifact/validation.h/.cpp` — full validation pipeline with PRD ordering
-- [ ] `src/artifact/referential_integrity.h/.cpp` — write-time + delete-time enforcement
-- [ ] `tests/artifact_store_test.cpp` — CRUD with implicit and explicit transactions
-- [ ] `tests/validation_test.cpp` — all 11 violation categories, short-circuit behavior
-- [ ] `tests/referential_integrity_test.cpp` — RESTRICT, CASCADE, SET_NULL, cycle detection
-- [ ] ID allocation via mock allocator (real integration in P10)
+- [x] `src/artifact/artifact_store.h/.cpp` — Create/Get/BatchGet/Update/Delete
+- [x] `src/artifact/validation.h/.cpp` — full validation pipeline with PRD ordering
+- [x] `src/artifact/referential_integrity.h/.cpp` — write-time + delete-time enforcement
+- [x] `tests/artifact_store_test.cpp` — CRUD with implicit and explicit transactions
+- [x] `tests/validation_test.cpp` — all 11 violation categories, short-circuit behavior
+- [x] `tests/referential_integrity_test.cpp` — RESTRICT, CASCADE, SET_NULL, cycle detection
+- [x] ID allocation via mock allocator (real integration in P10)
 
 ---
 

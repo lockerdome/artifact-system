@@ -8,6 +8,7 @@ namespace artifact_system::index {
 
 struct IndexMergeResult {
   IndexObject merged;
+  bool unique_conflict = false;
 };
 
 absl::StatusOr<IndexMergeResult> MergeIndexObjects(const artifact_system::IndexDefinition& index_definition, const IndexObject& base, const IndexObject& ours,
