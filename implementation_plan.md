@@ -29,7 +29,7 @@ otherwise noted.
 | P4 | Index Storage & Three-Way Merge | :white_check_mark: Complete |
 | P5 | Transaction & Snapshot Manager | :white_check_mark: Complete |
 | P6 | Artifact CRUD Engine | :white_check_mark: Complete |
-| P6.5 | String IDs for Snapshots & Transactions | :construction: In progress |
+| P6.5 | String IDs for Snapshots & Transactions | :white_check_mark: Complete |
 | P7a | Registry Utilities (proto compiler, schema compat) | :white_large_square: Not started |
 | P7b | Type Registry Orchestration (RegisterTypeVersion + introspection) | :white_large_square: Not started |
 | P8 | Genesis Bootstrap | :white_large_square: Not started |
@@ -569,12 +569,12 @@ Exposing the commit hashes also gives callers merkle-tree verification guarantee
 - `StoredArtifact` (on-disk format) — unchanged
 
 ### Checklist
-- [ ] Proto definitions updated (snapshot_id, transaction_id → string)
-- [ ] `CreateTransactionRequest` uses `oneof parent` instead of single `parent_id`
-- [ ] TransactionManager: removed uint64 counter/maps, UUID branch names
-- [ ] ArtifactStore: string snapshot/transaction IDs throughout
-- [ ] All tests updated and passing (292/292)
-- [ ] PRD updated with string ID definitions
+- [x] Proto definitions updated (snapshot_id, transaction_id → string)
+- [x] `CreateTransactionRequest` uses `oneof parent` instead of single `parent_id`
+- [x] TransactionManager: removed uint64 counter/maps, UUID branch names
+- [x] ArtifactStore: string snapshot/transaction IDs throughout
+- [x] All tests updated and passing (292/292)
+- [x] PRD updated with string ID definitions
 
 ---
 
