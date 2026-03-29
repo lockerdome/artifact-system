@@ -54,29 +54,25 @@ TEST(TransactionManagerTest, CreateSnapshotFromCanonicalAndTransaction) {
 
   auto canonical_snapshot_id_or = manager.CreateSnapshot();
   ASSERT_TRUE(canonical_snapshot_id_or.ok());
-
-  auto canonical_snapshot_meta_or = manager.GetSnapshotMetadata(*canonical_snapshot_id_or);
-  ASSERT_TRUE(canonical_snapshot_meta_or.ok());
+  EXPECT_FALSE(canonical_snapshot_id_or->empty());
 
   auto canonical_head_or = storage.GetBranchHead(storage.GetCanonicalBranch());
   ASSERT_TRUE(canonical_head_or.ok());
-  EXPECT_EQ(canonical_snapshot_meta_or->commit_id, *canonical_head_or);
+  // The snapshot_id IS the commit hash.
+  EXPECT_EQ(*canonical_snapshot_id_or, *canonical_head_or);
 
   auto transaction_id_or = manager.CreateTransaction();
   ASSERT_TRUE(transaction_id_or.ok());
 
-  auto transaction_meta_or = manager.GetTransactionMetadata(*transaction_id_or);
-  ASSERT_TRUE(transaction_meta_or.ok());
-  ASSERT_TRUE(storage.PutObject(transaction_meta_or->branch_name, "a.txt", "value-a").ok());
-  auto tx_commit_or = storage.Commit(transaction_meta_or->branch_name, "tx work");
+  // The transaction_id IS the branch name — use it directly for storage operations.
+  ASSERT_TRUE(storage.PutObject(*transaction_id_or, "a.txt", "value-a").ok());
+  auto tx_commit_or = storage.Commit(*transaction_id_or, "tx work");
   ASSERT_TRUE(tx_commit_or.ok());
 
   auto tx_snapshot_id_or = manager.CreateSnapshot(*transaction_id_or);
   ASSERT_TRUE(tx_snapshot_id_or.ok());
-
-  auto tx_snapshot_meta_or = manager.GetSnapshotMetadata(*tx_snapshot_id_or);
-  ASSERT_TRUE(tx_snapshot_meta_or.ok());
-  EXPECT_EQ(tx_snapshot_meta_or->commit_id, *tx_commit_or);
+  // The snapshot_id IS the commit hash.
+  EXPECT_EQ(*tx_snapshot_id_or, *tx_commit_or);
 }
 
 TEST(TransactionManagerTest, TransactionLifecycleCommitAndRollback) {
@@ -91,13 +87,12 @@ TEST(TransactionManagerTest, TransactionLifecycleCommitAndRollback) {
   ASSERT_TRUE(std::holds_alternative<TransactionManager::CommitSuccess>(*commit_result_or));
 
   const auto& committed = std::get<TransactionManager::CommitSuccess>(*commit_result_or);
-  ASSERT_TRUE(committed.snapshot_id.has_value());
+  EXPECT_FALSE(committed.snapshot_id.empty());
 
-  auto snapshot_meta_or = manager.GetSnapshotMetadata(*committed.snapshot_id);
-  ASSERT_TRUE(snapshot_meta_or.ok());
   auto canonical_head_or = storage.GetBranchHead(storage.GetCanonicalBranch());
   ASSERT_TRUE(canonical_head_or.ok());
-  EXPECT_EQ(snapshot_meta_or->commit_id, *canonical_head_or);
+  // The snapshot_id IS the commit hash.
+  EXPECT_EQ(committed.snapshot_id, *canonical_head_or);
 
   auto missing_after_commit = manager.GetTransactionMetadata(*commit_tx_id_or);
   ASSERT_FALSE(missing_after_commit.ok());
@@ -118,22 +113,21 @@ TEST(TransactionManagerTest, NestedCommitMergesIntoParentThenCanonicalOnParentCo
 
   auto parent_tx_id_or = manager.CreateTransaction();
   ASSERT_TRUE(parent_tx_id_or.ok());
-  auto parent_meta_or = manager.GetTransactionMetadata(*parent_tx_id_or);
-  ASSERT_TRUE(parent_meta_or.ok());
 
-  auto child_tx_id_or = manager.CreateTransaction(*parent_tx_id_or);
+  // Create child transaction with parent_transaction_id.
+  auto child_tx_id_or = manager.CreateTransaction(/*parent_snapshot_id=*/std::nullopt, /*parent_transaction_id=*/*parent_tx_id_or);
   ASSERT_TRUE(child_tx_id_or.ok());
-  auto child_meta_or = manager.GetTransactionMetadata(*child_tx_id_or);
-  ASSERT_TRUE(child_meta_or.ok());
 
-  ASSERT_TRUE(storage.PutObject(child_meta_or->branch_name, "nested/object.txt", "nested-data").ok());
+  // The transaction_id IS the branch name — use directly.
+  ASSERT_TRUE(storage.PutObject(*child_tx_id_or, "nested/object.txt", "nested-data").ok());
 
   auto child_commit_or = manager.CommitTransaction(*child_tx_id_or);
   ASSERT_TRUE(child_commit_or.ok());
   ASSERT_TRUE(std::holds_alternative<TransactionManager::CommitSuccess>(*child_commit_or));
-  EXPECT_TRUE(std::get<TransactionManager::CommitSuccess>(*child_commit_or).snapshot_id.has_value());
+  EXPECT_FALSE(std::get<TransactionManager::CommitSuccess>(*child_commit_or).snapshot_id.empty());
 
-  auto parent_read_or = storage.GetObject(parent_meta_or->branch_name, "nested/object.txt");
+  // Parent branch should now contain the nested object.
+  auto parent_read_or = storage.GetObject(*parent_tx_id_or, "nested/object.txt");
   ASSERT_TRUE(parent_read_or.ok());
   EXPECT_EQ(*parent_read_or, "nested-data");
 
@@ -154,18 +148,15 @@ TEST(TransactionManagerTest, ImplicitTransactionSuccessCommitsAndReturnsSnapshot
   MemoryStorage storage;
   TransactionManager manager(&storage);
 
-  auto implicit_or = manager.RunImplicitTransaction([&](uint64_t tx_id) {
-    auto tx_meta_or = manager.GetTransactionMetadata(tx_id);
-    if (!tx_meta_or.ok()) {
-      return tx_meta_or.status();
-    }
-    return storage.PutObject(tx_meta_or->branch_name, "implicit/success.txt", "ok");
+  auto implicit_or = manager.RunImplicitTransaction([&](const std::string& tx_id) {
+    // The tx_id IS the branch name — use directly.
+    return storage.PutObject(tx_id, "implicit/success.txt", "ok");
   });
 
   ASSERT_TRUE(implicit_or.ok());
   ASSERT_TRUE(std::holds_alternative<TransactionManager::CommitSuccess>(*implicit_or));
   const auto& committed = std::get<TransactionManager::CommitSuccess>(*implicit_or);
-  ASSERT_TRUE(committed.snapshot_id.has_value());
+  EXPECT_FALSE(committed.snapshot_id.empty());
 
   auto canonical_read_or = storage.GetObject(storage.GetCanonicalBranch(), "implicit/success.txt");
   ASSERT_TRUE(canonical_read_or.ok());
@@ -176,14 +167,11 @@ TEST(TransactionManagerTest, ImplicitTransactionFailureRollsBack) {
   MemoryStorage storage;
   TransactionManager manager(&storage);
 
-  std::optional<uint64_t> seen_tx_id;
-  auto implicit_or = manager.RunImplicitTransaction([&](uint64_t tx_id) {
+  std::optional<std::string> seen_tx_id;
+  auto implicit_or = manager.RunImplicitTransaction([&](const std::string& tx_id) {
     seen_tx_id = tx_id;
-    auto tx_meta_or = manager.GetTransactionMetadata(tx_id);
-    if (!tx_meta_or.ok()) {
-      return tx_meta_or.status();
-    }
-    auto put_status = storage.PutObject(tx_meta_or->branch_name, "implicit/failure.txt", "temp");
+    // The tx_id IS the branch name — use directly.
+    auto put_status = storage.PutObject(tx_id, "implicit/failure.txt", "temp");
     if (!put_status.ok()) {
       return put_status;
     }
@@ -217,10 +205,9 @@ TEST(TransactionManagerTest, CommitTransactionClassifiesNonRetryableIndexConflic
 
   auto transaction_id_or = manager.CreateTransaction();
   ASSERT_TRUE(transaction_id_or.ok());
-  auto transaction_meta_or = manager.GetTransactionMetadata(*transaction_id_or);
-  ASSERT_TRUE(transaction_meta_or.ok());
 
-  ASSERT_TRUE(storage.PutObject(transaction_meta_or->branch_name, "idx/unique/key", "tx-value").ok());
+  // The transaction_id IS the branch name.
+  ASSERT_TRUE(storage.PutObject(*transaction_id_or, "idx/unique/key", "tx-value").ok());
 
   ASSERT_TRUE(storage.PutObject(storage.GetCanonicalBranch(), "idx/unique/key", "canonical-value").ok());
   ASSERT_TRUE(storage.Commit(storage.GetCanonicalBranch(), "canonical update").ok());
@@ -252,10 +239,9 @@ TEST(TransactionManagerTest, CommitTransactionRetriesUntilExhaustedForRetryableC
 
   auto transaction_id_or = manager.CreateTransaction();
   ASSERT_TRUE(transaction_id_or.ok());
-  auto transaction_meta_or = manager.GetTransactionMetadata(*transaction_id_or);
-  ASSERT_TRUE(transaction_meta_or.ok());
 
-  ASSERT_TRUE(storage.PutObject(transaction_meta_or->branch_name, "idx/non_unique/key", "tx-value").ok());
+  // The transaction_id IS the branch name.
+  ASSERT_TRUE(storage.PutObject(*transaction_id_or, "idx/non_unique/key", "tx-value").ok());
 
   ASSERT_TRUE(storage.PutObject(storage.GetCanonicalBranch(), "idx/non_unique/key", "canonical-value").ok());
   ASSERT_TRUE(storage.Commit(storage.GetCanonicalBranch(), "canonical update").ok());
@@ -293,10 +279,9 @@ TEST(TransactionManagerTest, DefaultResolverDoesNotAutoResolveUniqueIndexConflic
 
   auto transaction_id_or = manager.CreateTransaction();
   ASSERT_TRUE(transaction_id_or.ok());
-  auto transaction_meta_or = manager.GetTransactionMetadata(*transaction_id_or);
-  ASSERT_TRUE(transaction_meta_or.ok());
 
-  ASSERT_TRUE(storage.PutObject(transaction_meta_or->branch_name, index_path, "ours").ok());
+  // The transaction_id IS the branch name.
+  ASSERT_TRUE(storage.PutObject(*transaction_id_or, index_path, "ours").ok());
 
   ASSERT_TRUE(storage.PutObject(storage.GetCanonicalBranch(), index_path, "theirs").ok());
   ASSERT_TRUE(storage.Commit(storage.GetCanonicalBranch(), "canonical unique update").ok());
@@ -318,10 +303,9 @@ TEST(TransactionManagerTest, DefaultResolverDoesNotAutoResolveNonIndexConflict) 
 
   auto transaction_id_or = manager.CreateTransaction();
   ASSERT_TRUE(transaction_id_or.ok());
-  auto transaction_meta_or = manager.GetTransactionMetadata(*transaction_id_or);
-  ASSERT_TRUE(transaction_meta_or.ok());
 
-  ASSERT_TRUE(storage.PutObject(transaction_meta_or->branch_name, "payload/object-1", "txn-value").ok());
+  // The transaction_id IS the branch name.
+  ASSERT_TRUE(storage.PutObject(*transaction_id_or, "payload/object-1", "txn-value").ok());
   ASSERT_TRUE(storage.PutObject(storage.GetCanonicalBranch(), "payload/object-1", "canonical-value").ok());
   ASSERT_TRUE(storage.Commit(storage.GetCanonicalBranch(), "canonical payload update").ok());
 
@@ -351,10 +335,9 @@ TEST(TransactionManagerTest, DefaultResolverTreatsMalformedIndexDefinitionAsNonR
 
   auto transaction_id_or = manager.CreateTransaction();
   ASSERT_TRUE(transaction_id_or.ok());
-  auto transaction_meta_or = manager.GetTransactionMetadata(*transaction_id_or);
-  ASSERT_TRUE(transaction_meta_or.ok());
 
-  ASSERT_TRUE(storage.PutObject(transaction_meta_or->branch_name, index_path, "txn-value").ok());
+  // The transaction_id IS the branch name.
+  ASSERT_TRUE(storage.PutObject(*transaction_id_or, index_path, "txn-value").ok());
   ASSERT_TRUE(storage.PutObject(storage.GetCanonicalBranch(), index_path, "canonical-value").ok());
   ASSERT_TRUE(storage.Commit(storage.GetCanonicalBranch(), "canonical malformed index update").ok());
 
@@ -397,10 +380,9 @@ TEST(TransactionManagerTest, CommitTransactionInvokesRetryConflictResolver) {
 
   auto transaction_id_or = manager.CreateTransaction();
   ASSERT_TRUE(transaction_id_or.ok());
-  auto transaction_meta_or = manager.GetTransactionMetadata(*transaction_id_or);
-  ASSERT_TRUE(transaction_meta_or.ok());
 
-  ASSERT_TRUE(storage.PutObject(transaction_meta_or->branch_name, "idx/non_unique/key", "tx-value").ok());
+  // The transaction_id IS the branch name.
+  ASSERT_TRUE(storage.PutObject(*transaction_id_or, "idx/non_unique/key", "tx-value").ok());
 
   ASSERT_TRUE(storage.PutObject(storage.GetCanonicalBranch(), "idx/non_unique/key", "canonical-value").ok());
   ASSERT_TRUE(storage.Commit(storage.GetCanonicalBranch(), "canonical update").ok());
@@ -443,14 +425,11 @@ TEST(TransactionManagerTest, ImplicitTransactionConflictRollsBackAndReturnsConfl
   options.sleep_for = [](absl::Duration) {};
   TransactionManager manager(&storage, options);
 
-  std::optional<uint64_t> seen_tx_id;
-  auto implicit_or = manager.RunImplicitTransaction([&](uint64_t tx_id) {
+  std::optional<std::string> seen_tx_id;
+  auto implicit_or = manager.RunImplicitTransaction([&](const std::string& tx_id) {
     seen_tx_id = tx_id;
-    auto tx_meta_or = manager.GetTransactionMetadata(tx_id);
-    if (!tx_meta_or.ok()) {
-      return tx_meta_or.status();
-    }
-    auto put_status = storage.PutObject(tx_meta_or->branch_name, "idx/non_unique/key", "tx-value");
+    // The tx_id IS the branch name — use directly.
+    auto put_status = storage.PutObject(tx_id, "idx/non_unique/key", "tx-value");
     if (!put_status.ok()) {
       return put_status;
     }
@@ -481,17 +460,16 @@ TEST(TransactionManagerTest, NestedRollbackChildThenCommitParentSucceeds) {
 
   auto parent_tx_id_or = manager.CreateTransaction();
   ASSERT_TRUE(parent_tx_id_or.ok());
-  auto parent_meta_or = manager.GetTransactionMetadata(*parent_tx_id_or);
-  ASSERT_TRUE(parent_meta_or.ok());
 
-  ASSERT_TRUE(storage.PutObject(parent_meta_or->branch_name, "parent/data.txt", "parent-data").ok());
+  // The transaction_id IS the branch name — use directly.
+  ASSERT_TRUE(storage.PutObject(*parent_tx_id_or, "parent/data.txt", "parent-data").ok());
 
-  auto child_tx_id_or = manager.CreateTransaction(*parent_tx_id_or);
+  // Create child transaction with parent_transaction_id.
+  auto child_tx_id_or = manager.CreateTransaction(/*parent_snapshot_id=*/std::nullopt, /*parent_transaction_id=*/*parent_tx_id_or);
   ASSERT_TRUE(child_tx_id_or.ok());
-  auto child_meta_or = manager.GetTransactionMetadata(*child_tx_id_or);
-  ASSERT_TRUE(child_meta_or.ok());
 
-  ASSERT_TRUE(storage.PutObject(child_meta_or->branch_name, "child/data.txt", "child-data").ok());
+  // The child transaction_id IS the branch name.
+  ASSERT_TRUE(storage.PutObject(*child_tx_id_or, "child/data.txt", "child-data").ok());
 
   // Rollback the child — its writes should not propagate.
   ASSERT_TRUE(manager.RollbackTransaction(*child_tx_id_or).ok());

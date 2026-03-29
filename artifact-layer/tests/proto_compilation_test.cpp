@@ -152,10 +152,10 @@ TEST(ProtoCompilationTest, ReadContextOneof) {
   ReadContext rc;
   EXPECT_EQ(rc.context_case(), ReadContext::CONTEXT_NOT_SET);
 
-  rc.set_snapshot_id(1);
+  rc.set_snapshot_id("commit-abc");
   EXPECT_EQ(rc.context_case(), ReadContext::kSnapshotId);
 
-  rc.set_transaction_id(2);
+  rc.set_transaction_id("txn-def");
   EXPECT_EQ(rc.context_case(), ReadContext::kTransactionId);
 }
 
@@ -259,17 +259,17 @@ TEST(ProtoCompilationTest, CrudRequestResponseRoundTrip) {
   CreateArtifactRequest create_req;
   create_req.set_version_id(1);
   create_req.set_payload("binary_data");
-  create_req.set_transaction_id(100);
+  create_req.set_transaction_id("txn-100");
   EXPECT_TRUE(create_req.has_transaction_id());
 
   CreateArtifactResponse create_resp;
   create_resp.set_artifact_id(42);
-  create_resp.set_snapshot_id(200);
+  create_resp.set_snapshot_id("commit-200");
 
   // GetArtifact
   GetArtifactRequest get_req;
   get_req.set_artifact_id(42);
-  get_req.mutable_context()->set_snapshot_id(200);
+  get_req.mutable_context()->set_snapshot_id("commit-200");
 
   GetArtifactResponse get_resp;
   get_resp.set_artifact_id(42);
@@ -310,23 +310,23 @@ TEST(ProtoCompilationTest, ArtifactNotFoundError) {
 
 TEST(ProtoCompilationTest, SnapshotTransactionMessages) {
   CreateSnapshotRequest snap_req;
-  EXPECT_FALSE(snap_req.has_parent_id());
-  snap_req.set_parent_id(10);
-  EXPECT_TRUE(snap_req.has_parent_id());
+  EXPECT_FALSE(snap_req.has_parent_transaction_id());
+  snap_req.set_parent_transaction_id("txn-10");
+  EXPECT_TRUE(snap_req.has_parent_transaction_id());
 
   CreateTransactionRequest tx_req;
-  EXPECT_FALSE(tx_req.has_parent_id());
+  EXPECT_EQ(tx_req.parent_case(), CreateTransactionRequest::PARENT_NOT_SET);
 
   CommitTransactionRequest commit_req;
-  commit_req.set_transaction_id(10);
-  EXPECT_EQ(commit_req.transaction_id(), 10);
+  commit_req.set_transaction_id("txn-10");
+  EXPECT_EQ(commit_req.transaction_id(), "txn-10");
 
   CommitTransactionResponse commit_resp;
-  commit_resp.set_snapshot_id(200);
-  EXPECT_EQ(commit_resp.snapshot_id(), 200);
+  commit_resp.set_snapshot_id("commit-200");
+  EXPECT_EQ(commit_resp.snapshot_id(), "commit-200");
 
   RollbackTransactionRequest rollback_req;
-  rollback_req.set_transaction_id(10);
+  rollback_req.set_transaction_id("txn-10");
 
   // RollbackTransactionResponse is empty.
   RollbackTransactionResponse rollback_resp;
@@ -337,7 +337,7 @@ TEST(ProtoCompilationTest, FetchIndexMessages) {
   FetchIndexRequest req;
   req.set_key_type("by_owner");
   req.set_key("key_bytes");
-  req.mutable_context()->set_transaction_id(5);
+  req.mutable_context()->set_transaction_id("txn-5");
 
   FetchIndexResponse resp;
   resp.set_index_payload("index_data");
