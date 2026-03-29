@@ -24,20 +24,6 @@
 namespace artifact_system::artifact {
 namespace {
 
-// Read and parse a StoredArtifact from storage at the given artifact_id.
-absl::StatusOr<StoredArtifact> ReadStoredArtifact(uint64_t artifact_id, const ValidationContext& ctx) {
-  const std::string path = encoding::ArtifactPath(artifact_id);
-  auto data_or = ctx.storage->GetObject(ctx.ref, path);
-  if (!data_or.ok()) {
-    return data_or.status();
-  }
-  StoredArtifact stored;
-  if (!stored.ParseFromString(*data_or)) {
-    return absl::InternalError(absl::StrCat("failed to parse StoredArtifact at ", path));
-  }
-  return stored;
-}
-
 // Validate payload against the type's descriptor set using DynamicMessage.
 // Returns nullopt on success, or a violation on failure.
 std::optional<ArtifactWriteViolation> ValidatePayloadParsing(const google::protobuf::FileDescriptorSet& descriptor_set, const std::string& type_name,
@@ -99,7 +85,7 @@ std::vector<ArtifactWriteViolation> ValidateIndexDerivation(const google::protob
 
 absl::StatusOr<ResolvedType> ResolveVersionId(uint64_t version_id, const ValidationContext& ctx) {
   // Step 1: Read the TypeVersionDefinition artifact.
-  auto version_stored_or = ReadStoredArtifact(version_id, ctx);
+  auto version_stored_or = ReadStoredArtifact(ctx.storage, ctx.ref, version_id);
   if (!version_stored_or.ok()) {
     return version_stored_or.status();
   }
@@ -117,7 +103,7 @@ absl::StatusOr<ResolvedType> ResolveVersionId(uint64_t version_id, const Validat
   }
 
   // Step 4: Read the parent TypeDefinition artifact.
-  auto type_stored_or = ReadStoredArtifact(tvd.type_id(), ctx);
+  auto type_stored_or = ReadStoredArtifact(ctx.storage, ctx.ref, tvd.type_id());
   if (!type_stored_or.ok()) {
     return type_stored_or.status();
   }
@@ -170,7 +156,7 @@ absl::StatusOr<ValidationResult> ValidateCreateOrUpdate(WriteOperation op, uint6
 
   // For Update: verify type_name matches the existing artifact.
   if (op == WriteOperation::kUpdate && existing_artifact_id.has_value()) {
-    auto existing_or = ReadStoredArtifact(*existing_artifact_id, ctx);
+    auto existing_or = ReadStoredArtifact(ctx.storage, ctx.ref, *existing_artifact_id);
     if (!existing_or.ok()) {
       if (absl::IsNotFound(existing_or.status())) {
         result.violations.push_back(MakeViolation(ArtifactWriteViolation::INVALID_VERSION_ID, absl::StrCat("version_id: ", version_id),
@@ -238,7 +224,7 @@ absl::StatusOr<std::vector<ArtifactWriteViolation>> ValidateDelete(uint64_t arti
   std::vector<ArtifactWriteViolation> violations;
 
   // Step 1: Read the existing artifact to get its type_name.
-  auto stored_or = ReadStoredArtifact(artifact_id, ctx);
+  auto stored_or = ReadStoredArtifact(ctx.storage, ctx.ref, artifact_id);
   if (!stored_or.ok()) {
     return stored_or.status();
   }

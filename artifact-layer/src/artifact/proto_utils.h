@@ -1,12 +1,20 @@
 #pragma once
 
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "google/protobuf/descriptor.h"
 #include "google/protobuf/descriptor.pb.h"
 
+#include "artifact_internal.pb.h"
 #include "artifact_service.pb.h"
+#include "encoding/artifact_path.h"
+#include "storage/storage_interface.h"
 
 namespace artifact_system::artifact {
 
@@ -48,6 +56,33 @@ inline ArtifactWriteViolation MakeViolation(ArtifactWriteViolation::Category cat
   v.set_subject(subject);
   v.set_description(description);
   return v;
+}
+
+// Read and parse a StoredArtifact from storage. Returns NOT_FOUND if the
+// object does not exist.
+inline absl::StatusOr<StoredArtifact> ReadStoredArtifact(StorageInterface* storage, const std::string& ref, uint64_t artifact_id) {
+  const std::string path = encoding::ArtifactPath(artifact_id);
+  auto data_or = storage->GetObject(ref, path);
+  if (!data_or.ok()) {
+    return data_or.status();
+  }
+  StoredArtifact stored;
+  if (!stored.ParseFromString(*data_or)) {
+    return absl::InternalError(absl::StrCat("failed to parse StoredArtifact at ", path));
+  }
+  return stored;
+}
+
+// Like ReadStoredArtifact, but returns nullopt instead of NOT_FOUND.
+inline absl::StatusOr<std::optional<StoredArtifact>> ReadStoredArtifactIfExists(StorageInterface* storage, const std::string& ref, uint64_t artifact_id) {
+  auto result = ReadStoredArtifact(storage, ref, artifact_id);
+  if (!result.ok()) {
+    if (absl::IsNotFound(result.status())) {
+      return std::nullopt;
+    }
+    return result.status();
+  }
+  return std::move(*result);
 }
 
 } // namespace artifact_system::artifact

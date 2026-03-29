@@ -28,19 +28,6 @@
 namespace artifact_system::artifact {
 namespace {
 
-// Read and parse a StoredArtifact from storage.
-absl::StatusOr<StoredArtifact> ReadStoredArtifact(StorageInterface* storage, const std::string& ref, uint64_t artifact_id) {
-  const std::string path = encoding::ArtifactPath(artifact_id);
-  auto data_or = storage->GetObject(ref, path);
-  if (!data_or.ok())
-    return data_or.status();
-  StoredArtifact stored;
-  if (!stored.ParseFromString(*data_or)) {
-    return absl::InternalError(absl::StrCat("failed to parse StoredArtifact at ", path));
-  }
-  return stored;
-}
-
 // Build an ArtifactWriteError status from violations.
 absl::Status MakeWriteError(const std::vector<ArtifactWriteViolation>& violations) {
   ArtifactWriteError error;

@@ -25,28 +25,10 @@
 namespace artifact_system::artifact {
 namespace {
 
-// Helper: read a StoredArtifact from storage by artifact_id.
-// Returns nullopt if the object does not exist (NOT_FOUND).
-absl::StatusOr<std::optional<StoredArtifact>> ReadStoredArtifact(uint64_t artifact_id, const RefIntegrityContext& ctx) {
-  const std::string path = encoding::ArtifactPath(artifact_id);
-  auto data_or = ctx.storage->GetObject(ctx.ref, path);
-  if (!data_or.ok()) {
-    if (absl::IsNotFound(data_or.status())) {
-      return std::nullopt;
-    }
-    return data_or.status();
-  }
-  StoredArtifact stored;
-  if (!stored.ParseFromString(*data_or)) {
-    return absl::InternalError(absl::StrCat("failed to parse StoredArtifact at ", path));
-  }
-  return stored;
-}
-
 // Validate a single reference value (a uint64 artifact_id) against storage.
 absl::StatusOr<std::optional<ArtifactWriteViolation>> ValidateSingleReference(uint64_t ref_id, const std::string& field_name,
                                                                               const std::string& target_type_name, const RefIntegrityContext& ctx) {
-  auto stored_or = ReadStoredArtifact(ref_id, ctx);
+  auto stored_or = ReadStoredArtifactIfExists(ctx.storage, ctx.ref, ref_id);
   if (!stored_or.ok()) {
     return stored_or.status();
   }
@@ -172,7 +154,7 @@ std::optional<ResolvedReferencingType> ResolveReferencingType(const std::string&
   const uint64_t type_def_id = (*td_ids_or)[0];
 
   // Step 2: Read the TypeDefinition to get current_version_id.
-  auto td_stored_or = ReadStoredArtifact(type_def_id, ctx);
+  auto td_stored_or = ReadStoredArtifactIfExists(ctx.storage, ctx.ref, type_def_id);
   if (!td_stored_or.ok() || !td_stored_or->has_value() || td_stored_or->value().payload().empty()) {
     return std::nullopt;
   }
@@ -182,7 +164,7 @@ std::optional<ResolvedReferencingType> ResolveReferencingType(const std::string&
   }
 
   // Step 3: Read the TypeVersionDefinition to get the descriptor_set.
-  auto tvd_stored_or = ReadStoredArtifact(td.current_version_id(), ctx);
+  auto tvd_stored_or = ReadStoredArtifactIfExists(ctx.storage, ctx.ref, td.current_version_id());
   if (!tvd_stored_or.ok() || !tvd_stored_or->has_value() || tvd_stored_or->value().payload().empty()) {
     return std::nullopt;
   }
@@ -344,7 +326,7 @@ absl::StatusOr<DeleteEnforcementResult> EnforceDeleteIntegrity(uint64_t artifact
 
   // Step 2: For each ReferenceDefinition, read it and enforce the policy.
   for (const uint64_t ref_def_id : *ref_def_ids_or) {
-    auto stored_or = ReadStoredArtifact(ref_def_id, ctx);
+    auto stored_or = ReadStoredArtifactIfExists(ctx.storage, ctx.ref, ref_def_id);
     if (!stored_or.ok()) {
       return stored_or.status();
     }
@@ -392,7 +374,7 @@ absl::StatusOr<DeleteEnforcementResult> EnforceDeleteIntegrity(uint64_t artifact
       }
       for (const uint64_t ref_artifact_id : active_referencing) {
         // Read the cascaded artifact to get its type_name.
-        auto cascade_stored_or = ReadStoredArtifact(ref_artifact_id, ctx);
+        auto cascade_stored_or = ReadStoredArtifactIfExists(ctx.storage, ctx.ref, ref_artifact_id);
         if (!cascade_stored_or.ok() || !cascade_stored_or->has_value() || cascade_stored_or->value().payload().empty()) {
           continue;
         }
