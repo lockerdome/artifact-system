@@ -14,6 +14,7 @@
 #include "google/protobuf/descriptor.pb.h"
 #include "google/protobuf/dynamic_message.h"
 
+#include "artifact/proto_utils.h"
 #include "artifact/referential_integrity.h"
 #include "artifact/validation.h"
 #include "artifact_internal.pb.h"
@@ -26,34 +27,6 @@
 
 namespace artifact_system::artifact {
 namespace {
-
-// Build a DescriptorPool and find a message by full name.
-const google::protobuf::Descriptor* BuildPoolAndFindMessage(const google::protobuf::FileDescriptorSet& descriptor_set, const std::string& message_full_name,
-                                                            google::protobuf::DescriptorPool* pool) {
-  std::vector<bool> built(descriptor_set.file_size(), false);
-  int built_count = 0;
-  bool made_progress = true;
-  while (built_count < descriptor_set.file_size() && made_progress) {
-    made_progress = false;
-    for (int i = 0; i < descriptor_set.file_size(); ++i) {
-      if (built[static_cast<size_t>(i)])
-        continue;
-      const auto& file = descriptor_set.file(i);
-      if (pool->FindFileByName(file.name()) != nullptr) {
-        built[static_cast<size_t>(i)] = true;
-        ++built_count;
-        made_progress = true;
-        continue;
-      }
-      if (pool->BuildFile(file) != nullptr) {
-        built[static_cast<size_t>(i)] = true;
-        ++built_count;
-        made_progress = true;
-      }
-    }
-  }
-  return pool->FindMessageTypeByName(message_full_name);
-}
 
 // Read and parse a StoredArtifact from storage.
 absl::StatusOr<StoredArtifact> ReadStoredArtifact(StorageInterface* storage, const std::string& ref, uint64_t artifact_id) {
@@ -112,6 +85,106 @@ std::string SerializeTombstone(uint64_t version_id, const std::string& type_name
   envelope.set_type_name(type_name);
   // empty payload = tombstone
   return envelope.SerializeAsString();
+}
+
+// Find an IndexDefinition by key_type from descriptor message options.
+std::optional<IndexDefinition> FindIndexDefinition(const google::protobuf::Descriptor& descriptor, const std::string& key_type) {
+  const auto& options = descriptor.options();
+  for (int i = 0; i < options.ExtensionSize(artifact_system::indexes); ++i) {
+    const auto& def = options.GetExtension(artifact_system::indexes, i);
+    if (def.key_type() == key_type) {
+      return def;
+    }
+  }
+  return std::nullopt;
+}
+
+// Add an index row for a derived entry. Reads the existing index object (if any),
+// appends the row, and writes back.
+absl::Status AddIndexRow(StorageInterface* storage, const std::string& branch, const index::DerivedIndexEntry& entry, uint64_t artifact_id,
+                         const IndexDefinition& index_def, const google::protobuf::Descriptor& descriptor) {
+  const std::string index_path = encoding::IndexPath(entry.index_def_id, entry.encoded_key);
+
+  auto schema_or = index::GenerateIndexSchema(index_def, descriptor);
+  if (!schema_or.ok())
+    return schema_or.status();
+
+  index::IndexObject index_obj;
+  index_obj.serialized_key = std::string(entry.encoded_key.begin(), entry.encoded_key.end());
+
+  auto existing_or = storage->GetObject(branch, index_path);
+  if (existing_or.ok()) {
+    auto deser_or = index::DeserializeIndexObject(*schema_or, index_def, *existing_or);
+    if (deser_or.ok()) {
+      index_obj = std::move(*deser_or);
+    }
+  }
+
+  index::IndexRow row;
+  row.artifact_id = artifact_id;
+  row.order_values = entry.order_values;
+  index_obj.rows.push_back(std::move(row));
+
+  auto ser_or = index::SerializeIndexObject(*schema_or, index_def, index_obj);
+  if (!ser_or.ok())
+    return ser_or.status();
+  return storage->PutObject(branch, index_path, *ser_or);
+}
+
+// Remove an index row for a derived entry. Reads the existing index object,
+// erases the row matching artifact_id, and writes back. Best-effort: returns
+// OkStatus on any intermediate failure.
+absl::Status RemoveIndexRow(StorageInterface* storage, const std::string& branch, const index::DerivedIndexEntry& entry, uint64_t artifact_id,
+                            const IndexDefinition& index_def, const google::protobuf::Descriptor& descriptor) {
+  const std::string index_path = encoding::IndexPath(entry.index_def_id, entry.encoded_key);
+
+  auto schema_or = index::GenerateIndexSchema(index_def, descriptor);
+  if (!schema_or.ok())
+    return absl::OkStatus();
+
+  auto existing_or = storage->GetObject(branch, index_path);
+  if (!existing_or.ok())
+    return absl::OkStatus();
+
+  auto deser_or = index::DeserializeIndexObject(*schema_or, index_def, *existing_or);
+  if (!deser_or.ok())
+    return absl::OkStatus();
+
+  auto& idx_obj = *deser_or;
+  std::erase_if(idx_obj.rows, [artifact_id](const index::IndexRow& row) { return row.artifact_id == artifact_id; });
+
+  auto ser_or = index::SerializeIndexObject(*schema_or, index_def, idx_obj);
+  if (ser_or.ok()) {
+    (void)storage->PutObject(branch, index_path, *ser_or);
+  }
+  return absl::OkStatus();
+}
+
+// Run referential integrity validation for a create or update operation.
+// Builds a dynamic message from the resolved type and validates all reference fields.
+absl::StatusOr<std::vector<ArtifactWriteViolation>> RunRefIntegrityValidation(StorageInterface* storage, const std::string& read_ref,
+                                                                              const ResolvedType& resolved, const std::string& payload) {
+  std::vector<ArtifactWriteViolation> violations;
+
+  google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
+  const auto* descriptor = BuildPoolAndFindMessage(resolved.descriptor_set, resolved.type_name, &pool);
+  if (descriptor == nullptr) {
+    return violations;
+  }
+
+  google::protobuf::DynamicMessageFactory factory;
+  const auto* prototype = factory.GetPrototype(descriptor);
+  std::unique_ptr<google::protobuf::Message> msg(prototype->New());
+  if (!msg->ParseFromString(payload)) {
+    return violations;
+  }
+
+  RefIntegrityContext ri_ctx{storage, read_ref};
+  auto ref_violations_or = ValidateReferences(*msg, *descriptor, ri_ctx);
+  if (!ref_violations_or.ok()) {
+    return ref_violations_or.status();
+  }
+  return std::move(*ref_violations_or);
 }
 
 } // namespace
@@ -290,7 +363,6 @@ absl::Status ArtifactStore::StageCreate(const std::string& branch, uint64_t arti
   if (!entries_or.ok())
     return entries_or.status();
 
-  // Build a descriptor pool for index schema generation.
   google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
   const auto* descriptor = BuildPoolAndFindMessage(descriptor_set, type_name, &pool);
   if (descriptor == nullptr) {
@@ -298,51 +370,11 @@ absl::Status ArtifactStore::StageCreate(const std::string& branch, uint64_t arti
   }
 
   for (const auto& entry : *entries_or) {
-    const std::string index_path = encoding::IndexPath(entry.index_def_id, entry.encoded_key);
-
-    // Find the IndexDefinition for this entry's key_type.
-    IndexDefinition index_def;
-    const auto& options = descriptor->options();
-    bool found = false;
-    for (int i = 0; i < options.ExtensionSize(artifact_system::indexes); ++i) {
-      const auto& def = options.GetExtension(artifact_system::indexes, i);
-      if (def.key_type() == entry.key_type) {
-        index_def = def;
-        found = true;
-        break;
-      }
-    }
-    if (!found) {
+    auto index_def = FindIndexDefinition(*descriptor, entry.key_type);
+    if (!index_def.has_value()) {
       return absl::InternalError(absl::StrCat("IndexDefinition not found for key_type: ", entry.key_type));
     }
-
-    auto schema_or = index::GenerateIndexSchema(index_def, *descriptor);
-    if (!schema_or.ok())
-      return schema_or.status();
-
-    // Read existing index object or start fresh.
-    index::IndexObject index_obj;
-    index_obj.serialized_key = std::string(entry.encoded_key.begin(), entry.encoded_key.end());
-
-    auto existing_or = storage_->GetObject(branch, index_path);
-    if (existing_or.ok()) {
-      auto deser_or = index::DeserializeIndexObject(*schema_or, index_def, *existing_or);
-      if (deser_or.ok()) {
-        index_obj = std::move(*deser_or);
-      }
-    }
-
-    // Add the new row.
-    index::IndexRow row;
-    row.artifact_id = artifact_id;
-    row.order_values = entry.order_values;
-    index_obj.rows.push_back(std::move(row));
-
-    // Serialize and write back.
-    auto ser_or = index::SerializeIndexObject(*schema_or, index_def, index_obj);
-    if (!ser_or.ok())
-      return ser_or.status();
-    status = storage_->PutObject(branch, index_path, *ser_or);
+    status = AddIndexRow(storage_, branch, entry, artifact_id, *index_def, *descriptor);
     if (!status.ok())
       return status;
   }
@@ -406,88 +438,20 @@ absl::Status ArtifactStore::StageUpdate(const std::string& branch, uint64_t arti
     // If the old descriptor can't be resolved, skip cleanup (best-effort).
     if (old_descriptor != nullptr) {
       for (const auto& old_entry : old_entries) {
-        const std::string index_path = encoding::IndexPath(old_entry.index_def_id, old_entry.encoded_key);
-
-        IndexDefinition index_def;
-        const auto& options = old_descriptor->options();
-        bool found = false;
-        for (int i = 0; i < options.ExtensionSize(artifact_system::indexes); ++i) {
-          const auto& def = options.GetExtension(artifact_system::indexes, i);
-          if (def.key_type() == old_entry.key_type) {
-            index_def = def;
-            found = true;
-            break;
-          }
-        }
-        if (!found)
+        auto index_def = FindIndexDefinition(*old_descriptor, old_entry.key_type);
+        if (!index_def.has_value())
           continue;
-
-        auto schema_or = index::GenerateIndexSchema(index_def, *old_descriptor);
-        if (!schema_or.ok())
-          continue;
-
-        auto existing_idx_or = storage_->GetObject(branch, index_path);
-        if (!existing_idx_or.ok())
-          continue;
-
-        auto deser_or = index::DeserializeIndexObject(*schema_or, index_def, *existing_idx_or);
-        if (!deser_or.ok())
-          continue;
-
-        auto& idx_obj = *deser_or;
-        std::erase_if(idx_obj.rows, [artifact_id](const index::IndexRow& row) { return row.artifact_id == artifact_id; });
-
-        // Write back (even if empty — tombstoned index per PRD).
-        auto ser_or = index::SerializeIndexObject(*schema_or, index_def, idx_obj);
-        if (ser_or.ok()) {
-          (void)storage_->PutObject(branch, index_path, *ser_or);
-        }
+        (void)RemoveIndexRow(storage_, branch, old_entry, artifact_id, *index_def, *old_descriptor);
       }
     }
   }
 
   // 7. Add new index entries.
   for (const auto& new_entry : *new_entries_or) {
-    const std::string index_path = encoding::IndexPath(new_entry.index_def_id, new_entry.encoded_key);
-
-    IndexDefinition index_def;
-    const auto& options = descriptor->options();
-    bool found = false;
-    for (int i = 0; i < options.ExtensionSize(artifact_system::indexes); ++i) {
-      const auto& def = options.GetExtension(artifact_system::indexes, i);
-      if (def.key_type() == new_entry.key_type) {
-        index_def = def;
-        found = true;
-        break;
-      }
-    }
-    if (!found)
+    auto index_def = FindIndexDefinition(*descriptor, new_entry.key_type);
+    if (!index_def.has_value())
       continue;
-
-    auto schema_or = index::GenerateIndexSchema(index_def, *descriptor);
-    if (!schema_or.ok())
-      return schema_or.status();
-
-    index::IndexObject index_obj;
-    index_obj.serialized_key = std::string(new_entry.encoded_key.begin(), new_entry.encoded_key.end());
-
-    auto existing_idx_or = storage_->GetObject(branch, index_path);
-    if (existing_idx_or.ok()) {
-      auto deser_or = index::DeserializeIndexObject(*schema_or, index_def, *existing_idx_or);
-      if (deser_or.ok()) {
-        index_obj = std::move(*deser_or);
-      }
-    }
-
-    index::IndexRow row;
-    row.artifact_id = artifact_id;
-    row.order_values = new_entry.order_values;
-    index_obj.rows.push_back(std::move(row));
-
-    auto ser_or = index::SerializeIndexObject(*schema_or, index_def, index_obj);
-    if (!ser_or.ok())
-      return ser_or.status();
-    status = storage_->PutObject(branch, index_path, *ser_or);
+    status = AddIndexRow(storage_, branch, new_entry, artifact_id, *index_def, *descriptor);
     if (!status.ok())
       return status;
   }
@@ -536,42 +500,10 @@ absl::Status ArtifactStore::StageDelete(const std::string& branch, uint64_t arti
   }
 
   for (const auto& entry : *old_entries_or) {
-    const std::string index_path = encoding::IndexPath(entry.index_def_id, entry.encoded_key);
-
-    IndexDefinition index_def;
-    const auto& options = descriptor->options();
-    bool found = false;
-    for (int i = 0; i < options.ExtensionSize(artifact_system::indexes); ++i) {
-      const auto& def = options.GetExtension(artifact_system::indexes, i);
-      if (def.key_type() == entry.key_type) {
-        index_def = def;
-        found = true;
-        break;
-      }
-    }
-    if (!found)
+    auto index_def = FindIndexDefinition(*descriptor, entry.key_type);
+    if (!index_def.has_value())
       continue;
-
-    auto schema_or = index::GenerateIndexSchema(index_def, *descriptor);
-    if (!schema_or.ok())
-      continue;
-
-    auto existing_idx_or = storage_->GetObject(branch, index_path);
-    if (!existing_idx_or.ok())
-      continue;
-
-    auto deser_or = index::DeserializeIndexObject(*schema_or, index_def, *existing_idx_or);
-    if (!deser_or.ok())
-      continue;
-
-    auto& idx_obj = *deser_or;
-    std::erase_if(idx_obj.rows, [artifact_id](const index::IndexRow& row) { return row.artifact_id == artifact_id; });
-
-    // Write back (even if empty — tombstoned index).
-    auto ser_or = index::SerializeIndexObject(*schema_or, index_def, idx_obj);
-    if (ser_or.ok()) {
-      (void)storage_->PutObject(branch, index_path, *ser_or);
-    }
+    (void)RemoveIndexRow(storage_, branch, entry, artifact_id, *index_def, *descriptor);
   }
 
   return absl::OkStatus();
@@ -605,20 +537,10 @@ absl::StatusOr<CreateResult> ArtifactStore::CreateArtifact(uint64_t version_id, 
 
   // Run referential integrity validation (phase 6) — runs independently
   // of phase 5 (NaN/varint). Both phases' violations are collected.
-  google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
-  const auto* descriptor = BuildPoolAndFindMessage(resolved.descriptor_set, resolved.type_name, &pool);
-  if (descriptor != nullptr) {
-    google::protobuf::DynamicMessageFactory factory;
-    const auto* prototype = factory.GetPrototype(descriptor);
-    std::unique_ptr<google::protobuf::Message> msg(prototype->New());
-    if (msg->ParseFromString(payload)) {
-      RefIntegrityContext ri_ctx{storage_, read_ref};
-      auto ref_violations_or = ValidateReferences(*msg, *descriptor, ri_ctx);
-      if (!ref_violations_or.ok())
-        return ref_violations_or.status();
-      val_result.violations.insert(val_result.violations.end(), ref_violations_or->begin(), ref_violations_or->end());
-    }
-  }
+  auto ref_violations_or = RunRefIntegrityValidation(storage_, read_ref, resolved, payload);
+  if (!ref_violations_or.ok())
+    return ref_violations_or.status();
+  val_result.violations.insert(val_result.violations.end(), ref_violations_or->begin(), ref_violations_or->end());
 
   if (!val_result.violations.empty())
     return MakeWriteError(val_result.violations);
@@ -667,20 +589,10 @@ absl::StatusOr<WriteResult> ArtifactStore::UpdateArtifact(uint64_t artifact_id, 
   const ResolvedType& resolved = *val_result.resolved_type;
 
   // Referential integrity validation (phase 6) — independent of phase 5.
-  google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
-  const auto* descriptor = BuildPoolAndFindMessage(resolved.descriptor_set, resolved.type_name, &pool);
-  if (descriptor != nullptr) {
-    google::protobuf::DynamicMessageFactory factory;
-    const auto* prototype = factory.GetPrototype(descriptor);
-    std::unique_ptr<google::protobuf::Message> msg(prototype->New());
-    if (msg->ParseFromString(payload)) {
-      RefIntegrityContext ri_ctx{storage_, read_ref};
-      auto ref_violations_or = ValidateReferences(*msg, *descriptor, ri_ctx);
-      if (!ref_violations_or.ok())
-        return ref_violations_or.status();
-      val_result.violations.insert(val_result.violations.end(), ref_violations_or->begin(), ref_violations_or->end());
-    }
-  }
+  auto ref_violations_or = RunRefIntegrityValidation(storage_, read_ref, resolved, payload);
+  if (!ref_violations_or.ok())
+    return ref_violations_or.status();
+  val_result.violations.insert(val_result.violations.end(), ref_violations_or->begin(), ref_violations_or->end());
 
   if (!val_result.violations.empty())
     return MakeWriteError(val_result.violations);

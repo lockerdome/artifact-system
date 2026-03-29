@@ -9,6 +9,7 @@
 
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
+#include "artifact/proto_utils.h"
 #include "artifact_internal.pb.h"
 #include "artifact_options.pb.h"
 #include "artifact_types.pb.h"
@@ -40,15 +41,6 @@ absl::StatusOr<std::optional<StoredArtifact>> ReadStoredArtifact(uint64_t artifa
     return absl::InternalError(absl::StrCat("failed to parse StoredArtifact at ", path));
   }
   return stored;
-}
-
-// Helper: create a violation.
-ArtifactWriteViolation MakeViolation(ArtifactWriteViolation::Category category, const std::string& subject, const std::string& description) {
-  ArtifactWriteViolation v;
-  v.set_category(category);
-  v.set_subject(subject);
-  v.set_description(description);
-  return v;
 }
 
 // Validate a single reference value (a uint64 artifact_id) against storage.
@@ -149,34 +141,6 @@ std::vector<uint8_t> EncodeStringKey(const std::string& value) {
   out.insert(out.end(), length_bytes.begin(), length_bytes.end());
   out.insert(out.end(), value.begin(), value.end());
   return out;
-}
-
-// Build a DescriptorPool from a FileDescriptorSet and find a message by name.
-const google::protobuf::Descriptor* BuildPoolAndFindMessage(const google::protobuf::FileDescriptorSet& descriptor_set, const std::string& message_full_name,
-                                                            google::protobuf::DescriptorPool* pool) {
-  std::vector<bool> built(descriptor_set.file_size(), false);
-  int built_count = 0;
-  bool made_progress = true;
-  while (built_count < descriptor_set.file_size() && made_progress) {
-    made_progress = false;
-    for (int i = 0; i < descriptor_set.file_size(); ++i) {
-      if (built[static_cast<size_t>(i)])
-        continue;
-      const auto& file = descriptor_set.file(i);
-      if (pool->FindFileByName(file.name()) != nullptr) {
-        built[static_cast<size_t>(i)] = true;
-        ++built_count;
-        made_progress = true;
-        continue;
-      }
-      if (pool->BuildFile(file) != nullptr) {
-        built[static_cast<size_t>(i)] = true;
-        ++built_count;
-        made_progress = true;
-      }
-    }
-  }
-  return pool->FindMessageTypeByName(message_full_name);
 }
 
 // Resolve the referencing type's descriptor for a ReferenceDefinition.

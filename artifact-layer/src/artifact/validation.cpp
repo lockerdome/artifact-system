@@ -14,6 +14,7 @@
 #include "google/protobuf/descriptor.pb.h"
 #include "google/protobuf/dynamic_message.h"
 
+#include "artifact/proto_utils.h"
 #include "artifact_internal.pb.h"
 #include "artifact_service.pb.h"
 #include "artifact_types.pb.h"
@@ -22,45 +23,6 @@
 
 namespace artifact_system::artifact {
 namespace {
-
-// Helper: build a single ArtifactWriteViolation.
-ArtifactWriteViolation MakeViolation(ArtifactWriteViolation::Category category, const std::string& subject, const std::string& description) {
-  ArtifactWriteViolation v;
-  v.set_category(category);
-  v.set_subject(subject);
-  v.set_description(description);
-  return v;
-}
-
-// Build a DescriptorPool from a FileDescriptorSet and find a message by name.
-// Returns nullptr on failure.
-const google::protobuf::Descriptor* BuildPoolAndFindMessage(const google::protobuf::FileDescriptorSet& descriptor_set, const std::string& message_full_name,
-                                                            google::protobuf::DescriptorPool* pool) {
-  std::vector<bool> built(descriptor_set.file_size(), false);
-  int built_count = 0;
-  bool made_progress = true;
-  while (built_count < descriptor_set.file_size() && made_progress) {
-    made_progress = false;
-    for (int i = 0; i < descriptor_set.file_size(); ++i) {
-      if (built[static_cast<size_t>(i)]) {
-        continue;
-      }
-      const auto& file = descriptor_set.file(i);
-      if (pool->FindFileByName(file.name()) != nullptr) {
-        built[static_cast<size_t>(i)] = true;
-        ++built_count;
-        made_progress = true;
-        continue;
-      }
-      if (pool->BuildFile(file) != nullptr) {
-        built[static_cast<size_t>(i)] = true;
-        ++built_count;
-        made_progress = true;
-      }
-    }
-  }
-  return pool->FindMessageTypeByName(message_full_name);
-}
 
 // Read and parse a StoredArtifact from storage at the given artifact_id.
 absl::StatusOr<StoredArtifact> ReadStoredArtifact(uint64_t artifact_id, const ValidationContext& ctx) {
