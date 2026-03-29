@@ -202,6 +202,44 @@ std::optional<ResolvedReferencingType> ResolveReferencingType(const std::string&
   return result;
 }
 
+// Find artifact_ids that actively reference the given artifact_id through a
+// specific ReferenceDefinition's covering index. Returns only IDs not already
+// in scheduled_deletes and not the artifact itself.
+absl::StatusOr<std::vector<uint64_t>> FindActiveReferencingArtifacts(uint64_t artifact_id, const ReferenceDefinition& ref_def, const RefIntegrityContext& ctx,
+                                                                     const std::set<uint64_t>& scheduled_deletes,
+                                                                     const std::unordered_map<std::string, uint64_t>& index_def_ids_by_key_type) {
+  const std::string& covering_key_type = ref_def.covering_index_key_type();
+  const auto covering_idx_it = index_def_ids_by_key_type.find(covering_key_type);
+  if (covering_idx_it == index_def_ids_by_key_type.end()) {
+    return std::vector<uint64_t>{};
+  }
+
+  const uint64_t covering_idx_def_id = covering_idx_it->second;
+  const std::vector<uint8_t> covering_encoded_key = EncodeUint64Key(artifact_id);
+  const IndexDefinition covering_index_def = MakeIndexDefinition(covering_key_type, {ref_def.field_name()}, false);
+
+  auto resolved = ResolveReferencingType(ref_def.referencing_type_name(), ctx, index_def_ids_by_key_type);
+  if (!resolved.has_value()) {
+    return std::vector<uint64_t>{};
+  }
+
+  auto referencing_ids_or = ReadIndexArtifactIds(covering_idx_def_id, covering_encoded_key, covering_index_def, *resolved->descriptor, ctx);
+  if (!referencing_ids_or.ok()) {
+    if (absl::IsNotFound(referencing_ids_or.status()) || absl::IsInvalidArgument(referencing_ids_or.status())) {
+      return std::vector<uint64_t>{};
+    }
+    return referencing_ids_or.status();
+  }
+
+  std::vector<uint64_t> active;
+  for (const uint64_t ref_artifact_id : *referencing_ids_or) {
+    if (scheduled_deletes.count(ref_artifact_id) == 0 && ref_artifact_id != artifact_id) {
+      active.push_back(ref_artifact_id);
+    }
+  }
+  return active;
+}
+
 } // namespace
 
 absl::StatusOr<std::vector<ArtifactWriteViolation>> ValidateReferences(const google::protobuf::Message& message, const google::protobuf::Descriptor& descriptor,
@@ -323,38 +361,12 @@ absl::StatusOr<DeleteEnforcementResult> EnforceDeleteIntegrity(uint64_t artifact
       continue;
     }
 
-    // Step 3: Look up the covering index to find referencing artifacts.
-    const std::string& covering_key_type = ref_def.covering_index_key_type();
-    const auto covering_idx_it = index_def_ids_by_key_type.find(covering_key_type);
-    if (covering_idx_it == index_def_ids_by_key_type.end()) {
-      continue;
+    // Step 3: Find artifacts that actively reference this one via the covering index.
+    auto active_or = FindActiveReferencingArtifacts(artifact_id, ref_def, ctx, scheduled_deletes, index_def_ids_by_key_type);
+    if (!active_or.ok()) {
+      return active_or.status();
     }
-    const uint64_t covering_idx_def_id = covering_idx_it->second;
-    const std::vector<uint8_t> covering_encoded_key = EncodeUint64Key(artifact_id);
-    const IndexDefinition covering_index_def = MakeIndexDefinition(covering_key_type, {ref_def.field_name()}, false);
-
-    // Resolve the referencing type's descriptor via type_name_unique index
-    // so GenerateIndexSchema can determine field types for deserialization.
-    auto resolved = ResolveReferencingType(ref_def.referencing_type_name(), ctx, index_def_ids_by_key_type);
-    if (!resolved.has_value()) {
-      continue; // can't resolve — skip this reference (best effort)
-    }
-
-    auto referencing_ids_or = ReadIndexArtifactIds(covering_idx_def_id, covering_encoded_key, covering_index_def, *resolved->descriptor, ctx);
-    if (!referencing_ids_or.ok()) {
-      if (absl::IsNotFound(referencing_ids_or.status()) || absl::IsInvalidArgument(referencing_ids_or.status())) {
-        continue;
-      }
-      return referencing_ids_or.status();
-    }
-
-    // Filter out artifacts already scheduled for deletion.
-    std::vector<uint64_t> active_referencing;
-    for (const uint64_t ref_artifact_id : *referencing_ids_or) {
-      if (scheduled_deletes.count(ref_artifact_id) == 0 && ref_artifact_id != artifact_id) {
-        active_referencing.push_back(ref_artifact_id);
-      }
-    }
+    const std::vector<uint64_t>& active_referencing = *active_or;
 
     if (active_referencing.empty()) {
       continue;

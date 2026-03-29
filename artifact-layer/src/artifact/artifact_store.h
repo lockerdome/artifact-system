@@ -10,6 +10,7 @@
 #include "absl/status/statusor.h"
 #include "google/protobuf/descriptor.pb.h"
 
+#include "artifact/referential_integrity.h"
 #include "artifact_internal.pb.h"
 #include "artifact_service.pb.h"
 #include "id/id_allocator_interface.h"
@@ -106,6 +107,10 @@ private:
 
   // Stage tombstone + index removal for a delete operation.
   absl::Status StageDelete(const std::string& branch, uint64_t artifact_id, const StoredArtifact& existing);
+
+  // Apply delete side effects within a write transaction.
+  absl::Status ApplyCascadeEffect(const std::string& branch, const CascadeDelete& cascade);
+  absl::Status ApplySetNullEffect(const std::string& branch, const SetNullUpdate& set_null);
 
   StorageInterface* storage_;
   transaction::TransactionManager* transaction_manager_;

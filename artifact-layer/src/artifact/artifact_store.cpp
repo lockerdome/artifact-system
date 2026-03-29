@@ -509,6 +509,70 @@ absl::Status ArtifactStore::StageDelete(const std::string& branch, uint64_t arti
   return absl::OkStatus();
 }
 
+// ── Delete side effects ────────────────────────────────────────────────────
+
+absl::Status ArtifactStore::ApplyCascadeEffect(const std::string& branch, const CascadeDelete& cascade) {
+  auto existing_or = ReadStoredArtifact(storage_, branch, cascade.artifact_id);
+  if (!existing_or.ok() || existing_or->payload().empty()) {
+    return absl::OkStatus();
+  }
+  return StageDelete(branch, cascade.artifact_id, *existing_or);
+}
+
+absl::Status ArtifactStore::ApplySetNullEffect(const std::string& branch, const SetNullUpdate& set_null) {
+  // Read the referencing artifact.
+  auto ref_art_or = ReadStoredArtifact(storage_, branch, set_null.referencing_artifact_id);
+  if (!ref_art_or.ok() || ref_art_or->payload().empty())
+    return absl::OkStatus();
+
+  // Read the TVD to get the descriptor set.
+  auto tvd_or = ReadStoredArtifact(storage_, branch, ref_art_or->version_id());
+  if (!tvd_or.ok())
+    return absl::OkStatus();
+  TypeVersionDefinition tvd;
+  if (!tvd.ParseFromString(tvd_or->payload()))
+    return absl::OkStatus();
+
+  // Build descriptor and parse the payload.
+  google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
+  const auto* desc = BuildPoolAndFindMessage(tvd.descriptor_set(), ref_art_or->type_name(), &pool);
+  if (desc == nullptr)
+    return absl::OkStatus();
+
+  google::protobuf::DynamicMessageFactory factory;
+  const auto* proto = factory.GetPrototype(desc);
+  std::unique_ptr<google::protobuf::Message> msg(proto->New());
+  if (!msg->ParseFromString(ref_art_or->payload()))
+    return absl::OkStatus();
+
+  // Find and clear the reference field.
+  const auto* field = desc->FindFieldByName(set_null.field_name);
+  if (field == nullptr)
+    return absl::OkStatus();
+
+  const auto* reflection = msg->GetReflection();
+  if (field->is_repeated()) {
+    const int count = reflection->FieldSize(*msg, field);
+    std::unique_ptr<google::protobuf::Message> new_msg(proto->New());
+    new_msg->CopyFrom(*msg);
+    const auto* new_reflection = new_msg->GetReflection();
+    new_reflection->ClearField(new_msg.get(), field);
+    for (int j = 0; j < count; ++j) {
+      const uint64_t val = reflection->GetRepeatedUInt64(*msg, field, j);
+      if (val != set_null.removed_reference_id) {
+        new_reflection->AddUInt64(new_msg.get(), field, val);
+      }
+    }
+    msg = std::move(new_msg);
+  } else {
+    reflection->ClearField(msg.get(), field);
+  }
+
+  // Write back the modified artifact.
+  const std::string new_payload = msg->SerializeAsString();
+  return StageUpdate(branch, set_null.referencing_artifact_id, ref_art_or->version_id(), ref_art_or->type_name(), new_payload, tvd.descriptor_set());
+}
+
 // ── CRUD operations ─────────────────────────────────────────────────────────
 
 absl::StatusOr<CreateResult> ArtifactStore::CreateArtifact(uint64_t version_id, const std::string& payload, std::optional<uint64_t> transaction_id) {
@@ -648,81 +712,18 @@ absl::StatusOr<WriteResult> ArtifactStore::DeleteArtifact(uint64_t artifact_id, 
   auto side_effects = std::move(enforce_or->side_effects);
 
   auto snapshot_or = ExecuteWrite(transaction_id, [&](const std::string& branch) -> absl::Status {
-    // Stage the primary delete.
     auto status = StageDelete(branch, artifact_id, existing);
     if (!status.ok())
       return status;
 
-    // Process side effects (CASCADE deletes, SET_NULL updates).
     for (const auto& effect : side_effects) {
       if (std::holds_alternative<CascadeDelete>(effect)) {
-        const auto& cascade = std::get<CascadeDelete>(effect);
-        auto cascade_existing_or = ReadStoredArtifact(storage_, branch, cascade.artifact_id);
-        if (cascade_existing_or.ok() && !cascade_existing_or->payload().empty()) {
-          status = StageDelete(branch, cascade.artifact_id, *cascade_existing_or);
-          if (!status.ok())
-            return status;
-        }
+        status = ApplyCascadeEffect(branch, std::get<CascadeDelete>(effect));
       } else if (std::holds_alternative<SetNullUpdate>(effect)) {
-        const auto& set_null = std::get<SetNullUpdate>(effect);
-        // Read the referencing artifact, clear the reference field,
-        // and write it back.
-        auto ref_art_or = ReadStoredArtifact(storage_, branch, set_null.referencing_artifact_id);
-        if (!ref_art_or.ok() || ref_art_or->payload().empty())
-          continue;
-
-        // Read the TVD to get the descriptor set.
-        auto tvd_or = ReadStoredArtifact(storage_, branch, ref_art_or->version_id());
-        if (!tvd_or.ok())
-          continue;
-        TypeVersionDefinition tvd;
-        if (!tvd.ParseFromString(tvd_or->payload()))
-          continue;
-
-        // Parse and modify the referencing artifact's payload.
-        google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
-        const auto* desc = BuildPoolAndFindMessage(tvd.descriptor_set(), ref_art_or->type_name(), &pool);
-        if (desc == nullptr)
-          continue;
-
-        google::protobuf::DynamicMessageFactory factory;
-        const auto* proto = factory.GetPrototype(desc);
-        std::unique_ptr<google::protobuf::Message> msg(proto->New());
-        if (!msg->ParseFromString(ref_art_or->payload()))
-          continue;
-
-        // Find and clear the reference field.
-        const auto* field = desc->FindFieldByName(set_null.field_name);
-        if (field == nullptr)
-          continue;
-
-        const auto* reflection = msg->GetReflection();
-        if (field->is_repeated()) {
-          // Remove the specific value from the repeated field.
-          const int count = reflection->FieldSize(*msg, field);
-          std::unique_ptr<google::protobuf::Message> new_msg(proto->New());
-          new_msg->CopyFrom(*msg);
-          const auto* new_reflection = new_msg->GetReflection();
-          // Clear and re-add all except the removed reference.
-          new_reflection->ClearField(new_msg.get(), field);
-          for (int j = 0; j < count; ++j) {
-            const uint64_t val = reflection->GetRepeatedUInt64(*msg, field, j);
-            if (val != set_null.removed_reference_id) {
-              new_reflection->AddUInt64(new_msg.get(), field, val);
-            }
-          }
-          msg = std::move(new_msg);
-        } else {
-          // Clear the optional field.
-          reflection->ClearField(msg.get(), field);
-        }
-
-        // Write back the modified artifact.
-        const std::string new_payload = msg->SerializeAsString();
-        status = StageUpdate(branch, set_null.referencing_artifact_id, ref_art_or->version_id(), ref_art_or->type_name(), new_payload, tvd.descriptor_set());
-        if (!status.ok())
-          return status;
+        status = ApplySetNullEffect(branch, std::get<SetNullUpdate>(effect));
       }
+      if (!status.ok())
+        return status;
     }
     return absl::OkStatus();
   });
