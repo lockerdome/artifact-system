@@ -11,26 +11,39 @@ jobs:
     env:
       CC: gcc-14
       CXX: g++-14
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 2G
+      CCACHE_COMPRESS: 'true'
     defaults:
       run:
         working-directory: artifact-system/artifact-layer
     steps:
       - uses: actions/checkout@v6
+
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build build-essential pkg-config curl libssl-dev libcurl4-openssl-dev gcc-14 g++-14
-      - name: Cache build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build build-essential pkg-config curl libssl-dev libcurl4-openssl-dev gcc-14 g++-14 ccache
+
+      - name: Restore ccache
         uses: actions/cache@v4
         with:
-          path: artifact-system/artifact-layer/build/release/_deps
-          key: ${{ runner.os }}-artifact-layer-${{ hashFiles('artifact-system/artifact-layer/CMakeLists.txt', 'artifact-system/artifact-layer/cmake/dependencies.cmake', 'artifact-system/artifact-layer/CMakePresets.json') }}
+          path: ${{ github.workspace }}/.ccache
+          key: ${{ runner.os }}-ccache-${{ github.ref }}-${{ github.sha }}
           restore-keys: |
-            ${{ runner.os }}-artifact-layer-
+            ${{ runner.os }}-ccache-${{ github.ref }}-
+            ${{ runner.os }}-ccache-
+
       - name: Configure
-        run: cmake --preset release
+        run: cmake --preset release -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
       - name: Build
         run: cmake --build --preset release
+
+      - name: ccache stats
+        run: ccache -s
+
       - name: Test (non-LakeFS)
         run: ctest --preset release -E '^LakeFS/'
+
       - name: Load LakeFS defaults
         run: |
           set -a
