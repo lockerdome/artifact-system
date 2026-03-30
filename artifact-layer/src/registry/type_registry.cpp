@@ -43,13 +43,6 @@ template <typename T> absl::StatusOr<T> ParseArtifactPayload(StorageInterface* s
   return result;
 }
 
-// Build a DescriptorPool from a FileDescriptorSet and find a message.
-// Falls back to generated_pool() for well-known types.
-const google::protobuf::Descriptor* FindMessageInDescriptorSet(const google::protobuf::FileDescriptorSet& fds, const std::string& message_name,
-                                                               google::protobuf::DescriptorPool* pool) {
-  return artifact::BuildPoolAndFindMessage(fds, message_name, pool);
-}
-
 // Extract IndexDefinitions from a message descriptor's custom options.
 std::vector<IndexDefinition> ExtractIndexDefinitions(const google::protobuf::Descriptor& descriptor) {
   std::vector<IndexDefinition> result;
@@ -268,24 +261,85 @@ std::string FindCoveringIndexKeyType(const std::string& field_name, const std::v
   return "";
 }
 
+// Check for items in `old_items` that are missing from `new_items`.
+// `get_key` extracts the comparison key from each item.
+// `make_violation` builds the violation for each missing item.
+template <typename T, typename KeyFn, typename ViolationFn>
+void CheckForRemovals(const std::vector<T>& old_items, const std::vector<T>& new_items, KeyFn get_key, ViolationFn make_violation,
+                      std::vector<TypeRegistrationViolation>& violations) {
+  for (const auto& old_item : old_items) {
+    const auto old_key = get_key(old_item);
+    bool found = false;
+    for (const auto& new_item : new_items) {
+      if (get_key(new_item) == old_key) {
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      violations.push_back(make_violation(old_item));
+    }
+  }
+}
+
+// Encode a single-field key for an index lookup using DynamicMessage.
+absl::StatusOr<std::vector<uint8_t>> EncodeStringIndexKey(const google::protobuf::Descriptor& descriptor, const std::string& field_name,
+                                                          const std::string& value) {
+  google::protobuf::DynamicMessageFactory factory;
+  const auto* prototype = factory.GetPrototype(&descriptor);
+  std::unique_ptr<google::protobuf::Message> key_msg(prototype->New());
+  key_msg->GetReflection()->SetString(key_msg.get(), descriptor.FindFieldByName(field_name), value);
+  std::vector<std::string> key_fields = {field_name};
+  return encoding::EncodeKey(descriptor, *key_msg, key_fields);
+}
+
+absl::StatusOr<std::vector<uint8_t>> EncodeUint64IndexKey(const google::protobuf::Descriptor& descriptor, const std::string& field_name, uint64_t value) {
+  google::protobuf::DynamicMessageFactory factory;
+  const auto* prototype = factory.GetPrototype(&descriptor);
+  std::unique_ptr<google::protobuf::Message> key_msg(prototype->New());
+  key_msg->GetReflection()->SetUInt64(key_msg.get(), descriptor.FindFieldByName(field_name), value);
+  std::vector<std::string> key_fields = {field_name};
+  return encoding::EncodeKey(descriptor, *key_msg, key_fields);
+}
+
+// Populate an IndexSchemaInfo from an IndexDefinition and generated schema.
+IndexSchemaInfo BuildIndexSchemaInfo(uint64_t idx_id, const IndexDefinition& idx_def, const index::GeneratedIndexSchema& schema) {
+  IndexSchemaInfo info;
+  info.index_definition_id = idx_id;
+  info.key_type = idx_def.key_type();
+  for (const auto& k : idx_def.key())
+    info.key_fields.push_back(k);
+  for (const auto& o : idx_def.order())
+    info.order_fields.push_back(o);
+  info.unique = idx_def.unique();
+
+  google::protobuf::FileDescriptorSet gen_fds;
+  schema.file_descriptor->CopyTo(gen_fds.add_file());
+  info.index_descriptor_set = gen_fds;
+
+  info.key_message_name = schema.key_descriptor->full_name();
+  info.value_message_name = schema.value_descriptor->full_name();
+  info.index_message_name = schema.index_descriptor->full_name();
+  return info;
+}
+
 } // namespace
 
 TypeRegistry::TypeRegistry(StorageInterface* storage, transaction::TransactionManager* transaction_manager, IdAllocatorInterface* id_allocator,
                            const std::unordered_map<std::string, uint64_t>& index_def_ids_by_key_type)
     : storage_(storage), transaction_manager_(transaction_manager), id_allocator_(id_allocator), index_def_ids_by_key_type_(index_def_ids_by_key_type),
       bypass_token_() {
-  artifact::ArtifactStore::Options opts;
-  opts.index_def_ids_by_key_type = index_def_ids_by_key_type;
-  opts.bypass_mutation_check = true;
-  opts.bypass_referential_integrity = true;
-  bypass_store_ = std::make_unique<artifact::ArtifactStore>(storage, transaction_manager, id_allocator, opts);
+  RebuildBypassStore();
 }
 
 void TypeRegistry::UpdateIndexDefIds(const std::unordered_map<std::string, uint64_t>& new_ids) {
   for (const auto& [key, id] : new_ids) {
     index_def_ids_by_key_type_[key] = id;
   }
-  // Rebuild bypass store with updated index map.
+  RebuildBypassStore();
+}
+
+void TypeRegistry::RebuildBypassStore() {
   artifact::ArtifactStore::Options opts;
   opts.index_def_ids_by_key_type = index_def_ids_by_key_type_;
   opts.bypass_mutation_check = true;
@@ -321,16 +375,8 @@ absl::StatusOr<std::optional<std::pair<uint64_t, TypeDefinition>>> TypeRegistry:
   if (it == index_def_ids_by_key_type_.end())
     return absl::InternalError("type_name_unique index not registered");
 
-  // Build the key by encoding the type_name.
   const auto* td_descriptor = TypeDefinition::descriptor();
-  google::protobuf::DynamicMessageFactory factory;
-  const auto* prototype = factory.GetPrototype(td_descriptor);
-  std::unique_ptr<google::protobuf::Message> key_msg(prototype->New());
-  const auto* reflection = key_msg->GetReflection();
-  reflection->SetString(key_msg.get(), td_descriptor->FindFieldByName("type_name"), type_name);
-
-  std::vector<std::string> key_fields = {"type_name"};
-  auto encoded_or = encoding::EncodeKey(*td_descriptor, *key_msg, key_fields);
+  auto encoded_or = EncodeStringIndexKey(*td_descriptor, "type_name", type_name);
   if (!encoded_or.ok())
     return encoded_or.status();
 
@@ -344,35 +390,14 @@ absl::StatusOr<std::optional<std::pair<uint64_t, TypeDefinition>>> TypeRegistry:
   if (ids_or->empty())
     return std::nullopt;
 
-  uint64_t artifact_id = ids_or->front();
-  auto td_or = ParseArtifactPayload<TypeDefinition>(storage_, ref, artifact_id);
+  auto td_or = ParseArtifactPayload<TypeDefinition>(storage_, ref, ids_or->front());
   if (!td_or.ok())
     return td_or.status();
-  return std::make_pair(artifact_id, std::move(*td_or));
+  return std::make_pair(ids_or->front(), std::move(*td_or));
 }
 
 absl::StatusOr<std::optional<std::pair<uint64_t, TypeVersionDefinition>>> TypeRegistry::FindTailVersion(const std::string& ref, uint64_t type_def_id) {
-  auto it = index_def_ids_by_key_type_.find("type_versions_by_type");
-  if (it == index_def_ids_by_key_type_.end())
-    return absl::InternalError("type_versions_by_type index not registered");
-
-  // Encode the key (type_id = type_def_id).
-  const auto* tvd_descriptor = TypeVersionDefinition::descriptor();
-  google::protobuf::DynamicMessageFactory factory;
-  const auto* prototype = factory.GetPrototype(tvd_descriptor);
-  std::unique_ptr<google::protobuf::Message> key_msg(prototype->New());
-  const auto* reflection = key_msg->GetReflection();
-  reflection->SetUInt64(key_msg.get(), tvd_descriptor->FindFieldByName("type_id"), type_def_id);
-
-  std::vector<std::string> key_fields = {"type_id"};
-  auto encoded_or = encoding::EncodeKey(*tvd_descriptor, *key_msg, key_fields);
-  if (!encoded_or.ok())
-    return encoded_or.status();
-
-  // Get the index definition for type_versions_by_type.
-  const IndexDefinition& idx_def = tvd_descriptor->options().GetExtension(artifact_system::indexes, 0); // type_versions_by_type is the only one
-
-  auto ids_or = ReadIndexArtifactIds(ref, it->second, *encoded_or, idx_def, *tvd_descriptor);
+  auto ids_or = ReadVersionIdsByType(ref, type_def_id);
   if (!ids_or.ok()) {
     if (absl::IsNotFound(ids_or.status()))
       return std::nullopt;
@@ -394,26 +419,23 @@ absl::StatusOr<std::optional<std::pair<uint64_t, TypeVersionDefinition>>> TypeRe
   return std::nullopt;
 }
 
-absl::StatusOr<std::optional<std::pair<uint64_t, IndexDefinition>>> TypeRegistry::LookupIndexDefinition(const std::string& ref, const std::string& key_type) {
-  auto it = index_def_ids_by_key_type_.find("index_key_type_unique");
+// Generic helper: look up an artifact by string key_type on the first index extension.
+// Returns nullopt if not found. T must be a protobuf message type with a "key_type" field
+// and the first index extension being the unique lookup index.
+template <typename T>
+absl::StatusOr<std::optional<std::pair<uint64_t, T>>> TypeRegistry::LookupByKeyType(const std::string& ref, const std::string& index_name,
+                                                                                    const std::string& key_type) {
+  auto it = index_def_ids_by_key_type_.find(index_name);
   if (it == index_def_ids_by_key_type_.end())
-    return absl::InternalError("index_key_type_unique index not registered");
+    return absl::InternalError(absl::StrCat(index_name, " index not registered"));
 
-  const auto* idx_descriptor = IndexDefinition::descriptor();
-  google::protobuf::DynamicMessageFactory factory;
-  const auto* prototype = factory.GetPrototype(idx_descriptor);
-  std::unique_ptr<google::protobuf::Message> key_msg(prototype->New());
-  const auto* reflection = key_msg->GetReflection();
-  reflection->SetString(key_msg.get(), idx_descriptor->FindFieldByName("key_type"), key_type);
-
-  std::vector<std::string> key_fields = {"key_type"};
-  auto encoded_or = encoding::EncodeKey(*idx_descriptor, *key_msg, key_fields);
+  const auto* descriptor = T::descriptor();
+  auto encoded_or = EncodeStringIndexKey(*descriptor, "key_type", key_type);
   if (!encoded_or.ok())
     return encoded_or.status();
 
-  const IndexDefinition& meta_idx_def = idx_descriptor->options().GetExtension(artifact_system::indexes, 0); // index_key_type_unique is first
-
-  auto ids_or = ReadIndexArtifactIds(ref, it->second, *encoded_or, meta_idx_def, *idx_descriptor);
+  const IndexDefinition& idx_def = descriptor->options().GetExtension(artifact_system::indexes, 0);
+  auto ids_or = ReadIndexArtifactIds(ref, it->second, *encoded_or, idx_def, *descriptor);
   if (!ids_or.ok()) {
     if (absl::IsNotFound(ids_or.status()))
       return std::nullopt;
@@ -422,47 +444,33 @@ absl::StatusOr<std::optional<std::pair<uint64_t, IndexDefinition>>> TypeRegistry
   if (ids_or->empty())
     return std::nullopt;
 
-  uint64_t artifact_id = ids_or->front();
-  auto def_or = ParseArtifactPayload<IndexDefinition>(storage_, ref, artifact_id);
-  if (!def_or.ok())
-    return def_or.status();
-  return std::make_pair(artifact_id, std::move(*def_or));
+  auto payload_or = ParseArtifactPayload<T>(storage_, ref, ids_or->front());
+  if (!payload_or.ok())
+    return payload_or.status();
+  return std::make_pair(ids_or->front(), std::move(*payload_or));
+}
+
+absl::StatusOr<std::optional<std::pair<uint64_t, IndexDefinition>>> TypeRegistry::LookupIndexDefinition(const std::string& ref, const std::string& key_type) {
+  return LookupByKeyType<IndexDefinition>(ref, "index_key_type_unique", key_type);
 }
 
 absl::StatusOr<std::optional<std::pair<uint64_t, ReferenceDefinition>>> TypeRegistry::LookupReferenceDefinition(const std::string& ref,
                                                                                                                 const std::string& key_type) {
-  auto it = index_def_ids_by_key_type_.find("reference_key_type_unique");
+  return LookupByKeyType<ReferenceDefinition>(ref, "reference_key_type_unique", key_type);
+}
+
+absl::StatusOr<std::vector<uint64_t>> TypeRegistry::ReadVersionIdsByType(const std::string& ref, uint64_t type_def_id) {
+  auto it = index_def_ids_by_key_type_.find("type_versions_by_type");
   if (it == index_def_ids_by_key_type_.end())
-    return absl::InternalError("reference_key_type_unique index not registered");
+    return absl::InternalError("type_versions_by_type index not registered");
 
-  const auto* rd_descriptor = ReferenceDefinition::descriptor();
-  google::protobuf::DynamicMessageFactory factory;
-  const auto* prototype = factory.GetPrototype(rd_descriptor);
-  std::unique_ptr<google::protobuf::Message> key_msg(prototype->New());
-  const auto* reflection = key_msg->GetReflection();
-  reflection->SetString(key_msg.get(), rd_descriptor->FindFieldByName("key_type"), key_type);
-
-  std::vector<std::string> key_fields = {"key_type"};
-  auto encoded_or = encoding::EncodeKey(*rd_descriptor, *key_msg, key_fields);
+  const auto* tvd_descriptor = TypeVersionDefinition::descriptor();
+  auto encoded_or = EncodeUint64IndexKey(*tvd_descriptor, "type_id", type_def_id);
   if (!encoded_or.ok())
     return encoded_or.status();
 
-  const IndexDefinition& meta_idx_def = rd_descriptor->options().GetExtension(artifact_system::indexes, 0); // reference_key_type_unique is first
-
-  auto ids_or = ReadIndexArtifactIds(ref, it->second, *encoded_or, meta_idx_def, *rd_descriptor);
-  if (!ids_or.ok()) {
-    if (absl::IsNotFound(ids_or.status()))
-      return std::nullopt;
-    return ids_or.status();
-  }
-  if (ids_or->empty())
-    return std::nullopt;
-
-  uint64_t artifact_id = ids_or->front();
-  auto rd_or = ParseArtifactPayload<ReferenceDefinition>(storage_, ref, artifact_id);
-  if (!rd_or.ok())
-    return rd_or.status();
-  return std::make_pair(artifact_id, std::move(*rd_or));
+  const IndexDefinition& idx_def = tvd_descriptor->options().GetExtension(artifact_system::indexes, 0);
+  return ReadIndexArtifactIds(ref, it->second, *encoded_or, idx_def, *tvd_descriptor);
 }
 
 absl::StatusOr<std::vector<uint64_t>> TypeRegistry::ReadIndexArtifactIds(const std::string& ref, uint64_t index_def_id, const std::vector<uint8_t>& encoded_key,
@@ -504,7 +512,7 @@ absl::StatusOr<RegisterResult> TypeRegistry::RegisterTypeVersion(const std::stri
 
   // Build a pool to find the message descriptor in the compiled result.
   google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
-  const auto* new_descriptor = FindMessageInDescriptorSet(new_descriptor_set, type_name, &pool);
+  const auto* new_descriptor = artifact::BuildPoolAndFindMessage(new_descriptor_set, type_name, &pool);
   if (new_descriptor == nullptr) {
     return MakeRegistrationError({MakeViolation(TypeRegistrationViolation::PROTO_COMPILATION_FAILURE, absl::StrCat("type: ", type_name),
                                                 absl::StrCat("message '", type_name, "' not found in compiled descriptor set"))});
@@ -608,43 +616,27 @@ absl::StatusOr<RegisterResult> TypeRegistry::RegisterTypeVersion(const std::stri
     }
   }
 
-  // Check for removed indexes (INDEX_INCOMPATIBILITY).
+  // Check for removed indexes and references against the previous version.
   if (tail_tvd.has_value()) {
     google::protobuf::DescriptorPool old_pool(google::protobuf::DescriptorPool::generated_pool());
-    const auto* old_descriptor = FindMessageInDescriptorSet(tail_tvd->descriptor_set(), type_name, &old_pool);
+    const auto* old_descriptor = artifact::BuildPoolAndFindMessage(tail_tvd->descriptor_set(), type_name, &old_pool);
     if (old_descriptor != nullptr) {
-      auto old_index_defs = ExtractIndexDefinitions(*old_descriptor);
-      for (const auto& old_idx : old_index_defs) {
-        bool found = false;
-        for (const auto& new_idx : new_index_defs) {
-          if (new_idx.key_type() == old_idx.key_type()) {
-            found = true;
-            break;
-          }
-        }
-        if (!found) {
-          violations.push_back(MakeViolation(TypeRegistrationViolation::INDEX_INCOMPATIBILITY, absl::StrCat("index: ", old_idx.key_type()),
-                                             absl::StrCat("existing index definition '", old_idx.key_type(), "' was removed")));
-        }
-      }
+      CheckForRemovals(
+          ExtractIndexDefinitions(*old_descriptor), new_index_defs, [](const IndexDefinition& idx) { return idx.key_type(); },
+          [](const IndexDefinition& idx) {
+            return MakeViolation(TypeRegistrationViolation::INDEX_INCOMPATIBILITY, absl::StrCat("index: ", idx.key_type()),
+                                 absl::StrCat("existing index definition '", idx.key_type(), "' was removed"));
+          },
+          violations);
 
-      // Check for removed references (REFERENCE_INCOMPATIBILITY).
-      auto old_refs = ExtractReferenceDeclarations(*old_descriptor);
-      for (const auto& old_ref : old_refs) {
-        const std::string old_ref_key = absl::StrCat(type_name, ".", old_ref.field_name);
-        bool found = false;
-        for (const auto& new_ref : new_refs) {
-          const std::string new_ref_key = absl::StrCat(type_name, ".", new_ref.field_name);
-          if (new_ref_key == old_ref_key) {
-            found = true;
-            break;
-          }
-        }
-        if (!found) {
-          violations.push_back(MakeViolation(TypeRegistrationViolation::REFERENCE_INCOMPATIBILITY, absl::StrCat("reference: ", old_ref_key),
-                                             absl::StrCat("existing reference declaration '", old_ref_key, "' was removed")));
-        }
-      }
+      CheckForRemovals(
+          ExtractReferenceDeclarations(*old_descriptor), new_refs, [&](const ExtractedReference& r) { return absl::StrCat(type_name, ".", r.field_name); },
+          [&](const ExtractedReference& r) {
+            const std::string key = absl::StrCat(type_name, ".", r.field_name);
+            return MakeViolation(TypeRegistrationViolation::REFERENCE_INCOMPATIBILITY, absl::StrCat("reference: ", key),
+                                 absl::StrCat("existing reference declaration '", key, "' was removed"));
+          },
+          violations);
     }
   }
 
@@ -663,36 +655,48 @@ absl::StatusOr<RegisterResult> TypeRegistry::RegisterTypeVersion(const std::stri
     return txn_or.status();
   const std::string& txn_id = *txn_or;
 
-  // Get the TVD version_id for TypeVersionDefinition (so bypass_store_ can resolve it).
-  // We need to find the version_id for the TypeVersionDefinition type itself.
-  auto tvd_type_or = LookupTypeDefinition(ref, "artifact_system.TypeVersionDefinition");
-  if (!tvd_type_or.ok())
-    return tvd_type_or.status();
-  if (!tvd_type_or->has_value())
-    return absl::InternalError("TypeVersionDefinition type not found in registry");
-  uint64_t tvd_version_id = (*tvd_type_or)->second.current_version_id();
+  // Scope guard: rollback on any early return (disarmed on successful commit).
+  bool committed = false;
+  auto rollback_guard = [&] {
+    if (!committed)
+      (void)transaction_manager_->RollbackTransaction(txn_id);
+  };
+  struct ScopeGuard {
+    std::function<void()> fn;
+    ~ScopeGuard() {
+      fn();
+    }
+  } guard{rollback_guard};
 
-  // Find version_ids for other built-in types we'll be creating.
-  auto td_type_or = LookupTypeDefinition(ref, "artifact_system.TypeDefinition");
-  if (!td_type_or.ok())
-    return td_type_or.status();
-  if (!td_type_or->has_value())
-    return absl::InternalError("TypeDefinition type not found in registry");
-  uint64_t td_version_id = (*td_type_or)->second.current_version_id();
+  // Look up the current version_id for each built-in meta-type.
+  auto resolve_builtin_version = [&](const std::string& builtin_type_name) -> absl::StatusOr<uint64_t> {
+    auto type_or = LookupTypeDefinition(ref, builtin_type_name);
+    if (!type_or.ok())
+      return type_or.status();
+    if (!type_or->has_value())
+      return absl::InternalError(absl::StrCat(builtin_type_name, " type not found in registry"));
+    return (*type_or)->second.current_version_id();
+  };
 
-  auto idx_type_or = LookupTypeDefinition(ref, "artifact_system.IndexDefinition");
-  if (!idx_type_or.ok())
-    return idx_type_or.status();
-  if (!idx_type_or->has_value())
-    return absl::InternalError("IndexDefinition type not found in registry");
-  uint64_t idx_version_id = (*idx_type_or)->second.current_version_id();
+  auto tvd_ver_or = resolve_builtin_version("artifact_system.TypeVersionDefinition");
+  if (!tvd_ver_or.ok())
+    return tvd_ver_or.status();
+  uint64_t tvd_version_id = *tvd_ver_or;
 
-  auto ref_type_or = LookupTypeDefinition(ref, "artifact_system.ReferenceDefinition");
-  if (!ref_type_or.ok())
-    return ref_type_or.status();
-  if (!ref_type_or->has_value())
-    return absl::InternalError("ReferenceDefinition type not found in registry");
-  uint64_t refdef_version_id = (*ref_type_or)->second.current_version_id();
+  auto td_ver_or = resolve_builtin_version("artifact_system.TypeDefinition");
+  if (!td_ver_or.ok())
+    return td_ver_or.status();
+  uint64_t td_version_id = *td_ver_or;
+
+  auto idx_ver_or = resolve_builtin_version("artifact_system.IndexDefinition");
+  if (!idx_ver_or.ok())
+    return idx_ver_or.status();
+  uint64_t idx_version_id = *idx_ver_or;
+
+  auto ref_ver_or = resolve_builtin_version("artifact_system.ReferenceDefinition");
+  if (!ref_ver_or.ok())
+    return ref_ver_or.status();
+  uint64_t refdef_version_id = *ref_ver_or;
 
   // Step 3 (creation): Create IndexDefinition artifacts for new indexes.
   std::unordered_map<std::string, uint64_t> new_index_ids;
@@ -710,7 +714,6 @@ absl::StatusOr<RegisterResult> TypeRegistry::RegisterTypeVersion(const std::stri
     // Create new IndexDefinition artifact.
     auto create_or = bypass_store_->CreateArtifact(idx_version_id, idx_def.SerializeAsString(), txn_id);
     if (!create_or.ok()) {
-      (void)transaction_manager_->RollbackTransaction(txn_id);
       return create_or.status();
     }
     new_index_ids[idx_def.key_type()] = create_or->artifact_id;
@@ -736,7 +739,6 @@ absl::StatusOr<RegisterResult> TypeRegistry::RegisterTypeVersion(const std::stri
 
     auto create_or = bypass_store_->CreateArtifact(refdef_version_id, rd.SerializeAsString(), txn_id);
     if (!create_or.ok()) {
-      (void)transaction_manager_->RollbackTransaction(txn_id);
       return create_or.status();
     }
   }
@@ -760,7 +762,6 @@ absl::StatusOr<RegisterResult> TypeRegistry::RegisterTypeVersion(const std::stri
 
     auto create_or = bypass_store_->CreateArtifact(td_version_id, new_td.SerializeAsString(), txn_id);
     if (!create_or.ok()) {
-      (void)transaction_manager_->RollbackTransaction(txn_id);
       return create_or.status();
     }
     type_def_id = create_or->artifact_id;
@@ -778,10 +779,8 @@ absl::StatusOr<RegisterResult> TypeRegistry::RegisterTypeVersion(const std::stri
   }
 
   auto tvd_create_or = bypass_store_->CreateArtifact(tvd_version_id, new_tvd.SerializeAsString(), txn_id);
-  if (!tvd_create_or.ok()) {
-    (void)transaction_manager_->RollbackTransaction(txn_id);
+  if (!tvd_create_or.ok())
     return tvd_create_or.status();
-  }
   const uint64_t new_tvd_artifact_id = tvd_create_or->artifact_id;
 
   // Step 5 continued: Update tail version's next_version_id.
@@ -790,10 +789,8 @@ absl::StatusOr<RegisterResult> TypeRegistry::RegisterTypeVersion(const std::stri
     updated_tail.set_next_version_id(new_tvd_artifact_id);
 
     auto update_or = bypass_store_->UpdateArtifact(*tail_version_id, tvd_version_id, updated_tail.SerializeAsString(), txn_id);
-    if (!update_or.ok()) {
-      (void)transaction_manager_->RollbackTransaction(txn_id);
+    if (!update_or.ok())
       return update_or.status();
-    }
   }
 
   // Step 6: Update TypeDefinition with current_version_id.
@@ -802,12 +799,9 @@ absl::StatusOr<RegisterResult> TypeRegistry::RegisterTypeVersion(const std::stri
     if (existing_td.has_value()) {
       updated_td = *existing_td;
     } else {
-      // Read back the TD we just created (to get its current state).
       auto td_read_or = ParseArtifactPayload<TypeDefinition>(storage_, txn_id, type_def_id);
-      if (!td_read_or.ok()) {
-        (void)transaction_manager_->RollbackTransaction(txn_id);
+      if (!td_read_or.ok())
         return td_read_or.status();
-      }
       updated_td = *td_read_or;
     }
     updated_td.set_current_version_id(new_tvd_artifact_id);
@@ -819,18 +813,16 @@ absl::StatusOr<RegisterResult> TypeRegistry::RegisterTypeVersion(const std::stri
       updated_td.set_deny_delete(*deny_delete);
 
     auto update_or = bypass_store_->UpdateArtifact(type_def_id, td_version_id, updated_td.SerializeAsString(), txn_id);
-    if (!update_or.ok()) {
-      (void)transaction_manager_->RollbackTransaction(txn_id);
+    if (!update_or.ok())
       return update_or.status();
-    }
   }
 
   // Step 7: Commit the transaction.
   auto commit_or = transaction_manager_->CommitTransaction(txn_id);
-  if (!commit_or.ok()) {
-    (void)transaction_manager_->RollbackTransaction(txn_id);
+  if (!commit_or.ok())
     return commit_or.status();
-  }
+
+  committed = true;
 
   if (std::holds_alternative<transaction::TransactionManager::CommitConflict>(*commit_or)) {
     return absl::AbortedError("concurrent type registration conflict");
@@ -873,23 +865,7 @@ absl::StatusOr<std::vector<uint64_t>> TypeRegistry::ListTypeVersions(const std::
   if (!td_or->has_value())
     return absl::NotFoundError(absl::StrCat("type '", type_name, "' not found"));
 
-  auto it = index_def_ids_by_key_type_.find("type_versions_by_type");
-  if (it == index_def_ids_by_key_type_.end())
-    return absl::InternalError("type_versions_by_type index not registered");
-
-  const auto* tvd_descriptor = TypeVersionDefinition::descriptor();
-  google::protobuf::DynamicMessageFactory factory;
-  const auto* prototype = factory.GetPrototype(tvd_descriptor);
-  std::unique_ptr<google::protobuf::Message> key_msg(prototype->New());
-  key_msg->GetReflection()->SetUInt64(key_msg.get(), tvd_descriptor->FindFieldByName("type_id"), (*td_or)->first);
-
-  std::vector<std::string> key_fields = {"type_id"};
-  auto encoded_or = encoding::EncodeKey(*tvd_descriptor, *key_msg, key_fields);
-  if (!encoded_or.ok())
-    return encoded_or.status();
-
-  const IndexDefinition& idx_def = tvd_descriptor->options().GetExtension(artifact_system::indexes, 0);
-  auto ids_or = ReadIndexArtifactIds(ref, it->second, *encoded_or, idx_def, *tvd_descriptor);
+  auto ids_or = ReadVersionIdsByType(ref, (*td_or)->first);
   if (!ids_or.ok()) {
     if (absl::IsNotFound(ids_or.status()))
       return std::vector<uint64_t>{};
@@ -955,37 +931,16 @@ absl::StatusOr<IndexSchemaInfo> TypeRegistry::GetIndexSchema(const std::string& 
           if (!tvd_payload_or.ok())
             continue;
           google::protobuf::DescriptorPool user_pool(google::protobuf::DescriptorPool::generated_pool());
-          const auto* user_desc = FindMessageInDescriptorSet(tvd_payload_or->descriptor_set(), td_payload_or->type_name(), &user_pool);
+          const auto* user_desc = artifact::BuildPoolAndFindMessage(tvd_payload_or->descriptor_set(), td_payload_or->type_name(), &user_pool);
           if (user_desc == nullptr)
             continue;
           const auto& opts = user_desc->options();
           for (int i = 0; i < opts.ExtensionSize(artifact_system::indexes); ++i) {
             if (opts.GetExtension(artifact_system::indexes, i).key_type() == key_type) {
-              // Found! Generate schema using this descriptor.
               auto schema_or = index::GenerateIndexSchema(idx_def, *user_desc);
               if (!schema_or.ok())
                 return schema_or.status();
-
-              IndexSchemaInfo info;
-              info.index_definition_id = idx_id;
-              info.key_type = idx_def.key_type();
-              for (const auto& k : idx_def.key()) {
-                info.key_fields.push_back(k);
-              }
-              for (const auto& o : idx_def.order()) {
-                info.order_fields.push_back(o);
-              }
-              info.unique = idx_def.unique();
-
-              // Serialize the generated descriptors into a FileDescriptorSet.
-              google::protobuf::FileDescriptorSet gen_fds;
-              schema_or->file_descriptor->CopyTo(gen_fds.add_file());
-              info.index_descriptor_set = gen_fds;
-
-              info.key_message_name = schema_or->key_descriptor->full_name();
-              info.value_message_name = schema_or->value_descriptor->full_name();
-              info.index_message_name = schema_or->index_descriptor->full_name();
-              return info;
+              return BuildIndexSchemaInfo(idx_id, idx_def, *schema_or);
             }
           }
         }
@@ -997,27 +952,7 @@ absl::StatusOr<IndexSchemaInfo> TypeRegistry::GetIndexSchema(const std::string& 
   auto schema_or = index::GenerateIndexSchema(idx_def, *parent_desc);
   if (!schema_or.ok())
     return schema_or.status();
-
-  IndexSchemaInfo info;
-  info.index_definition_id = idx_id;
-  info.key_type = idx_def.key_type();
-  for (const auto& k : idx_def.key()) {
-    info.key_fields.push_back(k);
-  }
-  for (const auto& o : idx_def.order()) {
-    info.order_fields.push_back(o);
-  }
-  info.unique = idx_def.unique();
-
-  // Serialize the generated descriptors into a FileDescriptorSet.
-  google::protobuf::FileDescriptorSet gen_fds;
-  schema_or->file_descriptor->CopyTo(gen_fds.add_file());
-  info.index_descriptor_set = gen_fds;
-
-  info.key_message_name = schema_or->key_descriptor->full_name();
-  info.value_message_name = schema_or->value_descriptor->full_name();
-  info.index_message_name = schema_or->index_descriptor->full_name();
-  return info;
+  return BuildIndexSchemaInfo(idx_id, idx_def, *schema_or);
 }
 
 } // namespace artifact_system::registry

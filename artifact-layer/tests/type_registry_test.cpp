@@ -119,27 +119,26 @@ void WriteIndexEntry(MemoryStorage& storage, const std::string& branch, uint64_t
   ASSERT_TRUE(storage.PutObject(branch, path, *ser_or).ok());
 }
 
-// Encode a key for an index lookup.
-std::vector<uint8_t> EncodeStringKey(const google::protobuf::Descriptor& desc, const std::string& field_name, const std::string& value) {
+// Encode a single-field index key using DynamicMessage.
+template <typename SetFn> std::vector<uint8_t> EncodeIndexKey(const google::protobuf::Descriptor& desc, const std::string& field_name, SetFn set_fn) {
   google::protobuf::DynamicMessageFactory factory;
   const auto* prototype = factory.GetPrototype(&desc);
   std::unique_ptr<google::protobuf::Message> msg(prototype->New());
-  msg->GetReflection()->SetString(msg.get(), desc.FindFieldByName(field_name), value);
+  set_fn(msg.get(), desc.FindFieldByName(field_name));
   std::vector<std::string> key_fields = {field_name};
   auto encoded_or = encoding::EncodeKey(desc, *msg, key_fields);
   EXPECT_TRUE(encoded_or.ok());
   return *encoded_or;
 }
 
+std::vector<uint8_t> EncodeStringKey(const google::protobuf::Descriptor& desc, const std::string& field_name, const std::string& value) {
+  return EncodeIndexKey(desc, field_name,
+                        [&](google::protobuf::Message* msg, const google::protobuf::FieldDescriptor* f) { msg->GetReflection()->SetString(msg, f, value); });
+}
+
 std::vector<uint8_t> EncodeUint64Key(const google::protobuf::Descriptor& desc, const std::string& field_name, uint64_t value) {
-  google::protobuf::DynamicMessageFactory factory;
-  const auto* prototype = factory.GetPrototype(&desc);
-  std::unique_ptr<google::protobuf::Message> msg(prototype->New());
-  msg->GetReflection()->SetUInt64(msg.get(), desc.FindFieldByName(field_name), value);
-  std::vector<std::string> key_fields = {field_name};
-  auto encoded_or = encoding::EncodeKey(desc, *msg, key_fields);
-  EXPECT_TRUE(encoded_or.ok());
-  return *encoded_or;
+  return EncodeIndexKey(desc, field_name,
+                        [&](google::protobuf::Message* msg, const google::protobuf::FieldDescriptor* f) { msg->GetReflection()->SetUInt64(msg, f, value); });
 }
 
 std::vector<uint8_t> EncodeEmptyKey() {
@@ -155,6 +154,21 @@ std::optional<RegisterTypeVersionError> ExtractRegistrationError(const absl::Sta
   if (!error.ParseFromString(std::string(payload->Flatten())))
     return std::nullopt;
   return error;
+}
+
+// Assert that a failed registration status contains a violation with the given category.
+void ExpectViolationCategory(const absl::Status& status, TypeRegistrationViolation::Category category) {
+  ASSERT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
+  auto error = ExtractRegistrationError(status);
+  ASSERT_TRUE(error.has_value()) << "expected RegisterTypeVersionError payload";
+  bool found = false;
+  for (const auto& v : error->violations()) {
+    if (v.category() == category) {
+      found = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(found) << "expected violation category " << static_cast<int>(category);
 }
 
 // ---------------------------------------------------------------------------
@@ -219,72 +233,32 @@ private:
         {"all_reference_definitions", kAllRefDefsId},
     };
 
-    // ── 1. IndexDefinition type ──
-    {
+    // ── 1-4. Bootstrap meta-type pairs (TypeDefinition + TypeVersionDefinition) ──
+    struct MetaType {
+      const char* type_name;
+      uint64_t td_id;
+      uint64_t tvd_id;
+      const google::protobuf::Descriptor* descriptor;
+    };
+    const MetaType meta_types[] = {
+        {"artifact_system.IndexDefinition", kIdxDefTypeDefId, kIdxDefTVDId, IndexDefinition::descriptor()},
+        {"artifact_system.TypeDefinition", kTypeDefTypeDefId, kTypeDefTVDId, TypeDefinition::descriptor()},
+        {"artifact_system.TypeVersionDefinition", kTVDTypeDefId, kTVDTVDId, TypeVersionDefinition::descriptor()},
+        {"artifact_system.ReferenceDefinition", kRefDefTypeDefId, kRefDefTVDId, ReferenceDefinition::descriptor()},
+    };
+    for (const auto& mt : meta_types) {
       TypeDefinition td;
-      td.set_type_name("artifact_system.IndexDefinition");
-      td.set_current_version_id(kIdxDefTVDId);
+      td.set_type_name(mt.type_name);
+      td.set_current_version_id(mt.tvd_id);
       td.set_deny_create(true);
       td.set_deny_update(true);
       td.set_deny_delete(true);
-      WriteStoredArtifact(*storage_, branch, kIdxDefTypeDefId, kTypeDefTVDId, "artifact_system.TypeDefinition", td.SerializeAsString());
-    }
-    {
-      TypeVersionDefinition tvd;
-      tvd.set_type_id(kIdxDefTypeDefId);
-      *tvd.mutable_descriptor_set() = BuildDescriptorSet(IndexDefinition::descriptor());
-      WriteStoredArtifact(*storage_, branch, kIdxDefTVDId, kTVDTVDId, "artifact_system.TypeVersionDefinition", tvd.SerializeAsString());
-    }
+      WriteStoredArtifact(*storage_, branch, mt.td_id, kTypeDefTVDId, "artifact_system.TypeDefinition", td.SerializeAsString());
 
-    // ── 2. TypeDefinition type ──
-    {
-      TypeDefinition td;
-      td.set_type_name("artifact_system.TypeDefinition");
-      td.set_current_version_id(kTypeDefTVDId);
-      td.set_deny_create(true);
-      td.set_deny_update(true);
-      td.set_deny_delete(true);
-      WriteStoredArtifact(*storage_, branch, kTypeDefTypeDefId, kTypeDefTVDId, "artifact_system.TypeDefinition", td.SerializeAsString());
-    }
-    {
       TypeVersionDefinition tvd;
-      tvd.set_type_id(kTypeDefTypeDefId);
-      *tvd.mutable_descriptor_set() = BuildDescriptorSet(TypeDefinition::descriptor());
-      WriteStoredArtifact(*storage_, branch, kTypeDefTVDId, kTVDTVDId, "artifact_system.TypeVersionDefinition", tvd.SerializeAsString());
-    }
-
-    // ── 3. TypeVersionDefinition type ──
-    {
-      TypeDefinition td;
-      td.set_type_name("artifact_system.TypeVersionDefinition");
-      td.set_current_version_id(kTVDTVDId);
-      td.set_deny_create(true);
-      td.set_deny_update(true);
-      td.set_deny_delete(true);
-      WriteStoredArtifact(*storage_, branch, kTVDTypeDefId, kTVDTVDId, "artifact_system.TypeDefinition", td.SerializeAsString());
-    }
-    {
-      TypeVersionDefinition tvd;
-      tvd.set_type_id(kTVDTypeDefId);
-      *tvd.mutable_descriptor_set() = BuildDescriptorSet(TypeVersionDefinition::descriptor());
-      WriteStoredArtifact(*storage_, branch, kTVDTVDId, kTVDTVDId, "artifact_system.TypeVersionDefinition", tvd.SerializeAsString());
-    }
-
-    // ── 4. ReferenceDefinition type ──
-    {
-      TypeDefinition td;
-      td.set_type_name("artifact_system.ReferenceDefinition");
-      td.set_current_version_id(kRefDefTVDId);
-      td.set_deny_create(true);
-      td.set_deny_update(true);
-      td.set_deny_delete(true);
-      WriteStoredArtifact(*storage_, branch, kRefDefTypeDefId, kRefDefTVDId, "artifact_system.TypeDefinition", td.SerializeAsString());
-    }
-    {
-      TypeVersionDefinition tvd;
-      tvd.set_type_id(kRefDefTypeDefId);
-      *tvd.mutable_descriptor_set() = BuildDescriptorSet(ReferenceDefinition::descriptor());
-      WriteStoredArtifact(*storage_, branch, kRefDefTVDId, kTVDTVDId, "artifact_system.TypeVersionDefinition", tvd.SerializeAsString());
+      tvd.set_type_id(mt.td_id);
+      *tvd.mutable_descriptor_set() = BuildDescriptorSet(mt.descriptor);
+      WriteStoredArtifact(*storage_, branch, mt.tvd_id, kTVDTVDId, "artifact_system.TypeVersionDefinition", tvd.SerializeAsString());
     }
 
     // ── 5. Bootstrap IndexDefinition artifacts ──
@@ -580,11 +554,9 @@ TEST_F(TypeRegistryTest, ProtoCompilationFailure_MessageNotFound) {
 }
 
 TEST_F(TypeRegistryTest, SchemaIncompatibility_FieldRemoved) {
-  // Register v1.
   auto v1_or = registry_->RegisterTypeVersion("test.SimpleArtifact", kSimpleProtoSource);
   ASSERT_TRUE(v1_or.ok()) << v1_or.status();
 
-  // Try to register v2 with a field removed.
   const char* v2_source = R"(
     syntax = "proto3";
     package test;
@@ -601,17 +573,7 @@ TEST_F(TypeRegistryTest, SchemaIncompatibility_FieldRemoved) {
   )";
   auto v2_or = registry_->RegisterTypeVersion("test.SimpleArtifact", v2_source);
   ASSERT_FALSE(v2_or.ok());
-
-  auto error = ExtractRegistrationError(v2_or.status());
-  ASSERT_TRUE(error.has_value());
-  bool found_schema = false;
-  for (const auto& v : error->violations()) {
-    if (v.category() == TypeRegistrationViolation::SCHEMA_INCOMPATIBILITY) {
-      found_schema = true;
-      break;
-    }
-  }
-  EXPECT_TRUE(found_schema);
+  ExpectViolationCategory(v2_or.status(), TypeRegistrationViolation::SCHEMA_INCOMPATIBILITY);
 }
 
 TEST_F(TypeRegistryTest, InvalidIndexDefinition_UnspecifiedOrder) {
@@ -630,15 +592,7 @@ TEST_F(TypeRegistryTest, InvalidIndexDefinition_UnspecifiedOrder) {
   )";
   auto result_or = registry_->RegisterTypeVersion("test.BadIndex", source);
   ASSERT_FALSE(result_or.ok());
-
-  auto error = ExtractRegistrationError(result_or.status());
-  ASSERT_TRUE(error.has_value());
-  bool found = false;
-  for (const auto& v : error->violations()) {
-    if (v.category() == TypeRegistrationViolation::INVALID_INDEX_DEFINITION)
-      found = true;
-  }
-  EXPECT_TRUE(found);
+  ExpectViolationCategory(result_or.status(), TypeRegistrationViolation::INVALID_INDEX_DEFINITION);
 }
 
 TEST_F(TypeRegistryTest, IndexIncompatibility_Removed) {
@@ -658,15 +612,7 @@ TEST_F(TypeRegistryTest, IndexIncompatibility_Removed) {
   )";
   auto v2_or = registry_->RegisterTypeVersion("test.SimpleArtifact", v2_source);
   ASSERT_FALSE(v2_or.ok());
-
-  auto error = ExtractRegistrationError(v2_or.status());
-  ASSERT_TRUE(error.has_value());
-  bool found = false;
-  for (const auto& v : error->violations()) {
-    if (v.category() == TypeRegistrationViolation::INDEX_INCOMPATIBILITY)
-      found = true;
-  }
-  EXPECT_TRUE(found);
+  ExpectViolationCategory(v2_or.status(), TypeRegistrationViolation::INDEX_INCOMPATIBILITY);
 }
 
 TEST_F(TypeRegistryTest, IndexIncompatibility_Modified) {
@@ -692,15 +638,7 @@ TEST_F(TypeRegistryTest, IndexIncompatibility_Modified) {
   )";
   auto v2_or = registry_->RegisterTypeVersion("test.SimpleArtifact", v2_source);
   ASSERT_FALSE(v2_or.ok());
-
-  auto error = ExtractRegistrationError(v2_or.status());
-  ASSERT_TRUE(error.has_value());
-  bool found = false;
-  for (const auto& v : error->violations()) {
-    if (v.category() == TypeRegistrationViolation::INDEX_INCOMPATIBILITY)
-      found = true;
-  }
-  EXPECT_TRUE(found);
+  ExpectViolationCategory(v2_or.status(), TypeRegistrationViolation::INDEX_INCOMPATIBILITY);
 }
 
 TEST_F(TypeRegistryTest, TightenOnlyViolation) {
@@ -711,15 +649,7 @@ TEST_F(TypeRegistryTest, TightenOnlyViolation) {
   // Try to loosen deny_create to false.
   auto v2_or = registry_->RegisterTypeVersion("test.SimpleArtifact", kSimpleProtoSourceV2, /*deny_create=*/false);
   ASSERT_FALSE(v2_or.ok());
-
-  auto error = ExtractRegistrationError(v2_or.status());
-  ASSERT_TRUE(error.has_value());
-  bool found = false;
-  for (const auto& v : error->violations()) {
-    if (v.category() == TypeRegistrationViolation::TIGHTEN_ONLY_VIOLATION)
-      found = true;
-  }
-  EXPECT_TRUE(found);
+  ExpectViolationCategory(v2_or.status(), TypeRegistrationViolation::TIGHTEN_ONLY_VIOLATION);
 }
 
 TEST_F(TypeRegistryTest, TightenOnlyAllowed) {
@@ -798,15 +728,7 @@ TEST_F(TypeRegistryTest, InvalidReferenceDeclaration_WrongFieldType) {
 
   auto result_or = registry_->RegisterTypeVersion("test.BadRef", source);
   ASSERT_FALSE(result_or.ok());
-
-  auto error = ExtractRegistrationError(result_or.status());
-  ASSERT_TRUE(error.has_value());
-  bool found = false;
-  for (const auto& v : error->violations()) {
-    if (v.category() == TypeRegistrationViolation::INVALID_REFERENCE_DECLARATION)
-      found = true;
-  }
-  EXPECT_TRUE(found);
+  ExpectViolationCategory(result_or.status(), TypeRegistrationViolation::INVALID_REFERENCE_DECLARATION);
 }
 
 TEST_F(TypeRegistryTest, InvalidReferenceDeclaration_TargetNotFound) {
@@ -828,15 +750,7 @@ TEST_F(TypeRegistryTest, InvalidReferenceDeclaration_TargetNotFound) {
   )";
   auto result_or = registry_->RegisterTypeVersion("test.RefToNowhere", source);
   ASSERT_FALSE(result_or.ok());
-
-  auto error = ExtractRegistrationError(result_or.status());
-  ASSERT_TRUE(error.has_value());
-  bool found = false;
-  for (const auto& v : error->violations()) {
-    if (v.category() == TypeRegistrationViolation::INVALID_REFERENCE_DECLARATION)
-      found = true;
-  }
-  EXPECT_TRUE(found);
+  ExpectViolationCategory(result_or.status(), TypeRegistrationViolation::INVALID_REFERENCE_DECLARATION);
 }
 
 TEST_F(TypeRegistryTest, InvalidReferenceDeclaration_NoCoveringIndex) {
@@ -857,15 +771,7 @@ TEST_F(TypeRegistryTest, InvalidReferenceDeclaration_NoCoveringIndex) {
 
   auto result_or = registry_->RegisterTypeVersion("test.NoCovering", source);
   ASSERT_FALSE(result_or.ok());
-
-  auto error = ExtractRegistrationError(result_or.status());
-  ASSERT_TRUE(error.has_value());
-  bool found = false;
-  for (const auto& v : error->violations()) {
-    if (v.category() == TypeRegistrationViolation::INVALID_REFERENCE_DECLARATION)
-      found = true;
-  }
-  EXPECT_TRUE(found);
+  ExpectViolationCategory(result_or.status(), TypeRegistrationViolation::INVALID_REFERENCE_DECLARATION);
 }
 
 TEST_F(TypeRegistryTest, ValidReferenceRegistration) {
@@ -903,15 +809,7 @@ TEST_F(TypeRegistryTest, ReferenceIncompatibility_Removed) {
   )";
   auto v2_or = registry_->RegisterTypeVersion("test.RefArtifact", v2_source);
   ASSERT_FALSE(v2_or.ok());
-
-  auto error = ExtractRegistrationError(v2_or.status());
-  ASSERT_TRUE(error.has_value());
-  bool found = false;
-  for (const auto& v : error->violations()) {
-    if (v.category() == TypeRegistrationViolation::REFERENCE_INCOMPATIBILITY)
-      found = true;
-  }
-  EXPECT_TRUE(found);
+  ExpectViolationCategory(v2_or.status(), TypeRegistrationViolation::REFERENCE_INCOMPATIBILITY);
 }
 
 TEST_F(TypeRegistryTest, MultipleViolationsCollected) {

@@ -99,6 +99,10 @@ private:
   // Find the tail TypeVersionDefinition (next_version_id unset) for a type.
   absl::StatusOr<std::optional<std::pair<uint64_t, TypeVersionDefinition>>> FindTailVersion(const std::string& ref, uint64_t type_def_id);
 
+  // Generic lookup by string key_type on the first index extension of type T.
+  template <typename T>
+  absl::StatusOr<std::optional<std::pair<uint64_t, T>>> LookupByKeyType(const std::string& ref, const std::string& index_name, const std::string& key_type);
+
   // Look up an IndexDefinition by key_type using the index_key_type_unique index.
   absl::StatusOr<std::optional<std::pair<uint64_t, IndexDefinition>>> LookupIndexDefinition(const std::string& ref, const std::string& key_type);
 
@@ -108,6 +112,12 @@ private:
   // Read artifact IDs from an index (returns all artifact_ids in the index object).
   absl::StatusOr<std::vector<uint64_t>> ReadIndexArtifactIds(const std::string& ref, uint64_t index_def_id, const std::vector<uint8_t>& encoded_key,
                                                              const IndexDefinition& index_def, const google::protobuf::Descriptor& parent_descriptor);
+
+  // Read TypeVersionDefinition artifact IDs for a type via type_versions_by_type index.
+  absl::StatusOr<std::vector<uint64_t>> ReadVersionIdsByType(const std::string& ref, uint64_t type_def_id);
+
+  // Rebuild bypass_store_ with current index_def_ids_by_key_type_.
+  void RebuildBypassStore();
 
   StorageInterface* storage_;
   transaction::TransactionManager* transaction_manager_;
