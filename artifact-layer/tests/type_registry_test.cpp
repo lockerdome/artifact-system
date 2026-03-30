@@ -742,6 +742,36 @@ TEST_F(TypeRegistryTest, TightenOnlyOmitPreservesExisting) {
   // Omit all flags — should preserve deny_delete = true.
   auto v2_or = registry_->RegisterTypeVersion("test.SimpleArtifact", kSimpleProtoSourceV2);
   ASSERT_TRUE(v2_or.ok()) << v2_or.status();
+
+  // Verify deny_delete is still true by attempting to loosen it — should fail.
+  const char* v3_source = R"(
+    syntax = "proto3";
+    package test;
+    import "artifact_options.proto";
+    message SimpleArtifact {
+      option (artifact_system.indexes) = {
+        key_type: "simple_by_name"
+        key: ["name"]
+        order: { field: "artifact_id" direction: ASCENDING }
+        unique: true
+      };
+      string name = 1;
+      string value = 2;
+      string description = 3;
+      string extra = 4;
+    }
+  )";
+  auto v3_or = registry_->RegisterTypeVersion("test.SimpleArtifact", v3_source, /*deny_create=*/std::nullopt, /*deny_update=*/std::nullopt,
+                                              /*deny_delete=*/false);
+  ASSERT_FALSE(v3_or.ok());
+  auto error = ExtractRegistrationError(v3_or.status());
+  ASSERT_TRUE(error.has_value());
+  bool found_tighten = false;
+  for (const auto& v : error->violations()) {
+    if (v.category() == TypeRegistrationViolation::TIGHTEN_ONLY_VIOLATION)
+      found_tighten = true;
+  }
+  EXPECT_TRUE(found_tighten) << "deny_delete=true should have been preserved from v1";
 }
 
 TEST_F(TypeRegistryTest, InvalidReferenceDeclaration_WrongFieldType) {
