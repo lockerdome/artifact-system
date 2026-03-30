@@ -15,8 +15,9 @@ namespace artifact_system::index {
 struct DerivedIndexEntry {
   uint64_t index_def_id = 0;
   std::string key_type;
-  std::vector<uint8_t> encoded_key;
+  std::vector<uint8_t> encoded_key;    // Custom binary encoding for storage paths.
   std::vector<IndexCell> order_values;
+  std::vector<IndexCell> key_values;   // Raw key field values (for building proto-serialized keys).
 };
 
 absl::StatusOr<std::vector<DerivedIndexEntry>> DeriveIndexEntries(const google::protobuf::Descriptor& descriptor,

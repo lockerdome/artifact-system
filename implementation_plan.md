@@ -31,7 +31,7 @@ otherwise noted.
 | P6 | Artifact CRUD Engine | :white_check_mark: Complete |
 | P6.5 | String IDs for Snapshots & Transactions | :white_check_mark: Complete |
 | P7a | Registry Utilities (proto compiler, schema compat) | :white_check_mark: Complete |
-| P7b | Type Registry Orchestration (RegisterTypeVersion + introspection) | :white_large_square: Not started |
+| P7b | Type Registry Orchestration (RegisterTypeVersion + introspection) | :white_check_mark: Complete |
 | P8 | Genesis Bootstrap | :white_large_square: Not started |
 | P9 | gRPC Server & Service Implementation | :white_large_square: Not started |
 | P10 | ID Allocator Production Integration | :white_large_square: Not started |
@@ -665,12 +665,12 @@ with internal bypass of mutation restrictions.
    - GetTypeVersion, ListTypeVersions, GetIndexSchema introspection
 
 ### Checklist
-- [ ] `src/registry/type_registry.h/.cpp` — RegisterTypeVersion orchestration
-- [ ] `src/registry/internal_bypass.h` — scoped mutation restriction bypass
-- [ ] `tests/type_registry_test.cpp` — register, version, tighten-only, concurrent conflict
-- [ ] GetTypeVersion, ListTypeVersions, GetIndexSchema working
-- [ ] All 7 RegisterTypeVersion violation categories tested
-- [ ] Internal bypass limited to system-managed operations only
+- [x] `src/registry/type_registry.h/.cpp` — RegisterTypeVersion orchestration
+- [x] `src/registry/internal_bypass.h` — scoped mutation restriction bypass
+- [x] `tests/type_registry_test.cpp` — register, version, tighten-only, concurrent conflict
+- [x] GetTypeVersion, ListTypeVersions, GetIndexSchema working
+- [x] All 7 RegisterTypeVersion violation categories tested
+- [x] Internal bypass limited to system-managed operations only
 
 ---
 

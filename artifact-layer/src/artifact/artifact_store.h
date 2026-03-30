@@ -58,6 +58,9 @@ public:
     std::unordered_map<std::string, uint64_t> index_def_ids_by_key_type;
     // When true, bypass mutation restriction checks (for internal operations).
     bool bypass_mutation_check = false;
+    // When true, bypass referential integrity validation (for internal operations
+    // like type registration that manage system artifacts with special naming).
+    bool bypass_referential_integrity = false;
   };
 
   ArtifactStore(StorageInterface* storage, transaction::TransactionManager* transaction_manager, IdAllocatorInterface* id_allocator);
