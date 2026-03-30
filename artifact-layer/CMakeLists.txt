@@ -115,6 +115,7 @@ add_library(artifact_layer_lib
   src/registry/proto_compiler.cpp
   src/registry/schema_compatibility.cpp
   src/registry/type_registry.cpp
+  src/bootstrap/genesis.cpp
 )
 target_include_directories(artifact_layer_lib PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(artifact_layer_lib
