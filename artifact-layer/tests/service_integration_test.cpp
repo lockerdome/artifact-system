@@ -125,13 +125,14 @@ protected:
     server_ = std::make_unique<service::ArtifactLayerServer>(config);
     ASSERT_TRUE(server_->Initialize().ok());
 
-    // Start() blocks, so run it on a background thread.
     server_thread_ = std::thread([this] { server_->Start(); });
 
-    // Wait for the port to become available.
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    // Poll until the server has bound a port, then connect.
+    while (server_->port() == 0)
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
 
     auto channel = grpc::CreateChannel("localhost:" + std::to_string(server_->port()), grpc::InsecureChannelCredentials());
+    channel->WaitForConnected(std::chrono::system_clock::now() + std::chrono::seconds(5));
 
     snapshot_txn_stub_ = SnapshotTransactionService::NewStub(channel);
     artifact_stub_ = ArtifactService::NewStub(channel);

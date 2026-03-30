@@ -7,6 +7,8 @@
 #include "absl/strings/str_cat.h"
 #include "grpcpp/support/status.h"
 
+#include "artifact_service.pb.h"
+
 namespace artifact_system::service {
 
 // Convert absl::StatusCode to grpc::StatusCode.
@@ -49,100 +51,52 @@ inline grpc::StatusCode AbslToGrpcCode(absl::StatusCode code) {
   }
 }
 
+namespace detail {
+
+inline void AppendVarint(uint32_t value, std::string* out) {
+  while (value >= 0x80) {
+    out->push_back(static_cast<char>(value | 0x80));
+    value >>= 7;
+  }
+  out->push_back(static_cast<char>(value));
+}
+
+inline void AppendLengthDelimited(uint8_t tag, absl::string_view data, std::string* out) {
+  out->push_back(static_cast<char>(tag));
+  AppendVarint(static_cast<uint32_t>(data.size()), out);
+  out->append(data.data(), data.size());
+}
+
+} // namespace detail
+
 // Convert an absl::Status to a grpc::Status, preserving any proto detail
-// payloads via the standard google.rpc.Status encoding.
+// payload as a google.rpc.Status binary error detail.
 //
-// If the absl::Status carries a payload with a type URL matching a known
-// proto detail type, the payload is encoded in a google.rpc.Status message
-// serialized into the gRPC trailing metadata (the "binary error details"
-// convention). grpc::Status supports this via its error_details parameter.
+// The wire encoding is manual to avoid a build dependency on
+// google/rpc/status.proto. Format:
+//   google.rpc.Status { int32 code=1; string message=2; repeated Any details=3; }
+//   google.protobuf.Any { string type_url=1; bytes value=2; }
 inline grpc::Status AbslToGrpcStatus(const absl::Status& status) {
   if (status.ok()) {
     return grpc::Status::OK;
   }
 
-  // Check for proto detail payload. The convention in this codebase is
-  // SetPayload("type.googleapis.com/<fully-qualified-message>", serialized).
-  // We extract the first payload (there's at most one per error) and encode
-  // it as a google.rpc.Status in binary error details.
   std::string error_details;
   status.ForEachPayload([&](absl::string_view type_url, const absl::Cord& payload) {
     if (!error_details.empty())
-      return; // take only the first
-
-    // Build a google.rpc.Status message manually to avoid depending on
-    // google/rpc/status.proto. The wire format is:
-    //   field 1 (int32): code
-    //   field 2 (string): message
-    //   field 3 (repeated google.protobuf.Any): details
-    // google.protobuf.Any is:
-    //   field 1 (string): type_url
-    //   field 2 (bytes): value
+      return;
 
     std::string payload_str = std::string(payload);
 
-    // Encode the Any message.
     std::string any_msg;
-    // field 1: type_url (tag = 0x0a, wire type 2)
-    any_msg.push_back(0x0a);
-    std::string type_url_str(type_url);
-    // varint length
-    {
-      uint32_t len = static_cast<uint32_t>(type_url_str.size());
-      while (len >= 0x80) {
-        any_msg.push_back(static_cast<char>(len | 0x80));
-        len >>= 7;
-      }
-      any_msg.push_back(static_cast<char>(len));
-    }
-    any_msg.append(type_url_str);
-    // field 2: value (tag = 0x12, wire type 2)
-    any_msg.push_back(0x12);
-    {
-      uint32_t len = static_cast<uint32_t>(payload_str.size());
-      while (len >= 0x80) {
-        any_msg.push_back(static_cast<char>(len | 0x80));
-        len >>= 7;
-      }
-      any_msg.push_back(static_cast<char>(len));
-    }
-    any_msg.append(payload_str);
+    detail::AppendLengthDelimited(0x0a, type_url, &any_msg);
+    detail::AppendLengthDelimited(0x12, payload_str, &any_msg);
 
-    // Encode the google.rpc.Status message.
     std::string rpc_status;
-    // field 1: code (tag = 0x08, varint)
     rpc_status.push_back(0x08);
-    {
-      uint32_t code = static_cast<uint32_t>(status.code());
-      while (code >= 0x80) {
-        rpc_status.push_back(static_cast<char>(code | 0x80));
-        code >>= 7;
-      }
-      rpc_status.push_back(static_cast<char>(code));
-    }
-    // field 2: message (tag = 0x12)
-    std::string msg(status.message());
-    rpc_status.push_back(0x12);
-    {
-      uint32_t len = static_cast<uint32_t>(msg.size());
-      while (len >= 0x80) {
-        rpc_status.push_back(static_cast<char>(len | 0x80));
-        len >>= 7;
-      }
-      rpc_status.push_back(static_cast<char>(len));
-    }
-    rpc_status.append(msg);
-    // field 3: details (tag = 0x1a)
-    rpc_status.push_back(0x1a);
-    {
-      uint32_t len = static_cast<uint32_t>(any_msg.size());
-      while (len >= 0x80) {
-        rpc_status.push_back(static_cast<char>(len | 0x80));
-        len >>= 7;
-      }
-      rpc_status.push_back(static_cast<char>(len));
-    }
-    rpc_status.append(any_msg);
+    detail::AppendVarint(static_cast<uint32_t>(status.code()), &rpc_status);
+    detail::AppendLengthDelimited(0x12, status.message(), &rpc_status);
+    detail::AppendLengthDelimited(0x1a, any_msg, &rpc_status);
 
     error_details = std::move(rpc_status);
   });
@@ -151,12 +105,31 @@ inline grpc::Status AbslToGrpcStatus(const absl::Status& status) {
 }
 
 // Build an absl::Status with a serialized proto detail payload.
-template <typename ProtoMessage> absl::Status MakeStatusWithDetail(absl::StatusCode code, const std::string& message, const ProtoMessage& detail) {
+template <typename ProtoMessage> absl::Status MakeStatusWithDetail(absl::StatusCode code, absl::string_view message, const ProtoMessage& detail) {
   absl::Status status(code, message);
   std::string serialized;
   detail.SerializeToString(&serialized);
-  status.SetPayload(absl::StrCat("type.googleapis.com/", ProtoMessage::descriptor()->full_name()), absl::Cord(serialized));
+  status.SetPayload(absl::StrCat("type.googleapis.com/", ProtoMessage::descriptor()->full_name()), absl::Cord(std::move(serialized)));
   return status;
+}
+
+// ── Shared error-detail builders ────────────────────────────────────────────
+// Used by multiple service implementations to build typed error statuses.
+
+inline absl::Status MakeSnapshotTxnError(absl::string_view message, SnapshotTransactionError::Category category, absl::string_view id) {
+  SnapshotTransactionError error;
+  error.set_category(category);
+  error.set_description(std::string(message));
+  error.set_id(std::string(id));
+  return MakeStatusWithDetail(absl::StatusCode::kNotFound, message, error);
+}
+
+inline absl::Status MakeFetchIndexError(absl::StatusCode code, absl::string_view message, FetchIndexError::Category category, absl::string_view key_type) {
+  FetchIndexError error;
+  error.set_category(category);
+  error.set_description(std::string(message));
+  error.set_key_type(std::string(key_type));
+  return MakeStatusWithDetail(code, message, error);
 }
 
 } // namespace artifact_system::service

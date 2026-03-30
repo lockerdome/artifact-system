@@ -8,7 +8,7 @@ SnapshotTransactionServiceImpl::SnapshotTransactionServiceImpl(transaction::Tran
     : transaction_manager_(transaction_manager) {
 }
 
-grpc::Status SnapshotTransactionServiceImpl::CreateSnapshot(grpc::ServerContext* context, const CreateSnapshotRequest* request,
+grpc::Status SnapshotTransactionServiceImpl::CreateSnapshot(grpc::ServerContext* /*context*/, const CreateSnapshotRequest* request,
                                                             CreateSnapshotResponse* response) {
   std::optional<std::string> parent_transaction_id;
   if (request->has_parent_transaction_id()) {
@@ -17,14 +17,8 @@ grpc::Status SnapshotTransactionServiceImpl::CreateSnapshot(grpc::ServerContext*
 
   auto result = transaction_manager_->CreateSnapshot(parent_transaction_id);
   if (!result.ok()) {
-    if (absl::IsNotFound(result.status())) {
-      SnapshotTransactionError error;
-      error.set_category(SnapshotTransactionError::PARENT_NOT_FOUND);
-      error.set_description(std::string(result.status().message()));
-      error.set_id(request->parent_transaction_id());
-      auto status_with_detail = MakeStatusWithDetail(absl::StatusCode::kNotFound, std::string(result.status().message()), error);
-      return AbslToGrpcStatus(status_with_detail);
-    }
+    if (absl::IsNotFound(result.status()))
+      return AbslToGrpcStatus(MakeSnapshotTxnError(result.status().message(), SnapshotTransactionError::PARENT_NOT_FOUND, request->parent_transaction_id()));
     return AbslToGrpcStatus(result.status());
   }
 
@@ -32,17 +26,20 @@ grpc::Status SnapshotTransactionServiceImpl::CreateSnapshot(grpc::ServerContext*
   return grpc::Status::OK;
 }
 
-grpc::Status SnapshotTransactionServiceImpl::CreateTransaction(grpc::ServerContext* context, const CreateTransactionRequest* request,
+grpc::Status SnapshotTransactionServiceImpl::CreateTransaction(grpc::ServerContext* /*context*/, const CreateTransactionRequest* request,
                                                                CreateTransactionResponse* response) {
   std::optional<std::string> parent_snapshot_id;
   std::optional<std::string> parent_transaction_id;
+  std::string parent_id;
 
   switch (request->parent_case()) {
   case CreateTransactionRequest::kParentSnapshotId:
     parent_snapshot_id = request->parent_snapshot_id();
+    parent_id = *parent_snapshot_id;
     break;
   case CreateTransactionRequest::kParentTransactionId:
     parent_transaction_id = request->parent_transaction_id();
+    parent_id = *parent_transaction_id;
     break;
   case CreateTransactionRequest::PARENT_NOT_SET:
     break;
@@ -50,18 +47,8 @@ grpc::Status SnapshotTransactionServiceImpl::CreateTransaction(grpc::ServerConte
 
   auto result = transaction_manager_->CreateTransaction(parent_snapshot_id, parent_transaction_id);
   if (!result.ok()) {
-    if (absl::IsNotFound(result.status())) {
-      SnapshotTransactionError error;
-      error.set_category(SnapshotTransactionError::PARENT_NOT_FOUND);
-      error.set_description(std::string(result.status().message()));
-      if (parent_snapshot_id.has_value()) {
-        error.set_id(*parent_snapshot_id);
-      } else if (parent_transaction_id.has_value()) {
-        error.set_id(*parent_transaction_id);
-      }
-      auto status_with_detail = MakeStatusWithDetail(absl::StatusCode::kNotFound, std::string(result.status().message()), error);
-      return AbslToGrpcStatus(status_with_detail);
-    }
+    if (absl::IsNotFound(result.status()))
+      return AbslToGrpcStatus(MakeSnapshotTxnError(result.status().message(), SnapshotTransactionError::PARENT_NOT_FOUND, parent_id));
     return AbslToGrpcStatus(result.status());
   }
 
@@ -69,25 +56,18 @@ grpc::Status SnapshotTransactionServiceImpl::CreateTransaction(grpc::ServerConte
   return grpc::Status::OK;
 }
 
-grpc::Status SnapshotTransactionServiceImpl::CommitTransaction(grpc::ServerContext* context, const CommitTransactionRequest* request,
+grpc::Status SnapshotTransactionServiceImpl::CommitTransaction(grpc::ServerContext* /*context*/, const CommitTransactionRequest* request,
                                                                CommitTransactionResponse* response) {
   auto result = transaction_manager_->CommitTransaction(request->transaction_id());
   if (!result.ok()) {
-    if (absl::IsNotFound(result.status())) {
-      SnapshotTransactionError error;
-      error.set_category(SnapshotTransactionError::TRANSACTION_NOT_FOUND);
-      error.set_description(std::string(result.status().message()));
-      error.set_id(request->transaction_id());
-      auto status_with_detail = MakeStatusWithDetail(absl::StatusCode::kNotFound, std::string(result.status().message()), error);
-      return AbslToGrpcStatus(status_with_detail);
-    }
+    if (absl::IsNotFound(result.status()))
+      return AbslToGrpcStatus(MakeSnapshotTxnError(result.status().message(), SnapshotTransactionError::TRANSACTION_NOT_FOUND, request->transaction_id()));
     return AbslToGrpcStatus(result.status());
   }
 
   if (auto* conflict = std::get_if<transaction::TransactionManager::CommitConflict>(&*result)) {
-    auto status_with_detail =
-        MakeStatusWithDetail(absl::StatusCode::kAborted, "commit conflict for transaction: " + request->transaction_id(), conflict->detail);
-    return AbslToGrpcStatus(status_with_detail);
+    return AbslToGrpcStatus(
+        MakeStatusWithDetail(absl::StatusCode::kAborted, absl::StrCat("commit conflict for transaction: ", request->transaction_id()), conflict->detail));
   }
 
   auto& success = std::get<transaction::TransactionManager::CommitSuccess>(*result);
@@ -95,18 +75,12 @@ grpc::Status SnapshotTransactionServiceImpl::CommitTransaction(grpc::ServerConte
   return grpc::Status::OK;
 }
 
-grpc::Status SnapshotTransactionServiceImpl::RollbackTransaction(grpc::ServerContext* context, const RollbackTransactionRequest* request,
+grpc::Status SnapshotTransactionServiceImpl::RollbackTransaction(grpc::ServerContext* /*context*/, const RollbackTransactionRequest* request,
                                                                  RollbackTransactionResponse* response) {
   auto status = transaction_manager_->RollbackTransaction(request->transaction_id());
   if (!status.ok()) {
-    if (absl::IsNotFound(status)) {
-      SnapshotTransactionError error;
-      error.set_category(SnapshotTransactionError::TRANSACTION_NOT_FOUND);
-      error.set_description(std::string(status.message()));
-      error.set_id(request->transaction_id());
-      auto status_with_detail = MakeStatusWithDetail(absl::StatusCode::kNotFound, std::string(status.message()), error);
-      return AbslToGrpcStatus(status_with_detail);
-    }
+    if (absl::IsNotFound(status))
+      return AbslToGrpcStatus(MakeSnapshotTxnError(status.message(), SnapshotTransactionError::TRANSACTION_NOT_FOUND, request->transaction_id()));
     return AbslToGrpcStatus(status);
   }
 

@@ -10,7 +10,7 @@ TypeRegistryServiceImpl::TypeRegistryServiceImpl(registry::TypeRegistry* registr
     : registry_(registry), artifact_store_(artifact_store) {
 }
 
-grpc::Status TypeRegistryServiceImpl::RegisterTypeVersion(grpc::ServerContext* context, const RegisterTypeVersionRequest* request,
+grpc::Status TypeRegistryServiceImpl::RegisterTypeVersion(grpc::ServerContext* /*context*/, const RegisterTypeVersionRequest* request,
                                                           RegisterTypeVersionResponse* response) {
   std::optional<bool> deny_create = request->has_deny_create() ? std::optional(request->deny_create()) : std::nullopt;
   std::optional<bool> deny_update = request->has_deny_update() ? std::optional(request->deny_update()) : std::nullopt;
@@ -37,7 +37,7 @@ grpc::Status TypeRegistryServiceImpl::RegisterTypeVersion(grpc::ServerContext* c
   return grpc::Status::OK;
 }
 
-grpc::Status TypeRegistryServiceImpl::GetTypeVersion(grpc::ServerContext* context, const GetTypeVersionRequest* request, GetTypeVersionResponse* response) {
+grpc::Status TypeRegistryServiceImpl::GetTypeVersion(grpc::ServerContext* /*context*/, const GetTypeVersionRequest* request, GetTypeVersionResponse* response) {
   auto result = registry_->GetTypeVersion(request->version_id());
   if (!result.ok()) {
     return AbslToGrpcStatus(result.status());
@@ -58,7 +58,7 @@ grpc::Status TypeRegistryServiceImpl::GetTypeVersion(grpc::ServerContext* contex
   return grpc::Status::OK;
 }
 
-grpc::Status TypeRegistryServiceImpl::ListTypeVersions(grpc::ServerContext* context, const ListTypeVersionsRequest* request,
+grpc::Status TypeRegistryServiceImpl::ListTypeVersions(grpc::ServerContext* /*context*/, const ListTypeVersionsRequest* request,
                                                        ListTypeVersionsResponse* response) {
   auto result = registry_->ListTypeVersions(request->type_name());
   if (!result.ok()) {
@@ -72,18 +72,12 @@ grpc::Status TypeRegistryServiceImpl::ListTypeVersions(grpc::ServerContext* cont
   return grpc::Status::OK;
 }
 
-grpc::Status TypeRegistryServiceImpl::GetIndexSchema(grpc::ServerContext* context, const GetIndexSchemaRequest* request, GetIndexSchemaResponse* response) {
+grpc::Status TypeRegistryServiceImpl::GetIndexSchema(grpc::ServerContext* /*context*/, const GetIndexSchemaRequest* request, GetIndexSchemaResponse* response) {
   auto result = registry_->GetIndexSchema(request->key_type());
   if (!result.ok()) {
-    if (absl::IsNotFound(result.status())) {
-      FetchIndexError error_detail;
-      error_detail.set_category(FetchIndexError::INDEX_NOT_FOUND);
-      error_detail.set_description(std::string(result.status().message()));
-      error_detail.set_key_type(request->key_type());
-
-      auto status_with_detail = MakeStatusWithDetail(absl::StatusCode::kNotFound, std::string(result.status().message()), error_detail);
-      return AbslToGrpcStatus(status_with_detail);
-    }
+    if (absl::IsNotFound(result.status()))
+      return AbslToGrpcStatus(
+          MakeFetchIndexError(absl::StatusCode::kNotFound, result.status().message(), FetchIndexError::INDEX_NOT_FOUND, request->key_type()));
     return AbslToGrpcStatus(result.status());
   }
 

@@ -29,7 +29,6 @@ int main() {
   std::signal(SIGINT, SignalHandler);
   std::signal(SIGTERM, SignalHandler);
 
-  // Start server in a background thread so we can poll for shutdown.
   std::thread server_thread([&server] { server.Start(); });
 
   while (!g_shutdown_requested.load(std::memory_order_relaxed)) {

@@ -5,26 +5,27 @@
 #include "service/grpc_error_util.h"
 
 namespace artifact_system::service {
+namespace {
+
+template <typename Request> std::optional<std::string> OptionalTransactionId(const Request& request) {
+  return request.has_transaction_id() ? std::optional(request.transaction_id()) : std::nullopt;
+}
+
+} // namespace
 
 ArtifactServiceImpl::ArtifactServiceImpl(artifact::ArtifactStore* store) : store_(store) {
 }
 
 grpc::Status ArtifactServiceImpl::CreateArtifact(grpc::ServerContext* /*context*/, const CreateArtifactRequest* request, CreateArtifactResponse* response) {
-  std::optional<std::string> transaction_id;
-  if (request->has_transaction_id()) {
-    transaction_id = request->transaction_id();
-  }
-
   absl::StatusOr<artifact::CreateResult> result;
   try {
-    result = store_->CreateArtifact(request->version_id(), request->payload(), transaction_id);
+    result = store_->CreateArtifact(request->version_id(), request->payload(), OptionalTransactionId(*request));
   } catch (const std::runtime_error& e) {
     return grpc::Status(grpc::StatusCode::UNAVAILABLE, e.what());
   }
 
-  if (!result.ok()) {
+  if (!result.ok())
     return AbslToGrpcStatus(result.status());
-  }
 
   response->set_artifact_id(result->artifact_id);
   response->set_snapshot_id(result->snapshot_id);
@@ -33,10 +34,8 @@ grpc::Status ArtifactServiceImpl::CreateArtifact(grpc::ServerContext* /*context*
 
 grpc::Status ArtifactServiceImpl::GetArtifact(grpc::ServerContext* /*context*/, const GetArtifactRequest* request, GetArtifactResponse* response) {
   auto result = store_->GetArtifact(request->artifact_id(), request->context());
-
-  if (!result.ok()) {
+  if (!result.ok())
     return AbslToGrpcStatus(result.status());
-  }
 
   response->set_artifact_id(result->artifact_id);
   response->set_type_name(result->type_name);
@@ -48,12 +47,9 @@ grpc::Status ArtifactServiceImpl::GetArtifact(grpc::ServerContext* /*context*/, 
 grpc::Status ArtifactServiceImpl::BatchGetArtifacts(grpc::ServerContext* /*context*/, const BatchGetArtifactsRequest* request,
                                                     BatchGetArtifactsResponse* response) {
   std::vector<uint64_t> artifact_ids(request->artifact_ids().begin(), request->artifact_ids().end());
-
   auto result = store_->BatchGetArtifacts(artifact_ids, request->context());
-
-  if (!result.ok()) {
+  if (!result.ok())
     return AbslToGrpcStatus(result.status());
-  }
 
   for (const auto& entry : *result) {
     auto* artifact_result = response->add_results();
@@ -67,37 +63,22 @@ grpc::Status ArtifactServiceImpl::BatchGetArtifacts(grpc::ServerContext* /*conte
       *artifact_result->mutable_not_found() = *not_found;
     }
   }
-
   return grpc::Status::OK;
 }
 
 grpc::Status ArtifactServiceImpl::UpdateArtifact(grpc::ServerContext* /*context*/, const UpdateArtifactRequest* request, UpdateArtifactResponse* response) {
-  std::optional<std::string> transaction_id;
-  if (request->has_transaction_id()) {
-    transaction_id = request->transaction_id();
-  }
-
-  auto result = store_->UpdateArtifact(request->artifact_id(), request->version_id(), request->payload(), transaction_id);
-
-  if (!result.ok()) {
+  auto result = store_->UpdateArtifact(request->artifact_id(), request->version_id(), request->payload(), OptionalTransactionId(*request));
+  if (!result.ok())
     return AbslToGrpcStatus(result.status());
-  }
 
   response->set_snapshot_id(result->snapshot_id);
   return grpc::Status::OK;
 }
 
 grpc::Status ArtifactServiceImpl::DeleteArtifact(grpc::ServerContext* /*context*/, const DeleteArtifactRequest* request, DeleteArtifactResponse* response) {
-  std::optional<std::string> transaction_id;
-  if (request->has_transaction_id()) {
-    transaction_id = request->transaction_id();
-  }
-
-  auto result = store_->DeleteArtifact(request->artifact_id(), transaction_id);
-
-  if (!result.ok()) {
+  auto result = store_->DeleteArtifact(request->artifact_id(), OptionalTransactionId(*request));
+  if (!result.ok())
     return AbslToGrpcStatus(result.status());
-  }
 
   response->set_snapshot_id(result->snapshot_id);
   return grpc::Status::OK;
