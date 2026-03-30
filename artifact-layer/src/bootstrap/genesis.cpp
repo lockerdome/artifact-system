@@ -203,14 +203,14 @@ absl::StatusOr<GenesisResult> RunGenesis(StorageInterface* storage) {
   std::vector<StagedArtifact> staged;
 
   // Helper to stage a TypeDefinition artifact.
-  auto stage_type_def = [&](uint64_t artifact_id, uint64_t version_id, const google::protobuf::Descriptor* type_desc, bool deny_create, bool deny_update,
-                            bool deny_delete) -> absl::Status {
+  // All built-in types deny direct CRUD — they are managed exclusively by the registry.
+  auto stage_type_def = [&](uint64_t artifact_id, uint64_t version_id, const google::protobuf::Descriptor* type_desc) -> absl::Status {
     TypeDefinition td;
     td.set_type_name(type_desc->full_name());
     td.set_current_version_id(version_id);
-    td.set_deny_create(deny_create);
-    td.set_deny_update(deny_update);
-    td.set_deny_delete(deny_delete);
+    td.set_deny_create(true);
+    td.set_deny_update(true);
+    td.set_deny_delete(true);
 
     std::string payload = td.SerializeAsString();
     auto status = WriteStoredArtifact(storage, branch, artifact_id, GenesisIds::kTypeDefinitionTypeVersionDef, td_desc->full_name(), payload);
@@ -261,73 +261,47 @@ absl::StatusOr<GenesisResult> RunGenesis(StorageInterface* storage) {
     return absl::OkStatus();
   };
 
-  // ── 1. IndexDefinition type ──
-  auto status = stage_type_def(GenesisIds::kIndexDefinitionTypeDef, GenesisIds::kIndexDefinitionTypeVersionDef, idx_desc, true, true, true);
-  if (!status.ok())
-    return status;
+  // ── 1-9. Stage all four built-in types in dependency order ──
+  struct BuiltInType {
+    uint64_t type_def_id;
+    uint64_t type_version_def_id;
+    const google::protobuf::Descriptor* descriptor;
+    std::unordered_map<std::string, uint64_t> index_ids;
+  };
 
-  status = stage_type_version_def(GenesisIds::kIndexDefinitionTypeVersionDef, GenesisIds::kIndexDefinitionTypeDef, idx_desc);
-  if (!status.ok())
-    return status;
+  const BuiltInType built_in_types[] = {
+      {GenesisIds::kIndexDefinitionTypeDef,
+       GenesisIds::kIndexDefinitionTypeVersionDef,
+       idx_desc,
+       {{"index_key_type_unique", GenesisIds::kIndexKeyTypeUnique}, {"all_index_definitions", GenesisIds::kAllIndexDefinitions}}},
+      {GenesisIds::kTypeDefinitionTypeDef,
+       GenesisIds::kTypeDefinitionTypeVersionDef,
+       td_desc,
+       {{"type_name_unique", GenesisIds::kTypeNameUnique}, {"all_types", GenesisIds::kAllTypes}}},
+      {GenesisIds::kTypeVersionDefinitionTypeDef,
+       GenesisIds::kTypeVersionDefinitionTypeVersionDef,
+       tvd_desc,
+       {{"type_versions_by_type", GenesisIds::kTypeVersionsByType}}},
+      {GenesisIds::kReferenceDefinitionTypeDef,
+       GenesisIds::kReferenceDefinitionTypeVersionDef,
+       rd_desc,
+       {{"reference_key_type_unique", GenesisIds::kReferenceKeyTypeUnique},
+        {"references_by_target_type", GenesisIds::kReferencesByTargetType},
+        {"all_reference_definitions", GenesisIds::kAllReferenceDefinitions}}},
+  };
 
-  // ── 2-3. IndexDefinition indexes ──
-  status = stage_index_defs(idx_desc, {
-                                          {"index_key_type_unique", GenesisIds::kIndexKeyTypeUnique},
-                                          {"all_index_definitions", GenesisIds::kAllIndexDefinitions},
-                                      });
-  if (!status.ok())
-    return status;
-
-  // ── 4. TypeDefinition type ──
-  status = stage_type_def(GenesisIds::kTypeDefinitionTypeDef, GenesisIds::kTypeDefinitionTypeVersionDef, td_desc, true, true, true);
-  if (!status.ok())
-    return status;
-
-  status = stage_type_version_def(GenesisIds::kTypeDefinitionTypeVersionDef, GenesisIds::kTypeDefinitionTypeDef, td_desc);
-  if (!status.ok())
-    return status;
-
-  // ── 5. TypeDefinition indexes ──
-  status = stage_index_defs(td_desc, {
-                                         {"type_name_unique", GenesisIds::kTypeNameUnique},
-                                         {"all_types", GenesisIds::kAllTypes},
-                                     });
-  if (!status.ok())
-    return status;
-
-  // ── 6. TypeVersionDefinition type ──
-  status = stage_type_def(GenesisIds::kTypeVersionDefinitionTypeDef, GenesisIds::kTypeVersionDefinitionTypeVersionDef, tvd_desc, true, true, true);
-  if (!status.ok())
-    return status;
-
-  status = stage_type_version_def(GenesisIds::kTypeVersionDefinitionTypeVersionDef, GenesisIds::kTypeVersionDefinitionTypeDef, tvd_desc);
-  if (!status.ok())
-    return status;
-
-  // ── 7. TypeVersionDefinition indexes ──
-  status = stage_index_defs(tvd_desc, {
-                                          {"type_versions_by_type", GenesisIds::kTypeVersionsByType},
-                                      });
-  if (!status.ok())
-    return status;
-
-  // ── 8. ReferenceDefinition type ──
-  status = stage_type_def(GenesisIds::kReferenceDefinitionTypeDef, GenesisIds::kReferenceDefinitionTypeVersionDef, rd_desc, true, true, true);
-  if (!status.ok())
-    return status;
-
-  status = stage_type_version_def(GenesisIds::kReferenceDefinitionTypeVersionDef, GenesisIds::kReferenceDefinitionTypeDef, rd_desc);
-  if (!status.ok())
-    return status;
-
-  // ── 9. ReferenceDefinition indexes ──
-  status = stage_index_defs(rd_desc, {
-                                         {"reference_key_type_unique", GenesisIds::kReferenceKeyTypeUnique},
-                                         {"references_by_target_type", GenesisIds::kReferencesByTargetType},
-                                         {"all_reference_definitions", GenesisIds::kAllReferenceDefinitions},
-                                     });
-  if (!status.ok())
-    return status;
+  absl::Status status;
+  for (const auto& bt : built_in_types) {
+    status = stage_type_def(bt.type_def_id, bt.type_version_def_id, bt.descriptor);
+    if (!status.ok())
+      return status;
+    status = stage_type_version_def(bt.type_version_def_id, bt.type_def_id, bt.descriptor);
+    if (!status.ok())
+      return status;
+    status = stage_index_defs(bt.descriptor, bt.index_ids);
+    if (!status.ok())
+      return status;
+  }
 
   // ── 10. Built-in ReferenceDefinition: TypeVersionDefinition.type_id -> TypeDefinition ──
   {

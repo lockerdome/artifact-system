@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -46,24 +47,16 @@ StoredArtifact ReadArtifact(MemoryStorage& storage, uint64_t id) {
   return envelope;
 }
 
-std::vector<uint8_t> EncodeStringKey(const google::protobuf::Descriptor& desc, const std::string& field_name, const std::string& value) {
+template <typename T> std::vector<uint8_t> EncodeKey(const google::protobuf::Descriptor& desc, const std::string& field_name, const T& value) {
   google::protobuf::DynamicMessageFactory factory;
   const auto* prototype = factory.GetPrototype(&desc);
   std::unique_ptr<google::protobuf::Message> msg(prototype->New());
   const auto* field = desc.FindFieldByName(field_name);
-  msg->GetReflection()->SetString(msg.get(), field, value);
-  std::vector<std::string> key_fields = {field_name};
-  auto encoded = encoding::EncodeKey(desc, *msg, key_fields);
-  EXPECT_TRUE(encoded.ok()) << encoded.status();
-  return *encoded;
-}
-
-std::vector<uint8_t> EncodeUint64Key(const google::protobuf::Descriptor& desc, const std::string& field_name, uint64_t value) {
-  google::protobuf::DynamicMessageFactory factory;
-  const auto* prototype = factory.GetPrototype(&desc);
-  std::unique_ptr<google::protobuf::Message> msg(prototype->New());
-  const auto* field = desc.FindFieldByName(field_name);
-  msg->GetReflection()->SetUInt64(msg.get(), field, value);
+  if constexpr (std::is_convertible_v<T, std::string>) {
+    msg->GetReflection()->SetString(msg.get(), field, std::string(value));
+  } else if constexpr (std::is_same_v<T, uint64_t>) {
+    msg->GetReflection()->SetUInt64(msg.get(), field, value);
+  }
   std::vector<std::string> key_fields = {field_name};
   auto encoded = encoding::EncodeKey(desc, *msg, key_fields);
   EXPECT_TRUE(encoded.ok()) << encoded.status();
@@ -228,15 +221,17 @@ TEST_F(GenesisTest, ReferenceDefinitionArtifactIsCorrect) {
 
 TEST_F(GenesisTest, IndexDefIdsMapIsCorrect) {
   const auto& m = genesis_result_.index_def_ids_by_key_type;
-  EXPECT_EQ(m.size(), 8);
-  EXPECT_EQ(m.at("index_key_type_unique"), GenesisIds::kIndexKeyTypeUnique);
-  EXPECT_EQ(m.at("all_index_definitions"), GenesisIds::kAllIndexDefinitions);
-  EXPECT_EQ(m.at("type_name_unique"), GenesisIds::kTypeNameUnique);
-  EXPECT_EQ(m.at("all_types"), GenesisIds::kAllTypes);
-  EXPECT_EQ(m.at("type_versions_by_type"), GenesisIds::kTypeVersionsByType);
-  EXPECT_EQ(m.at("reference_key_type_unique"), GenesisIds::kReferenceKeyTypeUnique);
-  EXPECT_EQ(m.at("references_by_target_type"), GenesisIds::kReferencesByTargetType);
-  EXPECT_EQ(m.at("all_reference_definitions"), GenesisIds::kAllReferenceDefinitions);
+  const std::unordered_map<std::string, uint64_t> expected = {
+      {"index_key_type_unique", GenesisIds::kIndexKeyTypeUnique},
+      {"all_index_definitions", GenesisIds::kAllIndexDefinitions},
+      {"type_name_unique", GenesisIds::kTypeNameUnique},
+      {"all_types", GenesisIds::kAllTypes},
+      {"type_versions_by_type", GenesisIds::kTypeVersionsByType},
+      {"reference_key_type_unique", GenesisIds::kReferenceKeyTypeUnique},
+      {"references_by_target_type", GenesisIds::kReferencesByTargetType},
+      {"all_reference_definitions", GenesisIds::kAllReferenceDefinitions},
+  };
+  EXPECT_EQ(m, expected);
 }
 
 TEST_F(GenesisTest, GenesisIsIdempotent) {
@@ -273,7 +268,7 @@ TEST_F(GenesisTest, AllBootstrapIndexesAreQueryable) {
     };
     for (const auto& c : cases) {
       SCOPED_TRACE(c.name);
-      auto key = EncodeStringKey(*td_desc, "type_name", c.name);
+      auto key = EncodeKey(*td_desc, "type_name", c.name);
       auto obj = ReadIndexObject(storage_, GenesisIds::kTypeNameUnique, key, idx_def, *td_desc);
       ASSERT_EQ(obj.rows.size(), 1);
       EXPECT_EQ(obj.rows[0].artifact_id, c.expected_id);
@@ -329,7 +324,7 @@ TEST_F(GenesisTest, AllBootstrapIndexesAreQueryable) {
     };
     for (const auto& c : cases) {
       SCOPED_TRACE(c.key_type);
-      auto key = EncodeStringKey(*idx_desc, "key_type", c.key_type);
+      auto key = EncodeKey(*idx_desc, "key_type", c.key_type);
       auto obj = ReadIndexObject(storage_, GenesisIds::kIndexKeyTypeUnique, key, idx_def, *idx_desc);
       ASSERT_EQ(obj.rows.size(), 1);
       EXPECT_EQ(obj.rows[0].artifact_id, c.expected_id);
@@ -351,7 +346,7 @@ TEST_F(GenesisTest, AllBootstrapIndexesAreQueryable) {
     };
     for (const auto& c : cases) {
       SCOPED_TRACE(c.type_id);
-      auto key = EncodeUint64Key(*tvd_desc, "type_id", c.type_id);
+      auto key = EncodeKey(*tvd_desc, "type_id", c.type_id);
       auto obj = ReadIndexObject(storage_, GenesisIds::kTypeVersionsByType, key, idx_def, *tvd_desc);
       ASSERT_EQ(obj.rows.size(), 1);
       EXPECT_EQ(obj.rows[0].artifact_id, c.expected_tvd_id);
@@ -361,7 +356,7 @@ TEST_F(GenesisTest, AllBootstrapIndexesAreQueryable) {
   // reference_key_type_unique: the one reference key_type
   {
     auto idx_def = FindIndexDef(*rd_desc, "reference_key_type_unique");
-    auto key = EncodeStringKey(*rd_desc, "key_type", "artifact_system.TypeVersionDefinition.type_id");
+    auto key = EncodeKey(*rd_desc, "key_type", "artifact_system.TypeVersionDefinition.type_id");
     auto obj = ReadIndexObject(storage_, GenesisIds::kReferenceKeyTypeUnique, key, idx_def, *rd_desc);
     ASSERT_EQ(obj.rows.size(), 1);
     EXPECT_EQ(obj.rows[0].artifact_id, GenesisIds::kRefTypeVersionDefTypeId);
@@ -370,7 +365,7 @@ TEST_F(GenesisTest, AllBootstrapIndexesAreQueryable) {
   // references_by_target_type: look up TypeDefinition
   {
     auto idx_def = FindIndexDef(*rd_desc, "references_by_target_type");
-    auto key = EncodeStringKey(*rd_desc, "target_type_name", "artifact_system.TypeDefinition");
+    auto key = EncodeKey(*rd_desc, "target_type_name", "artifact_system.TypeDefinition");
     auto obj = ReadIndexObject(storage_, GenesisIds::kReferencesByTargetType, key, idx_def, *rd_desc);
     auto ids = CollectArtifactIds(obj);
     EXPECT_TRUE(ids.count(GenesisIds::kRefTypeVersionDefTypeId));
