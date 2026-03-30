@@ -470,6 +470,7 @@ absl::StatusOr<std::vector<DerivedIndexEntry>> DeriveIndexEntries(const google::
       entry.key_type = index_definition.key_type();
       entry.encoded_key = std::move(encoded_key);
       entry.order_values = std::move(order_values_or->value());
+      entry.key_values = key_selection.ordered_values;
       out.push_back(std::move(entry));
     }
   }

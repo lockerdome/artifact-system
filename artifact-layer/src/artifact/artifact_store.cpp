@@ -86,6 +86,45 @@ std::optional<IndexDefinition> FindIndexDefinition(const google::protobuf::Descr
   return std::nullopt;
 }
 
+// Build a proto-serialized key message from raw key values and a generated index schema.
+absl::StatusOr<std::string> BuildProtoSerializedKey(const index::GeneratedIndexSchema& schema, const std::vector<index::IndexCell>& key_values) {
+  if (key_values.empty())
+    return std::string{};
+
+  google::protobuf::DynamicMessageFactory factory;
+  const auto* prototype = factory.GetPrototype(schema.key_descriptor);
+  std::unique_ptr<google::protobuf::Message> key_msg(prototype->New());
+  const auto* reflection = key_msg->GetReflection();
+
+  for (int i = 0; i < static_cast<int>(key_values.size()); ++i) {
+    const auto* field = schema.key_descriptor->FindFieldByNumber(i + 1);
+    if (field == nullptr)
+      return absl::InternalError("generated key schema missing field");
+
+    const auto& cell = key_values[static_cast<size_t>(i)];
+    if (std::holds_alternative<std::string>(cell)) {
+      reflection->SetString(key_msg.get(), field, std::get<std::string>(cell));
+    } else if (std::holds_alternative<uint64_t>(cell)) {
+      reflection->SetUInt64(key_msg.get(), field, std::get<uint64_t>(cell));
+    } else if (std::holds_alternative<int64_t>(cell)) {
+      reflection->SetInt64(key_msg.get(), field, std::get<int64_t>(cell));
+    } else if (std::holds_alternative<uint32_t>(cell)) {
+      reflection->SetUInt32(key_msg.get(), field, std::get<uint32_t>(cell));
+    } else if (std::holds_alternative<int32_t>(cell)) {
+      reflection->SetInt32(key_msg.get(), field, std::get<int32_t>(cell));
+    } else if (std::holds_alternative<bool>(cell)) {
+      reflection->SetBool(key_msg.get(), field, std::get<bool>(cell));
+    } else if (std::holds_alternative<float>(cell)) {
+      reflection->SetFloat(key_msg.get(), field, std::get<float>(cell));
+    } else if (std::holds_alternative<double>(cell)) {
+      reflection->SetDouble(key_msg.get(), field, std::get<double>(cell));
+    } else {
+      return absl::InternalError("unsupported key cell type for proto serialization");
+    }
+  }
+  return key_msg->SerializeAsString();
+}
+
 // Add an index row for a derived entry. Reads the existing index object (if any),
 // appends the row, and writes back.
 absl::Status AddIndexRow(StorageInterface* storage, const std::string& branch, const index::DerivedIndexEntry& entry, uint64_t artifact_id,
@@ -96,8 +135,13 @@ absl::Status AddIndexRow(StorageInterface* storage, const std::string& branch, c
   if (!schema_or.ok())
     return schema_or.status();
 
+  // Build the proto-serialized key for the IndexObject.
+  auto proto_key_or = BuildProtoSerializedKey(*schema_or, entry.key_values);
+  if (!proto_key_or.ok())
+    return proto_key_or.status();
+
   index::IndexObject index_obj;
-  index_obj.serialized_key = std::string(entry.encoded_key.begin(), entry.encoded_key.end());
+  index_obj.serialized_key = *proto_key_or;
 
   auto existing_or = storage->GetObject(branch, index_path);
   if (existing_or.ok()) {
@@ -582,10 +626,12 @@ absl::StatusOr<CreateResult> ArtifactStore::CreateArtifact(uint64_t version_id, 
 
   // Run referential integrity validation (phase 6) — runs independently
   // of phase 5 (NaN/varint). Both phases' violations are collected.
-  auto ref_violations_or = RunRefIntegrityValidation(storage_, read_ref, resolved, payload);
-  if (!ref_violations_or.ok())
-    return ref_violations_or.status();
-  val_result.violations.insert(val_result.violations.end(), ref_violations_or->begin(), ref_violations_or->end());
+  if (!options_.bypass_referential_integrity) {
+    auto ref_violations_or = RunRefIntegrityValidation(storage_, read_ref, resolved, payload);
+    if (!ref_violations_or.ok())
+      return ref_violations_or.status();
+    val_result.violations.insert(val_result.violations.end(), ref_violations_or->begin(), ref_violations_or->end());
+  }
 
   if (!val_result.violations.empty())
     return MakeWriteError(val_result.violations);
@@ -634,10 +680,12 @@ absl::StatusOr<WriteResult> ArtifactStore::UpdateArtifact(uint64_t artifact_id, 
   const ResolvedType& resolved = *val_result.resolved_type;
 
   // Referential integrity validation (phase 6) — independent of phase 5.
-  auto ref_violations_or = RunRefIntegrityValidation(storage_, read_ref, resolved, payload);
-  if (!ref_violations_or.ok())
-    return ref_violations_or.status();
-  val_result.violations.insert(val_result.violations.end(), ref_violations_or->begin(), ref_violations_or->end());
+  if (!options_.bypass_referential_integrity) {
+    auto ref_violations_or = RunRefIntegrityValidation(storage_, read_ref, resolved, payload);
+    if (!ref_violations_or.ok())
+      return ref_violations_or.status();
+    val_result.violations.insert(val_result.violations.end(), ref_violations_or->begin(), ref_violations_or->end());
+  }
 
   if (!val_result.violations.empty())
     return MakeWriteError(val_result.violations);
