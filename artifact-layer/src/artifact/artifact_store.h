@@ -23,13 +23,13 @@ namespace artifact_system::artifact {
 
 // Result of a successful write operation (Create/Update/Delete).
 struct WriteResult {
-  uint64_t snapshot_id = 0;
+  std::string snapshot_id;
 };
 
 // Result of a successful CreateArtifact.
 struct CreateResult {
   uint64_t artifact_id = 0;
-  uint64_t snapshot_id = 0;
+  std::string snapshot_id;
 };
 
 // Result of GetArtifact.
@@ -68,14 +68,15 @@ public:
   // CreateArtifact: allocate ID, validate, derive indexes, stage writes.
   // If transaction_id is set, writes into that transaction.
   // Otherwise, wraps in an implicit transaction.
-  absl::StatusOr<CreateResult> CreateArtifact(uint64_t version_id, const std::string& payload, std::optional<uint64_t> transaction_id = std::nullopt);
+  absl::StatusOr<CreateResult> CreateArtifact(uint64_t version_id, const std::string& payload,
+                                              const std::optional<std::string>& transaction_id = std::nullopt);
 
   // UpdateArtifact: validate type match, revalidate payload, compute index diff.
   absl::StatusOr<WriteResult> UpdateArtifact(uint64_t artifact_id, uint64_t version_id, const std::string& payload,
-                                             std::optional<uint64_t> transaction_id = std::nullopt);
+                                             const std::optional<std::string>& transaction_id = std::nullopt);
 
   // DeleteArtifact: write tombstone, remove indexes, enforce referential integrity.
-  absl::StatusOr<WriteResult> DeleteArtifact(uint64_t artifact_id, std::optional<uint64_t> transaction_id = std::nullopt);
+  absl::StatusOr<WriteResult> DeleteArtifact(uint64_t artifact_id, const std::optional<std::string>& transaction_id = std::nullopt);
 
   // ── Read operations ───────────────────────────────────────────────────────
 
@@ -90,12 +91,12 @@ private:
   absl::StatusOr<std::string> ResolveReadRef(const ReadContext& context);
 
   // Resolve a transaction_id to its branch name, or get canonical branch.
-  absl::StatusOr<std::string> ResolveWriteBranch(std::optional<uint64_t> transaction_id);
+  absl::StatusOr<std::string> ResolveWriteBranch(const std::optional<std::string>& transaction_id);
 
   // Execute a write operation within an explicit or implicit transaction.
   // The callback receives the branch name and should stage all writes.
   using WriteFn = std::function<absl::Status(const std::string& branch)>;
-  absl::StatusOr<uint64_t> ExecuteWrite(std::optional<uint64_t> transaction_id, const WriteFn& write_fn);
+  absl::StatusOr<std::string> ExecuteWrite(const std::optional<std::string>& transaction_id, const WriteFn& write_fn);
 
   // Stage artifact + index writes for a create operation.
   absl::Status StageCreate(const std::string& branch, uint64_t artifact_id, uint64_t version_id, const std::string& type_name, const std::string& payload,

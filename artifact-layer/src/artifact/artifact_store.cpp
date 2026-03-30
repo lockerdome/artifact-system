@@ -189,16 +189,18 @@ ArtifactStore::ArtifactStore(StorageInterface* storage, transaction::Transaction
 
 absl::StatusOr<std::string> ArtifactStore::ResolveReadRef(const ReadContext& context) {
   if (context.has_snapshot_id()) {
+    // The snapshot_id IS the commit hash — validate it's known, then return directly.
     auto meta_or = transaction_manager_->GetSnapshotMetadata(context.snapshot_id());
     if (!meta_or.ok())
       return meta_or.status();
-    return meta_or->commit_id;
+    return context.snapshot_id();
   }
   if (context.has_transaction_id()) {
+    // The transaction_id IS the branch name — validate it's known, then return directly.
     auto meta_or = transaction_manager_->GetTransactionMetadata(context.transaction_id());
     if (!meta_or.ok())
       return meta_or.status();
-    return meta_or->branch_name;
+    return context.transaction_id();
   }
   // No context: read from canonical branch head.
   return std::string(storage_->GetCanonicalBranch());
@@ -271,25 +273,27 @@ absl::StatusOr<std::vector<BatchGetEntry>> ArtifactStore::BatchGetArtifacts(cons
 
 // ── Write infrastructure ────────────────────────────────────────────────────
 
-absl::StatusOr<std::string> ArtifactStore::ResolveWriteBranch(std::optional<uint64_t> transaction_id) {
+absl::StatusOr<std::string> ArtifactStore::ResolveWriteBranch(const std::optional<std::string>& transaction_id) {
   if (transaction_id.has_value()) {
+    // The transaction_id IS the branch name — validate it's known, then return directly.
     auto meta_or = transaction_manager_->GetTransactionMetadata(*transaction_id);
     if (!meta_or.ok())
       return meta_or.status();
-    return meta_or->branch_name;
+    return *transaction_id;
   }
   return std::string(storage_->GetCanonicalBranch());
 }
 
-absl::StatusOr<uint64_t> ArtifactStore::ExecuteWrite(std::optional<uint64_t> transaction_id, const WriteFn& write_fn) {
+absl::StatusOr<std::string> ArtifactStore::ExecuteWrite(const std::optional<std::string>& transaction_id, const WriteFn& write_fn) {
   if (transaction_id.has_value()) {
     // Explicit transaction: use WriteExecutor against the transaction branch.
+    // The transaction_id IS the branch name.
     auto meta_or = transaction_manager_->GetTransactionMetadata(*transaction_id);
     if (!meta_or.ok())
       return meta_or.status();
 
     transaction::WriteExecutor executor(storage_);
-    auto result_or = executor.ExecuteWrite(meta_or->branch_name, [&write_fn](const std::string& child_branch) { return write_fn(child_branch); });
+    auto result_or = executor.ExecuteWrite(*transaction_id, [&write_fn](const std::string& child_branch) { return write_fn(child_branch); });
     if (!result_or.ok())
       return result_or.status();
 
@@ -307,12 +311,9 @@ absl::StatusOr<uint64_t> ArtifactStore::ExecuteWrite(std::optional<uint64_t> tra
   }
 
   // Implicit transaction: use RunImplicitTransaction.
-  uint64_t snapshot_id = 0;
-  auto commit_result_or = transaction_manager_->RunImplicitTransaction([&](uint64_t txn_id) -> absl::Status {
-    auto txn_meta_or = transaction_manager_->GetTransactionMetadata(txn_id);
-    if (!txn_meta_or.ok())
-      return txn_meta_or.status();
-    return write_fn(txn_meta_or->branch_name);
+  auto commit_result_or = transaction_manager_->RunImplicitTransaction([&](const std::string& txn_id) -> absl::Status {
+    // The txn_id IS the branch name — use it directly.
+    return write_fn(txn_id);
   });
   if (!commit_result_or.ok())
     return commit_result_or.status();
@@ -324,14 +325,7 @@ absl::StatusOr<uint64_t> ArtifactStore::ExecuteWrite(std::optional<uint64_t> tra
   }
 
   auto& success = std::get<transaction::TransactionManager::CommitSuccess>(commit_result);
-  if (success.snapshot_id.has_value()) {
-    return *success.snapshot_id;
-  }
-  // Create a snapshot from the commit.
-  auto snap_or = transaction_manager_->CreateSnapshot();
-  if (!snap_or.ok())
-    return snap_or.status();
-  return *snap_or;
+  return success.snapshot_id;
 }
 
 // ── Staging operations ──────────────────────────────────────────────────────
@@ -562,7 +556,7 @@ absl::Status ArtifactStore::ApplySetNullEffect(const std::string& branch, const 
 
 // ── CRUD operations ─────────────────────────────────────────────────────────
 
-absl::StatusOr<CreateResult> ArtifactStore::CreateArtifact(uint64_t version_id, const std::string& payload, std::optional<uint64_t> transaction_id) {
+absl::StatusOr<CreateResult> ArtifactStore::CreateArtifact(uint64_t version_id, const std::string& payload, const std::optional<std::string>& transaction_id) {
   // Allocate ID first (before validation, as per PRD flow).
   const uint64_t artifact_id = id_allocator_->AllocateId();
 
@@ -607,7 +601,7 @@ absl::StatusOr<CreateResult> ArtifactStore::CreateArtifact(uint64_t version_id, 
 }
 
 absl::StatusOr<WriteResult> ArtifactStore::UpdateArtifact(uint64_t artifact_id, uint64_t version_id, const std::string& payload,
-                                                          std::optional<uint64_t> transaction_id) {
+                                                          const std::optional<std::string>& transaction_id) {
   auto branch_or = ResolveWriteBranch(transaction_id);
   if (!branch_or.ok())
     return branch_or.status();
@@ -657,7 +651,7 @@ absl::StatusOr<WriteResult> ArtifactStore::UpdateArtifact(uint64_t artifact_id, 
   return WriteResult{*snapshot_or};
 }
 
-absl::StatusOr<WriteResult> ArtifactStore::DeleteArtifact(uint64_t artifact_id, std::optional<uint64_t> transaction_id) {
+absl::StatusOr<WriteResult> ArtifactStore::DeleteArtifact(uint64_t artifact_id, const std::optional<std::string>& transaction_id) {
   auto branch_or = ResolveWriteBranch(transaction_id);
   if (!branch_or.ok())
     return branch_or.status();

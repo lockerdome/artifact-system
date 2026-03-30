@@ -1,6 +1,5 @@
 #pragma once
 
-#include <cstdint>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -36,68 +35,64 @@ public:
   TransactionManager(StorageInterface* storage, Options options);
 
   struct SnapshotMetadata {
-    uint64_t snapshot_id = 0;
-    std::string commit_id;
-    std::optional<uint64_t> source_transaction_id;
+    std::string snapshot_id;
+    std::optional<std::string> source_transaction_id;
   };
 
   struct TransactionMetadata {
-    uint64_t transaction_id = 0;
-    std::string branch_name;
-    std::optional<uint64_t> parent_transaction_id;
-    std::optional<uint64_t> parent_snapshot_id;
+    std::string transaction_id;
+    std::optional<std::string> parent_transaction_id;
+    std::optional<std::string> parent_snapshot_id;
     uint32_t depth = 0;
   };
 
   struct CommitSuccess {
-    uint64_t transaction_id = 0;
+    std::string transaction_id;
     std::string commit_id;
-    std::optional<uint64_t> snapshot_id;
+    std::string snapshot_id;
   };
 
   struct CommitConflict {
-    uint64_t transaction_id = 0;
+    std::string transaction_id;
     MergeResult::Conflict conflict;
     artifact_system::CommitConflict detail;
   };
 
   using CommitResult = std::variant<CommitSuccess, CommitConflict>;
-  using ImplicitTransactionCallback = std::function<absl::Status(uint64_t)>;
+  using ImplicitTransactionCallback = std::function<absl::Status(const std::string&)>;
 
-  absl::StatusOr<uint64_t> CreateSnapshot(std::optional<uint64_t> parent_transaction_id = std::nullopt);
-  absl::StatusOr<uint64_t> CreateTransaction(std::optional<uint64_t> parent_id = std::nullopt);
-  absl::StatusOr<CommitResult> CommitTransaction(uint64_t transaction_id);
-  absl::Status RollbackTransaction(uint64_t transaction_id);
+  absl::StatusOr<std::string> CreateSnapshot(std::optional<std::string> parent_transaction_id = std::nullopt);
+  absl::StatusOr<std::string> CreateTransaction(std::optional<std::string> parent_snapshot_id = std::nullopt,
+                                                 std::optional<std::string> parent_transaction_id = std::nullopt);
+  absl::StatusOr<CommitResult> CommitTransaction(const std::string& transaction_id);
+  absl::Status RollbackTransaction(const std::string& transaction_id);
 
-  absl::StatusOr<CommitResult> RunImplicitTransaction(const ImplicitTransactionCallback& callback, std::optional<uint64_t> parent_id = std::nullopt);
+  absl::StatusOr<CommitResult> RunImplicitTransaction(const ImplicitTransactionCallback& callback, std::optional<std::string> parent_id = std::nullopt);
 
-  absl::StatusOr<SnapshotMetadata> GetSnapshotMetadata(uint64_t snapshot_id) const;
-  absl::StatusOr<TransactionMetadata> GetTransactionMetadata(uint64_t transaction_id) const;
+  absl::StatusOr<SnapshotMetadata> GetSnapshotMetadata(const std::string& snapshot_id) const;
+  absl::StatusOr<TransactionMetadata> GetTransactionMetadata(const std::string& transaction_id) const;
 
 private:
-  struct SnapshotRecord {
-    std::string commit_id;
-    std::optional<uint64_t> source_transaction_id;
+  struct SnapshotSource {
+    std::optional<std::string> source_transaction_id;
   };
 
   struct TransactionRecord {
-    std::string branch_name;
-    std::optional<uint64_t> parent_transaction_id;
-    std::optional<uint64_t> parent_snapshot_id;
+    std::optional<std::string> parent_transaction_id;
+    std::optional<std::string> parent_snapshot_id;
     uint32_t depth = 0;
-    std::set<uint64_t> child_transaction_ids;
+    std::set<std::string> child_transaction_ids;
   };
 
-  uint64_t NextIdLocked();
-  absl::Status RemoveTransactionLocked(uint64_t transaction_id);
+  std::string GenerateBranchName();
+  absl::Status RemoveTransactionLocked(const std::string& transaction_id);
 
   StorageInterface* storage_;
   Options options_;
 
   mutable std::mutex mutex_;
-  uint64_t next_id_ = 1;
-  std::unordered_map<uint64_t, SnapshotRecord> snapshots_;
-  std::unordered_map<uint64_t, TransactionRecord> transactions_;
+  std::unordered_map<std::string, SnapshotSource> snapshots_;
+  std::unordered_map<std::string, TransactionRecord> transactions_;
 };
 
 } // namespace artifact_system::transaction

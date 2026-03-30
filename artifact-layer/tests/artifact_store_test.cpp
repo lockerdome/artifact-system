@@ -238,7 +238,7 @@ TEST_F(ArtifactStoreTest, CreateAndGetArtifact) {
 
   const CreateResult& created = *create_or;
   EXPECT_GE(created.artifact_id, 1000U);
-  EXPECT_GT(created.snapshot_id, 0U);
+  EXPECT_FALSE(created.snapshot_id.empty());
 
   ReadContext ctx;
   auto get_or = store_->GetArtifact(created.artifact_id, ctx);
@@ -257,7 +257,7 @@ TEST_F(ArtifactStoreTest, CreateArtifactImplicitTransaction) {
   auto create_or = store_->CreateArtifact(TestVersionId(), payload);
   ASSERT_TRUE(create_or.ok()) << create_or.status();
 
-  EXPECT_GT(create_or->snapshot_id, 0U);
+  EXPECT_FALSE(create_or->snapshot_id.empty());
 
   ReadContext ctx;
   auto get_or = store_->GetArtifact(create_or->artifact_id, ctx);
@@ -268,7 +268,7 @@ TEST_F(ArtifactStoreTest, CreateArtifactImplicitTransaction) {
 TEST_F(ArtifactStoreTest, CreateArtifactExplicitTransaction) {
   auto tx_id_or = transaction_manager_->CreateTransaction();
   ASSERT_TRUE(tx_id_or.ok());
-  const uint64_t tx_id = *tx_id_or;
+  const std::string& tx_id = *tx_id_or;
 
   const std::string payload = MakeSimpleTestPayload("ExplicitType");
   auto create_or = store_->CreateArtifact(TestVersionId(), payload, tx_id);
@@ -406,7 +406,7 @@ TEST_F(ArtifactStoreTest, UpdateArtifact) {
   const std::string updated_payload = MakeSimpleTestPayload("UpdatedName", "new-value");
   auto update_or = store_->UpdateArtifact(artifact_id, TestVersionId(), updated_payload);
   ASSERT_TRUE(update_or.ok()) << update_or.status();
-  EXPECT_GT(update_or->snapshot_id, 0U);
+  EXPECT_FALSE(update_or->snapshot_id.empty());
 
   ReadContext ctx;
   auto get_or = store_->GetArtifact(artifact_id, ctx);
@@ -429,7 +429,7 @@ TEST_F(ArtifactStoreTest, DeleteArtifact) {
 
   auto delete_or = store_->DeleteArtifact(artifact_id);
   ASSERT_TRUE(delete_or.ok()) << delete_or.status();
-  EXPECT_GT(delete_or->snapshot_id, 0U);
+  EXPECT_FALSE(delete_or->snapshot_id.empty());
 
   ReadContext ctx;
   auto get_or = store_->GetArtifact(artifact_id, ctx);

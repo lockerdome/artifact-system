@@ -20,10 +20,13 @@ import "artifact_options.proto";
 // ReadContext scopes reads and writes to a snapshot or transaction.
 // At most one field may be set.  If neither is set, reads use the canonical
 // branch head and writes are wrapped in an implicit transaction.
+//
+// IDs are opaque strings from the Storage Layer: snapshot_id is a commit hash,
+// transaction_id is a branch name.
 message ReadContext {
   oneof context {
-    uint64 snapshot_id = 1;
-    uint64 transaction_id = 2;
+    string snapshot_id = 1;
+    string transaction_id = 2;
   }
 }
 
@@ -40,34 +43,37 @@ service SnapshotTransactionService {
 
 message CreateSnapshotRequest {
   // Transaction ID to snapshot; omit to snapshot the canonical branch head.
-  optional uint64 parent_id = 1;
+  optional string parent_transaction_id = 1;
 }
 
 message CreateSnapshotResponse {
-  uint64 snapshot_id = 1;
+  string snapshot_id = 1;
 }
 
 message CreateTransactionRequest {
-  // Snapshot ID or transaction ID to fork from; omit to fork from canonical
+  // Fork from a snapshot or transaction; omit both to fork from canonical
   // branch head.
-  optional uint64 parent_id = 1;
+  oneof parent {
+    string parent_snapshot_id = 1;
+    string parent_transaction_id = 2;
+  }
 }
 
 message CreateTransactionResponse {
-  uint64 transaction_id = 1;
+  string transaction_id = 1;
 }
 
 message CommitTransactionRequest {
-  uint64 transaction_id = 1;
+  string transaction_id = 1;
 }
 
 message CommitTransactionResponse {
   // Snapshot of the canonical branch state after the merge.
-  uint64 snapshot_id = 1;
+  string snapshot_id = 1;
 }
 
 message RollbackTransactionRequest {
-  uint64 transaction_id = 1;
+  string transaction_id = 1;
 }
 
 message RollbackTransactionResponse {}
@@ -102,12 +108,12 @@ service ArtifactService {
 message CreateArtifactRequest {
   uint64 version_id = 1;            // TypeVersionDefinition artifact_id (required)
   bytes payload = 2;                 // serialized protobuf message for the resolved type version
-  optional uint64 transaction_id = 3; // omit for implicit transaction
+  optional string transaction_id = 3; // omit for implicit transaction
 }
 
 message CreateArtifactResponse {
   uint64 artifact_id = 1;           // allocated by the ID service
-  uint64 snapshot_id = 2;           // snapshot of the state after the write
+  string snapshot_id = 2;           // snapshot of the state after the write
 }
 
 message GetArtifactRequest {
@@ -143,20 +149,20 @@ message UpdateArtifactRequest {
   uint64 artifact_id = 1;
   uint64 version_id = 2;            // TypeVersionDefinition artifact_id (required)
   bytes payload = 3;                 // serialized protobuf message for the resolved type version
-  optional uint64 transaction_id = 4; // omit for implicit transaction
+  optional string transaction_id = 4; // omit for implicit transaction
 }
 
 message UpdateArtifactResponse {
-  uint64 snapshot_id = 1;           // snapshot of the state after the write
+  string snapshot_id = 1;           // snapshot of the state after the write
 }
 
 message DeleteArtifactRequest {
   uint64 artifact_id = 1;
-  optional uint64 transaction_id = 2; // omit for implicit transaction
+  optional string transaction_id = 2; // omit for implicit transaction
 }
 
 message DeleteArtifactResponse {
-  uint64 snapshot_id = 1;           // snapshot of the state after the write
+  string snapshot_id = 1;           // snapshot of the state after the write
 }
 
 // --- CRUD error messages ---
