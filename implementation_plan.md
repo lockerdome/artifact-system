@@ -32,7 +32,7 @@ otherwise noted.
 | P6.5 | String IDs for Snapshots & Transactions | :white_check_mark: Complete |
 | P7a | Registry Utilities (proto compiler, schema compat) | :white_check_mark: Complete |
 | P7b | Type Registry Orchestration (RegisterTypeVersion + introspection) | :white_check_mark: Complete |
-| P8 | Genesis Bootstrap | :construction: In progress |
+| P8 | Genesis Bootstrap | :white_check_mark: Complete |
 | P9 | gRPC Server & Service Implementation | :white_large_square: Not started |
 | P10 | ID Allocator Production Integration | :white_large_square: Not started |
 
