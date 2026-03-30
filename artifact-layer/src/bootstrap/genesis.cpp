@@ -262,32 +262,29 @@ absl::StatusOr<GenesisResult> RunGenesis(StorageInterface* storage) {
   };
 
   // ── 1-9. Stage all four built-in types in dependency order ──
+  // Derive each type's index_ids from its proto descriptor options rather than
+  // duplicating the key_type-to-ID mapping a second time.
+  auto index_ids_for = [&](const google::protobuf::Descriptor* desc) {
+    std::unordered_map<std::string, uint64_t> result;
+    const auto& options = desc->options();
+    for (int i = 0; i < options.ExtensionSize(artifact_system::indexes); ++i) {
+      const auto& key = options.GetExtension(artifact_system::indexes, i).key_type();
+      result[key] = index_def_ids.at(key);
+    }
+    return result;
+  };
+
   struct BuiltInType {
     uint64_t type_def_id;
     uint64_t type_version_def_id;
     const google::protobuf::Descriptor* descriptor;
-    std::unordered_map<std::string, uint64_t> index_ids;
   };
 
   const BuiltInType built_in_types[] = {
-      {GenesisIds::kIndexDefinitionTypeDef,
-       GenesisIds::kIndexDefinitionTypeVersionDef,
-       idx_desc,
-       {{"index_key_type_unique", GenesisIds::kIndexKeyTypeUnique}, {"all_index_definitions", GenesisIds::kAllIndexDefinitions}}},
-      {GenesisIds::kTypeDefinitionTypeDef,
-       GenesisIds::kTypeDefinitionTypeVersionDef,
-       td_desc,
-       {{"type_name_unique", GenesisIds::kTypeNameUnique}, {"all_types", GenesisIds::kAllTypes}}},
-      {GenesisIds::kTypeVersionDefinitionTypeDef,
-       GenesisIds::kTypeVersionDefinitionTypeVersionDef,
-       tvd_desc,
-       {{"type_versions_by_type", GenesisIds::kTypeVersionsByType}}},
-      {GenesisIds::kReferenceDefinitionTypeDef,
-       GenesisIds::kReferenceDefinitionTypeVersionDef,
-       rd_desc,
-       {{"reference_key_type_unique", GenesisIds::kReferenceKeyTypeUnique},
-        {"references_by_target_type", GenesisIds::kReferencesByTargetType},
-        {"all_reference_definitions", GenesisIds::kAllReferenceDefinitions}}},
+      {GenesisIds::kIndexDefinitionTypeDef, GenesisIds::kIndexDefinitionTypeVersionDef, idx_desc},
+      {GenesisIds::kTypeDefinitionTypeDef, GenesisIds::kTypeDefinitionTypeVersionDef, td_desc},
+      {GenesisIds::kTypeVersionDefinitionTypeDef, GenesisIds::kTypeVersionDefinitionTypeVersionDef, tvd_desc},
+      {GenesisIds::kReferenceDefinitionTypeDef, GenesisIds::kReferenceDefinitionTypeVersionDef, rd_desc},
   };
 
   absl::Status status;
@@ -298,7 +295,7 @@ absl::StatusOr<GenesisResult> RunGenesis(StorageInterface* storage) {
     status = stage_type_version_def(bt.type_version_def_id, bt.type_def_id, bt.descriptor);
     if (!status.ok())
       return status;
-    status = stage_index_defs(bt.descriptor, bt.index_ids);
+    status = stage_index_defs(bt.descriptor, index_ids_for(bt.descriptor));
     if (!status.ok())
       return status;
   }
