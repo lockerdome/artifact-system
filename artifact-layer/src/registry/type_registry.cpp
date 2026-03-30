@@ -3,7 +3,6 @@
 #include <cstdint>
 #include <functional>
 #include <optional>
-#include <set>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -511,42 +510,6 @@ absl::StatusOr<RegisterResult> TypeRegistry::RegisterTypeVersion(const std::stri
                                                 absl::StrCat("message '", type_name, "' not found in compiled descriptor set"))});
   }
 
-  // Build the full FileDescriptorSet that includes the user's file plus
-  // system protos needed for custom extensions (artifact_options.proto, etc.).
-  // The ProtoCompiler result contains only the user file; we need system protos
-  // for index derivation and BuildPoolAndFindMessage to resolve extensions.
-  google::protobuf::FileDescriptorSet full_descriptor_set;
-  {
-    // Add system protos from generated_pool that the user's proto depends on.
-    std::set<std::string> added;
-    std::function<void(const google::protobuf::FileDescriptor*)> add_file;
-    add_file = [&](const google::protobuf::FileDescriptor* fd) {
-      if (!added.insert(std::string(fd->name())).second)
-        return;
-      for (int i = 0; i < fd->dependency_count(); ++i) {
-        add_file(fd->dependency(i));
-      }
-      fd->CopyTo(full_descriptor_set.add_file());
-    };
-
-    // Add all files from the compilation result.
-    // First, resolve dependencies from generated_pool.
-    google::protobuf::DescriptorPool temp_pool(google::protobuf::DescriptorPool::generated_pool());
-    for (const auto& file : new_descriptor_set.file()) {
-      // Add dependencies that come from generated_pool (system protos).
-      for (const auto& dep : file.dependency()) {
-        const auto* dep_fd = google::protobuf::DescriptorPool::generated_pool()->FindFileByName(dep);
-        if (dep_fd != nullptr) {
-          add_file(dep_fd);
-        }
-      }
-      // Add the user file itself.
-      if (added.insert(std::string(file.name())).second) {
-        *full_descriptor_set.add_file() = file;
-      }
-    }
-  }
-
   // Collect all non-fatal violations.
   std::vector<TypeRegistrationViolation> violations;
 
@@ -873,9 +836,9 @@ absl::StatusOr<RegisterResult> TypeRegistry::RegisterTypeVersion(const std::stri
     return absl::AbortedError("concurrent type registration conflict");
   }
 
-  // Update the index map with any new indexes.
-  for (const auto& [key_type, idx_id] : new_index_ids) {
-    index_def_ids_by_key_type_[key_type] = idx_id;
+  // Update the index map and rebuild bypass_store_ with current map.
+  if (!new_index_ids.empty()) {
+    UpdateIndexDefIds(new_index_ids);
   }
 
   return RegisterResult{new_tvd_artifact_id};
