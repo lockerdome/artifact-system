@@ -182,8 +182,13 @@ absl::StatusOr<GenesisResult> RunGenesis(StorageInterface* storage) {
   const std::string branch = storage->GetCanonicalBranch();
   const auto index_def_ids = BuildIndexDefIdsMap();
 
-  // Idempotency: if genesis already ran, return existing state.
-  auto exists_or = storage->ObjectExists(branch, encoding::ArtifactPath(GenesisIds::kIndexDefinitionTypeDef));
+  // Idempotency: check committed state (not staged) by reading from the
+  // branch head commit. This avoids false positives from a partial genesis
+  // that staged objects but crashed before committing.
+  auto head_or = storage->GetBranchHead(branch);
+  if (!head_or.ok())
+    return head_or.status();
+  auto exists_or = storage->ObjectExists(*head_or, encoding::ArtifactPath(GenesisIds::kIndexDefinitionTypeDef));
   if (!exists_or.ok())
     return exists_or.status();
   if (*exists_or) {

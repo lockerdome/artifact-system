@@ -240,9 +240,16 @@ TEST_F(GenesisTest, IndexDefIdsMapIsCorrect) {
 }
 
 TEST_F(GenesisTest, GenesisIsIdempotent) {
+  auto head_before = storage_.GetBranchHead(storage_.GetCanonicalBranch());
+  ASSERT_TRUE(head_before.ok()) << head_before.status();
+
   auto result2 = bootstrap::RunGenesis(&storage_);
   ASSERT_TRUE(result2.ok()) << result2.status();
   EXPECT_EQ(result2->index_def_ids_by_key_type, genesis_result_.index_def_ids_by_key_type);
+
+  auto head_after = storage_.GetBranchHead(storage_.GetCanonicalBranch());
+  ASSERT_TRUE(head_after.ok()) << head_after.status();
+  EXPECT_EQ(*head_before, *head_after) << "idempotent genesis should not create new commits";
 }
 
 TEST_F(GenesisTest, AllBootstrapIndexesAreQueryable) {
