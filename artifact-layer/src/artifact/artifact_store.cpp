@@ -24,6 +24,7 @@
 #include "index/index_derivation.h"
 #include "index/index_object.h"
 #include "index/index_schema_generator.h"
+#include "index/index_utils.h"
 
 namespace artifact_system::artifact {
 namespace {
@@ -74,122 +75,10 @@ std::string SerializeTombstone(uint64_t version_id, const std::string& type_name
   return envelope.SerializeAsString();
 }
 
-// Find an IndexDefinition by key_type from descriptor message options.
-std::optional<IndexDefinition> FindIndexDefinition(const google::protobuf::Descriptor& descriptor, const std::string& key_type) {
-  const auto& options = descriptor.options();
-  for (int i = 0; i < options.ExtensionSize(artifact_system::indexes); ++i) {
-    const auto& def = options.GetExtension(artifact_system::indexes, i);
-    if (def.key_type() == key_type) {
-      return def;
-    }
-  }
-  return std::nullopt;
-}
-
-// Build a proto-serialized key message from raw key values and a generated index schema.
-absl::StatusOr<std::string> BuildProtoSerializedKey(const index::GeneratedIndexSchema& schema, const std::vector<index::IndexCell>& key_values) {
-  if (key_values.empty())
-    return std::string{};
-
-  google::protobuf::DynamicMessageFactory factory;
-  const auto* prototype = factory.GetPrototype(schema.key_descriptor);
-  std::unique_ptr<google::protobuf::Message> key_msg(prototype->New());
-  const auto* reflection = key_msg->GetReflection();
-
-  for (int i = 0; i < static_cast<int>(key_values.size()); ++i) {
-    const auto* field = schema.key_descriptor->FindFieldByNumber(i + 1);
-    if (field == nullptr)
-      return absl::InternalError("generated key schema missing field");
-
-    const auto& cell = key_values[static_cast<size_t>(i)];
-    if (std::holds_alternative<std::string>(cell)) {
-      reflection->SetString(key_msg.get(), field, std::get<std::string>(cell));
-    } else if (std::holds_alternative<uint64_t>(cell)) {
-      reflection->SetUInt64(key_msg.get(), field, std::get<uint64_t>(cell));
-    } else if (std::holds_alternative<int64_t>(cell)) {
-      reflection->SetInt64(key_msg.get(), field, std::get<int64_t>(cell));
-    } else if (std::holds_alternative<uint32_t>(cell)) {
-      reflection->SetUInt32(key_msg.get(), field, std::get<uint32_t>(cell));
-    } else if (std::holds_alternative<int32_t>(cell)) {
-      reflection->SetInt32(key_msg.get(), field, std::get<int32_t>(cell));
-    } else if (std::holds_alternative<bool>(cell)) {
-      reflection->SetBool(key_msg.get(), field, std::get<bool>(cell));
-    } else if (std::holds_alternative<float>(cell)) {
-      reflection->SetFloat(key_msg.get(), field, std::get<float>(cell));
-    } else if (std::holds_alternative<double>(cell)) {
-      reflection->SetDouble(key_msg.get(), field, std::get<double>(cell));
-    } else {
-      return absl::InternalError("unsupported key cell type for proto serialization");
-    }
-  }
-  return key_msg->SerializeAsString();
-}
-
-// Add an index row for a derived entry. Reads the existing index object (if any),
-// appends the row, and writes back.
-absl::Status AddIndexRow(StorageInterface* storage, const std::string& branch, const index::DerivedIndexEntry& entry, uint64_t artifact_id,
-                         const IndexDefinition& index_def, const google::protobuf::Descriptor& descriptor) {
-  const std::string index_path = encoding::IndexPath(entry.index_def_id, entry.encoded_key);
-
-  auto schema_or = index::GenerateIndexSchema(index_def, descriptor);
-  if (!schema_or.ok())
-    return schema_or.status();
-
-  // Build the proto-serialized key for the IndexObject.
-  auto proto_key_or = BuildProtoSerializedKey(*schema_or, entry.key_values);
-  if (!proto_key_or.ok())
-    return proto_key_or.status();
-
-  index::IndexObject index_obj;
-  index_obj.serialized_key = *proto_key_or;
-
-  auto existing_or = storage->GetObject(branch, index_path);
-  if (existing_or.ok()) {
-    auto deser_or = index::DeserializeIndexObject(*schema_or, index_def, *existing_or);
-    if (deser_or.ok()) {
-      index_obj = std::move(*deser_or);
-    }
-  }
-
-  index::IndexRow row;
-  row.artifact_id = artifact_id;
-  row.order_values = entry.order_values;
-  index_obj.rows.push_back(std::move(row));
-
-  auto ser_or = index::SerializeIndexObject(*schema_or, index_def, index_obj);
-  if (!ser_or.ok())
-    return ser_or.status();
-  return storage->PutObject(branch, index_path, *ser_or);
-}
-
-// Remove an index row for a derived entry. Reads the existing index object,
-// erases the row matching artifact_id, and writes back. Best-effort: returns
-// OkStatus on any intermediate failure.
-absl::Status RemoveIndexRow(StorageInterface* storage, const std::string& branch, const index::DerivedIndexEntry& entry, uint64_t artifact_id,
-                            const IndexDefinition& index_def, const google::protobuf::Descriptor& descriptor) {
-  const std::string index_path = encoding::IndexPath(entry.index_def_id, entry.encoded_key);
-
-  auto schema_or = index::GenerateIndexSchema(index_def, descriptor);
-  if (!schema_or.ok())
-    return absl::OkStatus();
-
-  auto existing_or = storage->GetObject(branch, index_path);
-  if (!existing_or.ok())
-    return absl::OkStatus();
-
-  auto deser_or = index::DeserializeIndexObject(*schema_or, index_def, *existing_or);
-  if (!deser_or.ok())
-    return absl::OkStatus();
-
-  auto& idx_obj = *deser_or;
-  std::erase_if(idx_obj.rows, [artifact_id](const index::IndexRow& row) { return row.artifact_id == artifact_id; });
-
-  auto ser_or = index::SerializeIndexObject(*schema_or, index_def, idx_obj);
-  if (ser_or.ok()) {
-    (void)storage->PutObject(branch, index_path, *ser_or);
-  }
-  return absl::OkStatus();
-}
+// Aliases for shared index utilities used throughout this file.
+using index::AddIndexRow;
+using index::FindIndexDefinition;
+using index::RemoveIndexRow;
 
 // Run referential integrity validation for a create or update operation.
 // Builds a dynamic message from the resolved type and validates all reference fields.

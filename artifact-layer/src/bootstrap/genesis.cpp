@@ -1,14 +1,10 @@
 #include "bootstrap/genesis.h"
 
 #include <cstdint>
-#include <functional>
 #include <memory>
-#include <optional>
-#include <set>
 #include <string>
 #include <string_view>
 #include <unordered_map>
-#include <variant>
 #include <vector>
 
 #include "absl/status/status.h"
@@ -16,34 +12,17 @@
 #include "absl/strings/str_cat.h"
 #include "google/protobuf/descriptor.h"
 #include "google/protobuf/descriptor.pb.h"
-#include "google/protobuf/dynamic_message.h"
 
+#include "artifact/proto_utils.h"
 #include "artifact_internal.pb.h"
 #include "artifact_options.pb.h"
 #include "artifact_types.pb.h"
 #include "encoding/artifact_path.h"
 #include "index/index_derivation.h"
-#include "index/index_object.h"
-#include "index/index_schema_generator.h"
+#include "index/index_utils.h"
 
 namespace artifact_system::bootstrap {
 namespace {
-
-google::protobuf::FileDescriptorSet BuildDescriptorSet(const google::protobuf::Descriptor* desc) {
-  google::protobuf::FileDescriptorSet fds;
-  std::set<const google::protobuf::FileDescriptor*> seen;
-  std::function<void(const google::protobuf::FileDescriptor*)> add_file;
-  add_file = [&](const google::protobuf::FileDescriptor* fd) {
-    if (!seen.insert(fd).second)
-      return;
-    for (int i = 0; i < fd->dependency_count(); ++i) {
-      add_file(fd->dependency(i));
-    }
-    fd->CopyTo(fds.add_file());
-  };
-  add_file(desc->file());
-  return fds;
-}
 
 absl::Status WriteStoredArtifact(StorageInterface* storage, const std::string& branch, uint64_t artifact_id, uint64_t version_id, std::string_view type_name,
                                  const std::string& payload) {
@@ -55,89 +34,6 @@ absl::Status WriteStoredArtifact(StorageInterface* storage, const std::string& b
   return storage->PutObject(branch, encoding::ArtifactPath(artifact_id), envelope.SerializeAsString());
 }
 
-std::optional<IndexDefinition> FindIndexDefinition(const google::protobuf::Descriptor& descriptor, const std::string& key_type) {
-  const auto& options = descriptor.options();
-  for (int i = 0; i < options.ExtensionSize(artifact_system::indexes); ++i) {
-    const auto& def = options.GetExtension(artifact_system::indexes, i);
-    if (def.key_type() == key_type) {
-      return def;
-    }
-  }
-  return std::nullopt;
-}
-
-absl::StatusOr<std::string> BuildProtoSerializedKey(const index::GeneratedIndexSchema& schema, const std::vector<index::IndexCell>& key_values) {
-  if (key_values.empty())
-    return std::string{};
-
-  google::protobuf::DynamicMessageFactory factory;
-  const auto* prototype = factory.GetPrototype(schema.key_descriptor);
-  std::unique_ptr<google::protobuf::Message> key_msg(prototype->New());
-  const auto* reflection = key_msg->GetReflection();
-
-  for (int i = 0; i < static_cast<int>(key_values.size()); ++i) {
-    const auto* field = schema.key_descriptor->FindFieldByNumber(i + 1);
-    if (field == nullptr)
-      return absl::InternalError("generated key schema missing field");
-
-    const auto& cell = key_values[static_cast<size_t>(i)];
-    if (std::holds_alternative<std::string>(cell)) {
-      reflection->SetString(key_msg.get(), field, std::get<std::string>(cell));
-    } else if (std::holds_alternative<uint64_t>(cell)) {
-      reflection->SetUInt64(key_msg.get(), field, std::get<uint64_t>(cell));
-    } else if (std::holds_alternative<int64_t>(cell)) {
-      reflection->SetInt64(key_msg.get(), field, std::get<int64_t>(cell));
-    } else if (std::holds_alternative<uint32_t>(cell)) {
-      reflection->SetUInt32(key_msg.get(), field, std::get<uint32_t>(cell));
-    } else if (std::holds_alternative<int32_t>(cell)) {
-      reflection->SetInt32(key_msg.get(), field, std::get<int32_t>(cell));
-    } else if (std::holds_alternative<bool>(cell)) {
-      reflection->SetBool(key_msg.get(), field, std::get<bool>(cell));
-    } else if (std::holds_alternative<float>(cell)) {
-      reflection->SetFloat(key_msg.get(), field, std::get<float>(cell));
-    } else if (std::holds_alternative<double>(cell)) {
-      reflection->SetDouble(key_msg.get(), field, std::get<double>(cell));
-    } else {
-      return absl::InternalError("unsupported key cell type for proto serialization");
-    }
-  }
-  return key_msg->SerializeAsString();
-}
-
-absl::Status AddIndexRow(StorageInterface* storage, const std::string& branch, const index::DerivedIndexEntry& entry, uint64_t artifact_id,
-                         const IndexDefinition& index_def, const google::protobuf::Descriptor& descriptor) {
-  const std::string index_path = encoding::IndexPath(entry.index_def_id, entry.encoded_key);
-
-  auto schema_or = index::GenerateIndexSchema(index_def, descriptor);
-  if (!schema_or.ok())
-    return schema_or.status();
-
-  auto proto_key_or = BuildProtoSerializedKey(*schema_or, entry.key_values);
-  if (!proto_key_or.ok())
-    return proto_key_or.status();
-
-  index::IndexObject index_obj;
-  index_obj.serialized_key = *proto_key_or;
-
-  auto existing_or = storage->GetObject(branch, index_path);
-  if (existing_or.ok()) {
-    auto deser_or = index::DeserializeIndexObject(*schema_or, index_def, *existing_or);
-    if (deser_or.ok()) {
-      index_obj = std::move(*deser_or);
-    }
-  }
-
-  index::IndexRow row;
-  row.artifact_id = artifact_id;
-  row.order_values = entry.order_values;
-  index_obj.rows.push_back(std::move(row));
-
-  auto ser_or = index::SerializeIndexObject(*schema_or, index_def, index_obj);
-  if (!ser_or.ok())
-    return ser_or.status();
-  return storage->PutObject(branch, index_path, *ser_or);
-}
-
 absl::Status DeriveAndWriteIndexEntries(StorageInterface* storage, const std::string& branch, const google::protobuf::Descriptor& descriptor,
                                         const google::protobuf::Message& message, uint64_t artifact_id,
                                         const std::unordered_map<std::string, uint64_t>& index_def_ids_by_key_type) {
@@ -146,11 +42,11 @@ absl::Status DeriveAndWriteIndexEntries(StorageInterface* storage, const std::st
     return entries_or.status();
 
   for (const auto& entry : *entries_or) {
-    auto index_def = FindIndexDefinition(descriptor, entry.key_type);
+    auto index_def = index::FindIndexDefinition(descriptor, entry.key_type);
     if (!index_def.has_value()) {
       return absl::InternalError(absl::StrCat("no IndexDefinition for key_type: ", entry.key_type));
     }
-    auto status = AddIndexRow(storage, branch, entry, artifact_id, *index_def, descriptor);
+    auto status = index::AddIndexRow(storage, branch, entry, artifact_id, *index_def, descriptor);
     if (!status.ok())
       return status;
   }
@@ -226,7 +122,7 @@ absl::StatusOr<GenesisResult> RunGenesis(StorageInterface* storage) {
   auto stage_type_version_def = [&](uint64_t artifact_id, uint64_t type_id, const google::protobuf::Descriptor* type_desc) -> absl::Status {
     TypeVersionDefinition tvd;
     tvd.set_type_id(type_id);
-    *tvd.mutable_descriptor_set() = BuildDescriptorSet(type_desc);
+    *tvd.mutable_descriptor_set() = artifact::BuildDescriptorSet(type_desc);
     tvd.set_proto_source("");
 
     std::string payload = tvd.SerializeAsString();
@@ -240,7 +136,6 @@ absl::StatusOr<GenesisResult> RunGenesis(StorageInterface* storage) {
   };
 
   // Helper to stage IndexDefinition artifacts from descriptor options.
-  // `ids` maps key_type -> pre-allocated artifact_id for each index on this type.
   auto stage_index_defs = [&](const google::protobuf::Descriptor* type_desc, const std::unordered_map<std::string, uint64_t>& ids) -> absl::Status {
     const auto& options = type_desc->options();
     for (int i = 0; i < options.ExtensionSize(artifact_system::indexes); ++i) {
@@ -262,8 +157,6 @@ absl::StatusOr<GenesisResult> RunGenesis(StorageInterface* storage) {
   };
 
   // ── 1-9. Stage all four built-in types in dependency order ──
-  // Derive each type's index_ids from its proto descriptor options rather than
-  // duplicating the key_type-to-ID mapping a second time.
   auto index_ids_for = [&](const google::protobuf::Descriptor* desc) {
     std::unordered_map<std::string, uint64_t> result;
     const auto& options = desc->options();

@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -17,6 +19,24 @@
 #include "storage/storage_interface.h"
 
 namespace artifact_system::artifact {
+
+// Build a FileDescriptorSet from a compiled-in Descriptor, recursively
+// including all transitive file dependencies.
+inline google::protobuf::FileDescriptorSet BuildDescriptorSet(const google::protobuf::Descriptor* desc) {
+  google::protobuf::FileDescriptorSet fds;
+  std::set<const google::protobuf::FileDescriptor*> seen;
+  std::function<void(const google::protobuf::FileDescriptor*)> add_file;
+  add_file = [&](const google::protobuf::FileDescriptor* fd) {
+    if (!seen.insert(fd).second)
+      return;
+    for (int i = 0; i < fd->dependency_count(); ++i) {
+      add_file(fd->dependency(i));
+    }
+    fd->CopyTo(fds.add_file());
+  };
+  add_file(desc->file());
+  return fds;
+}
 
 // Build a DescriptorPool from a FileDescriptorSet and find a message by name.
 // Uses a topological-sort loop to handle dependency ordering.
