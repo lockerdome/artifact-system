@@ -99,10 +99,14 @@ grpc::Status IndexServiceImpl::FetchIndex(grpc::ServerContext* /*context*/, cons
   }
 
   // Step 5: Validate completeness — all key fields must be set.
+  // Generated IndexKey_* messages use proto3_optional (synthetic oneofs)
+  // so HasField correctly detects explicit presence.
   const google::protobuf::Reflection* refl = key_msg->GetReflection();
   for (int i = 0; i < key_desc->field_count(); ++i) {
     const google::protobuf::FieldDescriptor* field = key_desc->field(i);
-    if (!refl->HasField(*key_msg, field)) {
+    if (field->is_repeated())
+      continue; // repeated fields are always "present"
+    if (field->has_presence() && !refl->HasField(*key_msg, field)) {
       return AbslToGrpcStatus(MakeFetchIndexError(absl::StatusCode::kInvalidArgument,
                                                   absl::StrCat("missing key field '", field->name(), "' for key_type: ", key_type),
                                                   FetchIndexError::INCOMPLETE_KEY, key_type));

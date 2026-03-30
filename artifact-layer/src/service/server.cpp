@@ -91,6 +91,10 @@ void ArtifactLayerServer::Start() {
   builder.RegisterService(impl_->type_registry_service.get());
 
   impl_->server = builder.BuildAndStart();
+  if (!impl_->server) {
+    std::println(stderr, "Failed to start gRPC server on {}", impl_->config.listen_address);
+    return;
+  }
   std::println("Artifact layer server listening on {}", impl_->config.listen_address);
 
   impl_->server->Wait();

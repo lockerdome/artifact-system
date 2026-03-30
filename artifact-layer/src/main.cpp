@@ -1,14 +1,16 @@
 #include "absl/status/status.h"
 #include "service/server.h"
+#include <atomic>
+#include <chrono>
 #include <csignal>
 #include <print>
+#include <thread>
 
 namespace {
-artifact_system::service::ArtifactLayerServer* g_server = nullptr;
+std::atomic<bool> g_shutdown_requested{false};
 
 void SignalHandler(int) {
-  if (g_server)
-    g_server->Shutdown();
+  g_shutdown_requested.store(true, std::memory_order_relaxed);
 }
 } // namespace
 
@@ -17,7 +19,6 @@ int main() {
   // TODO: parse config from flags/env
 
   artifact_system::service::ArtifactLayerServer server(config);
-  g_server = &server;
 
   auto status = server.Initialize();
   if (!status.ok()) {
@@ -28,8 +29,15 @@ int main() {
   std::signal(SIGINT, SignalHandler);
   std::signal(SIGTERM, SignalHandler);
 
-  std::println("Starting artifact layer server...");
-  server.Start();
+  // Start server in a background thread so we can poll for shutdown.
+  std::thread server_thread([&server] { server.Start(); });
+
+  while (!g_shutdown_requested.load(std::memory_order_relaxed)) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+
+  server.Shutdown();
+  server_thread.join();
 
   return 0;
 }
