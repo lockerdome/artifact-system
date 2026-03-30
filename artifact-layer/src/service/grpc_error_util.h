@@ -12,23 +12,40 @@ namespace artifact_system::service {
 // Convert absl::StatusCode to grpc::StatusCode.
 inline grpc::StatusCode AbslToGrpcCode(absl::StatusCode code) {
   switch (code) {
-    case absl::StatusCode::kOk: return grpc::OK;
-    case absl::StatusCode::kCancelled: return grpc::CANCELLED;
-    case absl::StatusCode::kInvalidArgument: return grpc::INVALID_ARGUMENT;
-    case absl::StatusCode::kDeadlineExceeded: return grpc::DEADLINE_EXCEEDED;
-    case absl::StatusCode::kNotFound: return grpc::NOT_FOUND;
-    case absl::StatusCode::kAlreadyExists: return grpc::ALREADY_EXISTS;
-    case absl::StatusCode::kPermissionDenied: return grpc::PERMISSION_DENIED;
-    case absl::StatusCode::kResourceExhausted: return grpc::RESOURCE_EXHAUSTED;
-    case absl::StatusCode::kFailedPrecondition: return grpc::FAILED_PRECONDITION;
-    case absl::StatusCode::kAborted: return grpc::ABORTED;
-    case absl::StatusCode::kOutOfRange: return grpc::OUT_OF_RANGE;
-    case absl::StatusCode::kUnimplemented: return grpc::UNIMPLEMENTED;
-    case absl::StatusCode::kInternal: return grpc::INTERNAL;
-    case absl::StatusCode::kUnavailable: return grpc::UNAVAILABLE;
-    case absl::StatusCode::kDataLoss: return grpc::DATA_LOSS;
-    case absl::StatusCode::kUnauthenticated: return grpc::UNAUTHENTICATED;
-    default: return grpc::UNKNOWN;
+  case absl::StatusCode::kOk:
+    return grpc::OK;
+  case absl::StatusCode::kCancelled:
+    return grpc::CANCELLED;
+  case absl::StatusCode::kInvalidArgument:
+    return grpc::INVALID_ARGUMENT;
+  case absl::StatusCode::kDeadlineExceeded:
+    return grpc::DEADLINE_EXCEEDED;
+  case absl::StatusCode::kNotFound:
+    return grpc::NOT_FOUND;
+  case absl::StatusCode::kAlreadyExists:
+    return grpc::ALREADY_EXISTS;
+  case absl::StatusCode::kPermissionDenied:
+    return grpc::PERMISSION_DENIED;
+  case absl::StatusCode::kResourceExhausted:
+    return grpc::RESOURCE_EXHAUSTED;
+  case absl::StatusCode::kFailedPrecondition:
+    return grpc::FAILED_PRECONDITION;
+  case absl::StatusCode::kAborted:
+    return grpc::ABORTED;
+  case absl::StatusCode::kOutOfRange:
+    return grpc::OUT_OF_RANGE;
+  case absl::StatusCode::kUnimplemented:
+    return grpc::UNIMPLEMENTED;
+  case absl::StatusCode::kInternal:
+    return grpc::INTERNAL;
+  case absl::StatusCode::kUnavailable:
+    return grpc::UNAVAILABLE;
+  case absl::StatusCode::kDataLoss:
+    return grpc::DATA_LOSS;
+  case absl::StatusCode::kUnauthenticated:
+    return grpc::UNAUTHENTICATED;
+  default:
+    return grpc::UNKNOWN;
   }
 }
 
@@ -50,7 +67,8 @@ inline grpc::Status AbslToGrpcStatus(const absl::Status& status) {
   // it as a google.rpc.Status in binary error details.
   std::string error_details;
   status.ForEachPayload([&](absl::string_view type_url, const absl::Cord& payload) {
-    if (!error_details.empty()) return; // take only the first
+    if (!error_details.empty())
+      return; // take only the first
 
     // Build a google.rpc.Status message manually to avoid depending on
     // google/rpc/status.proto. The wire format is:
@@ -133,14 +151,11 @@ inline grpc::Status AbslToGrpcStatus(const absl::Status& status) {
 }
 
 // Build an absl::Status with a serialized proto detail payload.
-template <typename ProtoMessage>
-absl::Status MakeStatusWithDetail(absl::StatusCode code, const std::string& message, const ProtoMessage& detail) {
+template <typename ProtoMessage> absl::Status MakeStatusWithDetail(absl::StatusCode code, const std::string& message, const ProtoMessage& detail) {
   absl::Status status(code, message);
   std::string serialized;
   detail.SerializeToString(&serialized);
-  status.SetPayload(
-      absl::StrCat("type.googleapis.com/", ProtoMessage::descriptor()->full_name()),
-      absl::Cord(serialized));
+  status.SetPayload(absl::StrCat("type.googleapis.com/", ProtoMessage::descriptor()->full_name()), absl::Cord(serialized));
   return status;
 }
 

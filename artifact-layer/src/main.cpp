@@ -1,15 +1,16 @@
-#include <csignal>
-#include <print>
 #include "absl/status/status.h"
 #include "service/server.h"
+#include <csignal>
+#include <print>
 
 namespace {
 artifact_system::service::ArtifactLayerServer* g_server = nullptr;
 
 void SignalHandler(int) {
-  if (g_server) g_server->Shutdown();
+  if (g_server)
+    g_server->Shutdown();
 }
-}  // namespace
+} // namespace
 
 int main() {
   artifact_system::service::ServerConfig config;
@@ -20,8 +21,7 @@ int main() {
 
   auto status = server.Initialize();
   if (!status.ok()) {
-    std::println(stderr, "Failed to initialize server: {}",
-                 std::string(status.message()));
+    std::println(stderr, "Failed to initialize server: {}", std::string(status.message()));
     return 1;
   }
 

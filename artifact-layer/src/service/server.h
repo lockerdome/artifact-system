@@ -1,8 +1,8 @@
 #pragma once
-#include <memory>
-#include <string>
 #include "absl/status/status.h"
 #include "grpcpp/server.h"
+#include <memory>
+#include <string>
 
 namespace artifact_system::service {
 

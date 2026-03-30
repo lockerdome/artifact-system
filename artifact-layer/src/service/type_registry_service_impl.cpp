@@ -6,25 +6,19 @@
 
 namespace artifact_system::service {
 
-TypeRegistryServiceImpl::TypeRegistryServiceImpl(registry::TypeRegistry* registry)
-    : registry_(registry) {}
+TypeRegistryServiceImpl::TypeRegistryServiceImpl(registry::TypeRegistry* registry, artifact::ArtifactStore* artifact_store)
+    : registry_(registry), artifact_store_(artifact_store) {
+}
 
-grpc::Status TypeRegistryServiceImpl::RegisterTypeVersion(
-    grpc::ServerContext* context,
-    const RegisterTypeVersionRequest* request,
-    RegisterTypeVersionResponse* response) {
-  std::optional<bool> deny_create =
-      request->has_deny_create() ? std::optional(request->deny_create()) : std::nullopt;
-  std::optional<bool> deny_update =
-      request->has_deny_update() ? std::optional(request->deny_update()) : std::nullopt;
-  std::optional<bool> deny_delete =
-      request->has_deny_delete() ? std::optional(request->deny_delete()) : std::nullopt;
+grpc::Status TypeRegistryServiceImpl::RegisterTypeVersion(grpc::ServerContext* context, const RegisterTypeVersionRequest* request,
+                                                          RegisterTypeVersionResponse* response) {
+  std::optional<bool> deny_create = request->has_deny_create() ? std::optional(request->deny_create()) : std::nullopt;
+  std::optional<bool> deny_update = request->has_deny_update() ? std::optional(request->deny_update()) : std::nullopt;
+  std::optional<bool> deny_delete = request->has_deny_delete() ? std::optional(request->deny_delete()) : std::nullopt;
 
   absl::StatusOr<registry::RegisterResult> result;
   try {
-    result = registry_->RegisterTypeVersion(
-        request->type_name(), request->proto_source(),
-        deny_create, deny_update, deny_delete);
+    result = registry_->RegisterTypeVersion(request->type_name(), request->proto_source(), deny_create, deny_update, deny_delete);
   } catch (const std::runtime_error& e) {
     return grpc::Status(grpc::StatusCode::UNAVAILABLE, e.what());
   }
@@ -33,14 +27,17 @@ grpc::Status TypeRegistryServiceImpl::RegisterTypeVersion(
     return AbslToGrpcStatus(result.status());
   }
 
+  // Propagate new index IDs to the artifact store so subsequent CRUD operations
+  // can derive indexes for the newly registered type.
+  if (artifact_store_) {
+    artifact_store_->UpdateIndexDefIds(registry_->index_def_ids_by_key_type());
+  }
+
   response->set_version_id(result->version_id);
   return grpc::Status::OK;
 }
 
-grpc::Status TypeRegistryServiceImpl::GetTypeVersion(
-    grpc::ServerContext* context,
-    const GetTypeVersionRequest* request,
-    GetTypeVersionResponse* response) {
+grpc::Status TypeRegistryServiceImpl::GetTypeVersion(grpc::ServerContext* context, const GetTypeVersionRequest* request, GetTypeVersionResponse* response) {
   auto result = registry_->GetTypeVersion(request->version_id());
   if (!result.ok()) {
     return AbslToGrpcStatus(result.status());
@@ -61,10 +58,8 @@ grpc::Status TypeRegistryServiceImpl::GetTypeVersion(
   return grpc::Status::OK;
 }
 
-grpc::Status TypeRegistryServiceImpl::ListTypeVersions(
-    grpc::ServerContext* context,
-    const ListTypeVersionsRequest* request,
-    ListTypeVersionsResponse* response) {
+grpc::Status TypeRegistryServiceImpl::ListTypeVersions(grpc::ServerContext* context, const ListTypeVersionsRequest* request,
+                                                       ListTypeVersionsResponse* response) {
   auto result = registry_->ListTypeVersions(request->type_name());
   if (!result.ok()) {
     return AbslToGrpcStatus(result.status());
@@ -77,10 +72,7 @@ grpc::Status TypeRegistryServiceImpl::ListTypeVersions(
   return grpc::Status::OK;
 }
 
-grpc::Status TypeRegistryServiceImpl::GetIndexSchema(
-    grpc::ServerContext* context,
-    const GetIndexSchemaRequest* request,
-    GetIndexSchemaResponse* response) {
+grpc::Status TypeRegistryServiceImpl::GetIndexSchema(grpc::ServerContext* context, const GetIndexSchemaRequest* request, GetIndexSchemaResponse* response) {
   auto result = registry_->GetIndexSchema(request->key_type());
   if (!result.ok()) {
     if (absl::IsNotFound(result.status())) {
@@ -89,10 +81,7 @@ grpc::Status TypeRegistryServiceImpl::GetIndexSchema(
       error_detail.set_description(std::string(result.status().message()));
       error_detail.set_key_type(request->key_type());
 
-      auto status_with_detail = MakeStatusWithDetail(
-          absl::StatusCode::kNotFound,
-          std::string(result.status().message()),
-          error_detail);
+      auto status_with_detail = MakeStatusWithDetail(absl::StatusCode::kNotFound, std::string(result.status().message()), error_detail);
       return AbslToGrpcStatus(status_with_detail);
     }
     return AbslToGrpcStatus(result.status());
@@ -118,4 +107,4 @@ grpc::Status TypeRegistryServiceImpl::GetIndexSchema(
   return grpc::Status::OK;
 }
 
-}  // namespace artifact_system::service
+} // namespace artifact_system::service

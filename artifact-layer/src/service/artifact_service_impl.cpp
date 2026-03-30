@@ -6,13 +6,10 @@
 
 namespace artifact_system::service {
 
-ArtifactServiceImpl::ArtifactServiceImpl(artifact::ArtifactStore* store)
-    : store_(store) {}
+ArtifactServiceImpl::ArtifactServiceImpl(artifact::ArtifactStore* store) : store_(store) {
+}
 
-grpc::Status ArtifactServiceImpl::CreateArtifact(
-    grpc::ServerContext* /*context*/,
-    const CreateArtifactRequest* request,
-    CreateArtifactResponse* response) {
+grpc::Status ArtifactServiceImpl::CreateArtifact(grpc::ServerContext* /*context*/, const CreateArtifactRequest* request, CreateArtifactResponse* response) {
   std::optional<std::string> transaction_id;
   if (request->has_transaction_id()) {
     transaction_id = request->transaction_id();
@@ -20,8 +17,7 @@ grpc::Status ArtifactServiceImpl::CreateArtifact(
 
   absl::StatusOr<artifact::CreateResult> result;
   try {
-    result = store_->CreateArtifact(request->version_id(), request->payload(),
-                                    transaction_id);
+    result = store_->CreateArtifact(request->version_id(), request->payload(), transaction_id);
   } catch (const std::runtime_error& e) {
     return grpc::Status(grpc::StatusCode::UNAVAILABLE, e.what());
   }
@@ -35,10 +31,7 @@ grpc::Status ArtifactServiceImpl::CreateArtifact(
   return grpc::Status::OK;
 }
 
-grpc::Status ArtifactServiceImpl::GetArtifact(
-    grpc::ServerContext* /*context*/,
-    const GetArtifactRequest* request,
-    GetArtifactResponse* response) {
+grpc::Status ArtifactServiceImpl::GetArtifact(grpc::ServerContext* /*context*/, const GetArtifactRequest* request, GetArtifactResponse* response) {
   auto result = store_->GetArtifact(request->artifact_id(), request->context());
 
   if (!result.ok()) {
@@ -52,12 +45,9 @@ grpc::Status ArtifactServiceImpl::GetArtifact(
   return grpc::Status::OK;
 }
 
-grpc::Status ArtifactServiceImpl::BatchGetArtifacts(
-    grpc::ServerContext* /*context*/,
-    const BatchGetArtifactsRequest* request,
-    BatchGetArtifactsResponse* response) {
-  std::vector<uint64_t> artifact_ids(request->artifact_ids().begin(),
-                                     request->artifact_ids().end());
+grpc::Status ArtifactServiceImpl::BatchGetArtifacts(grpc::ServerContext* /*context*/, const BatchGetArtifactsRequest* request,
+                                                    BatchGetArtifactsResponse* response) {
+  std::vector<uint64_t> artifact_ids(request->artifact_ids().begin(), request->artifact_ids().end());
 
   auto result = store_->BatchGetArtifacts(artifact_ids, request->context());
 
@@ -67,15 +57,13 @@ grpc::Status ArtifactServiceImpl::BatchGetArtifacts(
 
   for (const auto& entry : *result) {
     auto* artifact_result = response->add_results();
-    if (auto* get_result =
-            std::get_if<artifact::GetResult>(&entry.result)) {
+    if (auto* get_result = std::get_if<artifact::GetResult>(&entry.result)) {
       auto* artifact = artifact_result->mutable_artifact();
       artifact->set_artifact_id(get_result->artifact_id);
       artifact->set_type_name(get_result->type_name);
       artifact->set_version_id(get_result->version_id);
       artifact->set_payload(get_result->payload);
-    } else if (auto* not_found =
-                   std::get_if<ArtifactNotFoundError>(&entry.result)) {
+    } else if (auto* not_found = std::get_if<ArtifactNotFoundError>(&entry.result)) {
       *artifact_result->mutable_not_found() = *not_found;
     }
   }
@@ -83,18 +71,13 @@ grpc::Status ArtifactServiceImpl::BatchGetArtifacts(
   return grpc::Status::OK;
 }
 
-grpc::Status ArtifactServiceImpl::UpdateArtifact(
-    grpc::ServerContext* /*context*/,
-    const UpdateArtifactRequest* request,
-    UpdateArtifactResponse* response) {
+grpc::Status ArtifactServiceImpl::UpdateArtifact(grpc::ServerContext* /*context*/, const UpdateArtifactRequest* request, UpdateArtifactResponse* response) {
   std::optional<std::string> transaction_id;
   if (request->has_transaction_id()) {
     transaction_id = request->transaction_id();
   }
 
-  auto result = store_->UpdateArtifact(request->artifact_id(),
-                                       request->version_id(),
-                                       request->payload(), transaction_id);
+  auto result = store_->UpdateArtifact(request->artifact_id(), request->version_id(), request->payload(), transaction_id);
 
   if (!result.ok()) {
     return AbslToGrpcStatus(result.status());
@@ -104,10 +87,7 @@ grpc::Status ArtifactServiceImpl::UpdateArtifact(
   return grpc::Status::OK;
 }
 
-grpc::Status ArtifactServiceImpl::DeleteArtifact(
-    grpc::ServerContext* /*context*/,
-    const DeleteArtifactRequest* request,
-    DeleteArtifactResponse* response) {
+grpc::Status ArtifactServiceImpl::DeleteArtifact(grpc::ServerContext* /*context*/, const DeleteArtifactRequest* request, DeleteArtifactResponse* response) {
   std::optional<std::string> transaction_id;
   if (request->has_transaction_id()) {
     transaction_id = request->transaction_id();
@@ -123,4 +103,4 @@ grpc::Status ArtifactServiceImpl::DeleteArtifact(
   return grpc::Status::OK;
 }
 
-}  // namespace artifact_system::service
+} // namespace artifact_system::service

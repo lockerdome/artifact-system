@@ -98,7 +98,13 @@ ArtifactStore::ArtifactStore(StorageInterface* storage, transaction::Transaction
     : storage_(storage), transaction_manager_(transaction_manager), id_allocator_(id_allocator), options_(std::move(options)) {
 }
 
-// ── Read operations ────────────��────────────────────────────────────────────
+void ArtifactStore::UpdateIndexDefIds(const std::unordered_map<std::string, uint64_t>& new_ids) {
+  for (const auto& [key, id] : new_ids) {
+    options_.index_def_ids_by_key_type[key] = id;
+  }
+}
+
+//── Read operations ────────────��────────────────────────────────────────────
 
 absl::StatusOr<std::string> ArtifactStore::ResolveReadRef(const ReadContext& context) {
   if (context.has_snapshot_id()) {

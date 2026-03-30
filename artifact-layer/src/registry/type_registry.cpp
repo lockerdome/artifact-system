@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <set>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -298,7 +299,17 @@ IndexSchemaInfo BuildIndexSchemaInfo(uint64_t idx_id, const IndexDefinition& idx
   info.unique = idx_def.unique();
 
   google::protobuf::FileDescriptorSet gen_fds;
-  schema.file_descriptor->CopyTo(gen_fds.add_file());
+  // Include transitive dependencies so the descriptor set is self-contained.
+  std::set<const google::protobuf::FileDescriptor*> seen;
+  std::function<void(const google::protobuf::FileDescriptor*)> add_file;
+  add_file = [&](const google::protobuf::FileDescriptor* fd) {
+    if (!seen.insert(fd).second)
+      return;
+    for (int i = 0; i < fd->dependency_count(); ++i)
+      add_file(fd->dependency(i));
+    fd->CopyTo(gen_fds.add_file());
+  };
+  add_file(schema.file_descriptor);
   info.index_descriptor_set = gen_fds;
 
   info.key_message_name = schema.key_descriptor->full_name();
