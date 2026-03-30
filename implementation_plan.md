@@ -30,7 +30,7 @@ otherwise noted.
 | P5 | Transaction & Snapshot Manager | :white_check_mark: Complete |
 | P6 | Artifact CRUD Engine | :white_check_mark: Complete |
 | P6.5 | String IDs for Snapshots & Transactions | :white_check_mark: Complete |
-| P7a | Registry Utilities (proto compiler, schema compat) | :white_large_square: Not started |
+| P7a | Registry Utilities (proto compiler, schema compat) | :white_check_mark: Complete |
 | P7b | Type Registry Orchestration (RegisterTypeVersion + introspection) | :white_large_square: Not started |
 | P8 | Genesis Bootstrap | :white_large_square: Not started |
 | P9 | gRPC Server & Service Implementation | :white_large_square: Not started |
