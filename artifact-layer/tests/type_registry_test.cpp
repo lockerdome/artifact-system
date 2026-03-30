@@ -1,7 +1,6 @@
 #include "registry/type_registry.h"
 
 #include <cstdint>
-#include <functional>
 #include <optional>
 #include <set>
 #include <string>
@@ -11,6 +10,7 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "artifact/proto_utils.h"
 #include "artifact_internal.pb.h"
 #include "artifact_options.pb.h"
 #include "artifact_service.pb.h"
@@ -19,11 +19,11 @@
 #include "encoding/index_key_encoder.h"
 #include "google/protobuf/descriptor.h"
 #include "google/protobuf/descriptor.pb.h"
-#include "google/protobuf/dynamic_message.h"
 #include "id/id_allocator_interface.h"
 #include "index/index_derivation.h"
 #include "index/index_object.h"
 #include "index/index_schema_generator.h"
+#include "index/index_utils.h"
 #include "storage/memory_storage.h"
 #include "transaction/transaction_manager.h"
 #include "gtest/gtest.h"
@@ -41,104 +41,40 @@ using artifact_system::transaction::TransactionManager;
 // Helpers
 // ---------------------------------------------------------------------------
 
-google::protobuf::FileDescriptorSet BuildDescriptorSet(const google::protobuf::Descriptor* desc) {
-  google::protobuf::FileDescriptorSet fds;
-  std::set<const google::protobuf::FileDescriptor*> seen;
-  std::function<void(const google::protobuf::FileDescriptor*)> add_file;
-  add_file = [&](const google::protobuf::FileDescriptor* fd) {
-    if (!seen.insert(fd).second)
-      return;
-    for (int i = 0; i < fd->dependency_count(); ++i) {
-      add_file(fd->dependency(i));
-    }
-    fd->CopyTo(fds.add_file());
-  };
-  add_file(desc->file());
-  return fds;
-}
-
 void WriteStoredArtifact(MemoryStorage& storage, const std::string& branch, uint64_t artifact_id, uint64_t version_id, const std::string& type_name,
                          const std::string& payload) {
-  StoredArtifact envelope;
-  envelope.set_envelope_version(1);
-  envelope.set_version_id(version_id);
-  envelope.set_type_name(type_name);
-  envelope.set_payload(payload);
-  ASSERT_TRUE(storage.PutObject(branch, encoding::ArtifactPath(artifact_id), envelope.SerializeAsString()).ok());
+  ASSERT_TRUE(storage.PutObject(branch, encoding::ArtifactPath(artifact_id), artifact::SerializeStoredArtifact(version_id, type_name, payload)).ok());
 }
 
 // Build a proto-serialized key for an index.
 std::string BuildProtoKey(const index::GeneratedIndexSchema& schema, const std::vector<index::IndexCell>& key_values) {
-  if (key_values.empty())
-    return {};
-  google::protobuf::DynamicMessageFactory factory;
-  const auto* prototype = factory.GetPrototype(schema.key_descriptor);
-  std::unique_ptr<google::protobuf::Message> key_msg(prototype->New());
-  const auto* reflection = key_msg->GetReflection();
-  for (int i = 0; i < static_cast<int>(key_values.size()); ++i) {
-    const auto* field = schema.key_descriptor->FindFieldByNumber(i + 1);
-    const auto& cell = key_values[static_cast<size_t>(i)];
-    if (std::holds_alternative<std::string>(cell)) {
-      reflection->SetString(key_msg.get(), field, std::get<std::string>(cell));
-    } else if (std::holds_alternative<uint64_t>(cell)) {
-      reflection->SetUInt64(key_msg.get(), field, std::get<uint64_t>(cell));
-    }
-  }
-  return key_msg->SerializeAsString();
+  auto result = index::BuildProtoSerializedKey(schema, key_values);
+  EXPECT_TRUE(result.ok()) << result.status();
+  return result.value_or(std::string{});
 }
 
 // Write an index entry pointing artifact_id to the given index object.
 void WriteIndexEntry(MemoryStorage& storage, const std::string& branch, uint64_t index_def_id, const std::vector<uint8_t>& encoded_key, uint64_t artifact_id,
                      const IndexDefinition& idx_def, const google::protobuf::Descriptor& parent_desc, const std::vector<index::IndexCell>& key_values) {
-  auto schema_or = index::GenerateIndexSchema(idx_def, parent_desc);
-  ASSERT_TRUE(schema_or.ok()) << schema_or.status();
-
-  std::string proto_key = BuildProtoKey(*schema_or, key_values);
-
-  index::IndexObject obj;
-  obj.serialized_key = proto_key;
-
-  // Try reading existing.
-  const std::string path = encoding::IndexPath(index_def_id, encoded_key);
-  auto existing_or = storage.GetObject(branch, path);
-  if (existing_or.ok()) {
-    auto deser_or = index::DeserializeIndexObject(*schema_or, idx_def, *existing_or);
-    if (deser_or.ok()) {
-      obj = std::move(*deser_or);
-    }
-  }
-
-  index::IndexRow row;
-  row.artifact_id = artifact_id;
-  // For order by artifact_id ascending, the value is the artifact_id.
-  row.order_values.push_back(static_cast<uint64_t>(artifact_id));
-  obj.rows.push_back(std::move(row));
-
-  auto ser_or = index::SerializeIndexObject(*schema_or, idx_def, obj);
-  ASSERT_TRUE(ser_or.ok()) << ser_or.status();
-  ASSERT_TRUE(storage.PutObject(branch, path, *ser_or).ok());
-}
-
-// Encode a single-field index key using DynamicMessage.
-template <typename SetFn> std::vector<uint8_t> EncodeIndexKey(const google::protobuf::Descriptor& desc, const std::string& field_name, SetFn set_fn) {
-  google::protobuf::DynamicMessageFactory factory;
-  const auto* prototype = factory.GetPrototype(&desc);
-  std::unique_ptr<google::protobuf::Message> msg(prototype->New());
-  set_fn(msg.get(), desc.FindFieldByName(field_name));
-  std::vector<std::string> key_fields = {field_name};
-  auto encoded_or = encoding::EncodeKey(desc, *msg, key_fields);
-  EXPECT_TRUE(encoded_or.ok());
-  return *encoded_or;
+  index::DerivedIndexEntry entry;
+  entry.index_def_id = index_def_id;
+  entry.key_type = idx_def.key_type();
+  entry.encoded_key = encoded_key;
+  entry.order_values.push_back(static_cast<uint64_t>(artifact_id));
+  entry.key_values = key_values;
+  ASSERT_TRUE(index::AddIndexRow(&storage, branch, entry, artifact_id, idx_def, parent_desc).ok());
 }
 
 std::vector<uint8_t> EncodeStringKey(const google::protobuf::Descriptor& desc, const std::string& field_name, const std::string& value) {
-  return EncodeIndexKey(desc, field_name,
-                        [&](google::protobuf::Message* msg, const google::protobuf::FieldDescriptor* f) { msg->GetReflection()->SetString(msg, f, value); });
+  auto encoded_or = encoding::EncodeSingleStringKey(desc, field_name, value);
+  EXPECT_TRUE(encoded_or.ok()) << encoded_or.status();
+  return *encoded_or;
 }
 
 std::vector<uint8_t> EncodeUint64Key(const google::protobuf::Descriptor& desc, const std::string& field_name, uint64_t value) {
-  return EncodeIndexKey(desc, field_name,
-                        [&](google::protobuf::Message* msg, const google::protobuf::FieldDescriptor* f) { msg->GetReflection()->SetUInt64(msg, f, value); });
+  auto encoded_or = encoding::EncodeSingleUint64Key(desc, field_name, value);
+  EXPECT_TRUE(encoded_or.ok()) << encoded_or.status();
+  return *encoded_or;
 }
 
 std::vector<uint8_t> EncodeEmptyKey() {
@@ -257,7 +193,7 @@ private:
 
       TypeVersionDefinition tvd;
       tvd.set_type_id(mt.td_id);
-      *tvd.mutable_descriptor_set() = BuildDescriptorSet(mt.descriptor);
+      *tvd.mutable_descriptor_set() = artifact::BuildDescriptorSet(mt.descriptor);
       WriteStoredArtifact(*storage_, branch, mt.tvd_id, kTVDTVDId, "artifact_system.TypeVersionDefinition", tvd.SerializeAsString());
     }
 

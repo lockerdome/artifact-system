@@ -55,26 +55,6 @@ absl::Status MakeNotFoundError(uint64_t artifact_id, bool tombstoned) {
   return status;
 }
 
-// Serialize a StoredArtifact envelope.
-std::string SerializeEnvelope(uint64_t version_id, const std::string& type_name, const std::string& payload) {
-  StoredArtifact envelope;
-  envelope.set_envelope_version(1);
-  envelope.set_version_id(version_id);
-  envelope.set_type_name(type_name);
-  envelope.set_payload(payload);
-  return envelope.SerializeAsString();
-}
-
-// Serialize a tombstone envelope.
-std::string SerializeTombstone(uint64_t version_id, const std::string& type_name) {
-  StoredArtifact envelope;
-  envelope.set_envelope_version(1);
-  envelope.set_version_id(version_id);
-  envelope.set_type_name(type_name);
-  // empty payload = tombstone
-  return envelope.SerializeAsString();
-}
-
 // Aliases for shared index utilities used throughout this file.
 using index::AddIndexRow;
 using index::FindIndexDefinition;
@@ -266,7 +246,7 @@ absl::StatusOr<std::string> ArtifactStore::ExecuteWrite(const std::optional<std:
 absl::Status ArtifactStore::StageCreate(const std::string& branch, uint64_t artifact_id, uint64_t version_id, const std::string& type_name,
                                         const std::string& payload, const google::protobuf::FileDescriptorSet& descriptor_set) {
   // 1. Write the StoredArtifact envelope.
-  const std::string envelope = SerializeEnvelope(version_id, type_name, payload);
+  const std::string envelope = SerializeStoredArtifact(version_id, type_name, payload);
   const std::string artifact_path = encoding::ArtifactPath(artifact_id);
   auto status = storage_->PutObject(branch, artifact_path, envelope);
   if (!status.ok())
@@ -325,7 +305,7 @@ absl::Status ArtifactStore::StageUpdate(const std::string& branch, uint64_t arti
   }
 
   // 3. Write the new StoredArtifact envelope.
-  const std::string envelope = SerializeEnvelope(version_id, type_name, payload);
+  const std::string envelope = SerializeStoredArtifact(version_id, type_name, payload);
   const std::string artifact_path = encoding::ArtifactPath(artifact_id);
   auto status = storage_->PutObject(branch, artifact_path, envelope);
   if (!status.ok())
@@ -375,7 +355,7 @@ absl::Status ArtifactStore::StageUpdate(const std::string& branch, uint64_t arti
 
 absl::Status ArtifactStore::StageDelete(const std::string& branch, uint64_t artifact_id, const StoredArtifact& existing) {
   // 1. Write tombstone envelope.
-  const std::string tombstone = SerializeTombstone(existing.version_id(), existing.type_name());
+  const std::string tombstone = SerializeStoredArtifact(existing.version_id(), existing.type_name(), "");
   const std::string artifact_path = encoding::ArtifactPath(artifact_id);
   auto status = storage_->PutObject(branch, artifact_path, tombstone);
   if (!status.ok())

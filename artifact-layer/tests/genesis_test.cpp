@@ -3,7 +3,6 @@
 #include <cstdint>
 #include <span>
 #include <string>
-#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -16,11 +15,11 @@
 #include "encoding/index_key_encoder.h"
 #include "google/protobuf/descriptor.h"
 #include "google/protobuf/descriptor.pb.h"
-#include "google/protobuf/dynamic_message.h"
 #include "id/id_allocator_interface.h"
 #include "index/index_derivation.h"
 #include "index/index_object.h"
 #include "index/index_schema_generator.h"
+#include "index/index_utils.h"
 #include "registry/type_registry.h"
 #include "storage/memory_storage.h"
 #include "transaction/transaction_manager.h"
@@ -47,18 +46,14 @@ StoredArtifact ReadArtifact(MemoryStorage& storage, uint64_t id) {
   return envelope;
 }
 
-template <typename T> std::vector<uint8_t> EncodeKey(const google::protobuf::Descriptor& desc, const std::string& field_name, const T& value) {
-  google::protobuf::DynamicMessageFactory factory;
-  const auto* prototype = factory.GetPrototype(&desc);
-  std::unique_ptr<google::protobuf::Message> msg(prototype->New());
-  const auto* field = desc.FindFieldByName(field_name);
-  if constexpr (std::is_convertible_v<T, std::string>) {
-    msg->GetReflection()->SetString(msg.get(), field, std::string(value));
-  } else if constexpr (std::is_same_v<T, uint64_t>) {
-    msg->GetReflection()->SetUInt64(msg.get(), field, value);
-  }
-  std::vector<std::string> key_fields = {field_name};
-  auto encoded = encoding::EncodeKey(desc, *msg, key_fields);
+std::vector<uint8_t> EncodeKey(const google::protobuf::Descriptor& desc, const std::string& field_name, const std::string& value) {
+  auto encoded = encoding::EncodeSingleStringKey(desc, field_name, value);
+  EXPECT_TRUE(encoded.ok()) << encoded.status();
+  return *encoded;
+}
+
+std::vector<uint8_t> EncodeKey(const google::protobuf::Descriptor& desc, const std::string& field_name, uint64_t value) {
+  auto encoded = encoding::EncodeSingleUint64Key(desc, field_name, value);
   EXPECT_TRUE(encoded.ok()) << encoded.status();
   return *encoded;
 }
@@ -85,14 +80,9 @@ std::unordered_set<uint64_t> CollectArtifactIds(const index::IndexObject& obj) {
 }
 
 IndexDefinition FindIndexDef(const google::protobuf::Descriptor& desc, const std::string& key_type) {
-  const auto& options = desc.options();
-  for (int i = 0; i < options.ExtensionSize(artifact_system::indexes); ++i) {
-    const auto& def = options.GetExtension(artifact_system::indexes, i);
-    if (def.key_type() == key_type)
-      return def;
-  }
-  ADD_FAILURE() << "index def not found: " << key_type;
-  return {};
+  auto result = index::FindIndexDefinition(desc, key_type);
+  EXPECT_TRUE(result.has_value()) << "index def not found: " << key_type;
+  return result.value_or(IndexDefinition{});
 }
 
 // ---------------------------------------------------------------------------

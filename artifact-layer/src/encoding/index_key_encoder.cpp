@@ -14,6 +14,7 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_split.h"
 #include "google/protobuf/descriptor.h"
+#include "google/protobuf/dynamic_message.h"
 #include "google/protobuf/message.h"
 #include "google/protobuf/reflection.h"
 
@@ -270,6 +271,33 @@ absl::StatusOr<std::vector<uint8_t>> EncodeKey(const google::protobuf::Descripto
   }
 
   return out;
+}
+
+absl::StatusOr<std::vector<uint8_t>> EncodeSingleStringKey(const google::protobuf::Descriptor& descriptor, const std::string& field_name,
+                                                           const std::string& value) {
+  google::protobuf::DynamicMessageFactory factory;
+  const auto* prototype = factory.GetPrototype(&descriptor);
+  std::unique_ptr<google::protobuf::Message> msg(prototype->New());
+  const auto* field = descriptor.FindFieldByName(field_name);
+  if (field == nullptr) {
+    return absl::InvalidArgumentError(absl::StrCat("field not found: ", field_name));
+  }
+  msg->GetReflection()->SetString(msg.get(), field, value);
+  std::vector<std::string> key_fields = {field_name};
+  return EncodeKey(descriptor, *msg, key_fields);
+}
+
+absl::StatusOr<std::vector<uint8_t>> EncodeSingleUint64Key(const google::protobuf::Descriptor& descriptor, const std::string& field_name, uint64_t value) {
+  google::protobuf::DynamicMessageFactory factory;
+  const auto* prototype = factory.GetPrototype(&descriptor);
+  std::unique_ptr<google::protobuf::Message> msg(prototype->New());
+  const auto* field = descriptor.FindFieldByName(field_name);
+  if (field == nullptr) {
+    return absl::InvalidArgumentError(absl::StrCat("field not found: ", field_name));
+  }
+  msg->GetReflection()->SetUInt64(msg.get(), field, value);
+  std::vector<std::string> key_fields = {field_name};
+  return EncodeKey(descriptor, *msg, key_fields);
 }
 
 } // namespace artifact_system::encoding

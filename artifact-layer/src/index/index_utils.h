@@ -3,11 +3,13 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "google/protobuf/descriptor.h"
+#include "google/protobuf/message.h"
 
 #include "artifact_options.pb.h"
 #include "index/index_derivation.h"
@@ -34,5 +36,12 @@ absl::Status AddIndexRow(StorageInterface* storage, const std::string& branch, c
 // OkStatus on any intermediate failure.
 absl::Status RemoveIndexRow(StorageInterface* storage, const std::string& branch, const DerivedIndexEntry& entry, uint64_t artifact_id,
                             const IndexDefinition& index_def, const google::protobuf::Descriptor& descriptor);
+
+// Derive index entries from a protobuf message and write them all.
+// This combines DeriveIndexEntries, FindIndexDefinition, and AddIndexRow
+// into a single convenience function.
+absl::Status DeriveAndWriteIndexEntries(StorageInterface* storage, const std::string& branch, const google::protobuf::Descriptor& descriptor,
+                                        const google::protobuf::Message& message, uint64_t artifact_id,
+                                        const std::unordered_map<std::string, uint64_t>& index_def_ids_by_key_type);
 
 } // namespace artifact_system::index

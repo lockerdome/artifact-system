@@ -4,11 +4,13 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <variant>
 #include <vector>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "google/protobuf/descriptor.h"
 #include "google/protobuf/dynamic_message.h"
 
@@ -121,6 +123,25 @@ absl::Status RemoveIndexRow(StorageInterface* storage, const std::string& branch
   auto ser_or = SerializeIndexObject(*schema_or, index_def, idx_obj);
   if (ser_or.ok()) {
     (void)storage->PutObject(branch, index_path, *ser_or);
+  }
+  return absl::OkStatus();
+}
+
+absl::Status DeriveAndWriteIndexEntries(StorageInterface* storage, const std::string& branch, const google::protobuf::Descriptor& descriptor,
+                                        const google::protobuf::Message& message, uint64_t artifact_id,
+                                        const std::unordered_map<std::string, uint64_t>& index_def_ids_by_key_type) {
+  auto entries_or = DeriveIndexEntries(descriptor, message, artifact_id, index_def_ids_by_key_type);
+  if (!entries_or.ok())
+    return entries_or.status();
+
+  for (const auto& entry : *entries_or) {
+    auto index_def = FindIndexDefinition(descriptor, entry.key_type);
+    if (!index_def.has_value()) {
+      return absl::InternalError(absl::StrCat("no IndexDefinition for key_type: ", entry.key_type));
+    }
+    auto status = AddIndexRow(storage, branch, entry, artifact_id, *index_def, descriptor);
+    if (!status.ok())
+      return status;
   }
   return absl::OkStatus();
 }

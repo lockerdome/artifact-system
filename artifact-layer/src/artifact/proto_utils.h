@@ -5,6 +5,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "absl/status/status.h"
@@ -36,6 +37,16 @@ inline google::protobuf::FileDescriptorSet BuildDescriptorSet(const google::prot
   };
   add_file(desc->file());
   return fds;
+}
+
+// Serialize a StoredArtifact envelope with the given fields.
+inline std::string SerializeStoredArtifact(uint64_t version_id, std::string_view type_name, const std::string& payload) {
+  StoredArtifact envelope;
+  envelope.set_envelope_version(1);
+  envelope.set_version_id(version_id);
+  envelope.set_type_name(type_name);
+  envelope.set_payload(payload);
+  return envelope.SerializeAsString();
 }
 
 // Build a DescriptorPool from a FileDescriptorSet and find a message by name.

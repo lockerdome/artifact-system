@@ -28,4 +28,11 @@ absl::StatusOr<uint64_t> DecodeVarint(std::span<const uint8_t> bytes, size_t* by
 absl::StatusOr<std::vector<uint8_t>> EncodeKey(const google::protobuf::Descriptor& descriptor, const google::protobuf::Message& message,
                                                std::span<const std::string> key_fields);
 
+// Convenience: encode a single string field as an index key.
+absl::StatusOr<std::vector<uint8_t>> EncodeSingleStringKey(const google::protobuf::Descriptor& descriptor, const std::string& field_name,
+                                                           const std::string& value);
+
+// Convenience: encode a single uint64 field as an index key.
+absl::StatusOr<std::vector<uint8_t>> EncodeSingleUint64Key(const google::protobuf::Descriptor& descriptor, const std::string& field_name, uint64_t value);
+
 } // namespace artifact_system::encoding

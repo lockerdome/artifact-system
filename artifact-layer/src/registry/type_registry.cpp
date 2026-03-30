@@ -282,25 +282,9 @@ void CheckForRemovals(const std::vector<T>& old_items, const std::vector<T>& new
   }
 }
 
-// Encode a single-field key for an index lookup using DynamicMessage.
-absl::StatusOr<std::vector<uint8_t>> EncodeStringIndexKey(const google::protobuf::Descriptor& descriptor, const std::string& field_name,
-                                                          const std::string& value) {
-  google::protobuf::DynamicMessageFactory factory;
-  const auto* prototype = factory.GetPrototype(&descriptor);
-  std::unique_ptr<google::protobuf::Message> key_msg(prototype->New());
-  key_msg->GetReflection()->SetString(key_msg.get(), descriptor.FindFieldByName(field_name), value);
-  std::vector<std::string> key_fields = {field_name};
-  return encoding::EncodeKey(descriptor, *key_msg, key_fields);
-}
-
-absl::StatusOr<std::vector<uint8_t>> EncodeUint64IndexKey(const google::protobuf::Descriptor& descriptor, const std::string& field_name, uint64_t value) {
-  google::protobuf::DynamicMessageFactory factory;
-  const auto* prototype = factory.GetPrototype(&descriptor);
-  std::unique_ptr<google::protobuf::Message> key_msg(prototype->New());
-  key_msg->GetReflection()->SetUInt64(key_msg.get(), descriptor.FindFieldByName(field_name), value);
-  std::vector<std::string> key_fields = {field_name};
-  return encoding::EncodeKey(descriptor, *key_msg, key_fields);
-}
+// Aliases for encoding convenience functions.
+const auto& EncodeStringIndexKey = encoding::EncodeSingleStringKey;
+const auto& EncodeUint64IndexKey = encoding::EncodeSingleUint64Key;
 
 // Populate an IndexSchemaInfo from an IndexDefinition and generated schema.
 IndexSchemaInfo BuildIndexSchemaInfo(uint64_t idx_id, const IndexDefinition& idx_def, const index::GeneratedIndexSchema& schema) {

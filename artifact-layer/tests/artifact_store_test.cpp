@@ -1,7 +1,6 @@
 #include "artifact/artifact_store.h"
 
 #include <cstdint>
-#include <functional>
 #include <optional>
 #include <set>
 #include <string>
@@ -10,6 +9,7 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "artifact/proto_utils.h"
 #include "artifact_internal.pb.h"
 #include "artifact_service.pb.h"
 #include "artifact_types.pb.h"
@@ -35,24 +35,6 @@ using artifact_system::transaction::TransactionManager;
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-// Build a FileDescriptorSet covering the given message descriptor and all its
-// transitive file dependencies.
-google::protobuf::FileDescriptorSet BuildDescriptorSet(const google::protobuf::Descriptor* desc) {
-  google::protobuf::FileDescriptorSet fds;
-  std::set<const google::protobuf::FileDescriptor*> seen;
-  std::function<void(const google::protobuf::FileDescriptor*)> add_file;
-  add_file = [&](const google::protobuf::FileDescriptor* fd) {
-    if (!seen.insert(fd).second)
-      return;
-    for (int i = 0; i < fd->dependency_count(); ++i) {
-      add_file(fd->dependency(i));
-    }
-    fd->CopyTo(fds.add_file());
-  };
-  add_file(desc->file());
-  return fds;
-}
 
 // Build a FileDescriptorSet for a simple test message with no indexes.
 // The message is named "test.SimpleTestArtifact" with a single string field "name".
@@ -157,12 +139,7 @@ protected:
 
 private:
   void WriteStoredArtifact(const std::string& branch, uint64_t artifact_id, uint64_t version_id, const std::string& type_name, const std::string& payload) {
-    StoredArtifact envelope;
-    envelope.set_envelope_version(1);
-    envelope.set_version_id(version_id);
-    envelope.set_type_name(type_name);
-    envelope.set_payload(payload);
-    ASSERT_TRUE(storage_->PutObject(branch, encoding::ArtifactPath(artifact_id), envelope.SerializeAsString()).ok());
+    ASSERT_TRUE(storage_->PutObject(branch, encoding::ArtifactPath(artifact_id), artifact::SerializeStoredArtifact(version_id, type_name, payload)).ok());
   }
 
   void BootstrapTypeSystem() {
@@ -182,7 +159,7 @@ private:
     {
       TypeVersionDefinition tvd;
       tvd.set_type_id(kTypeDefOfTypeDefId);
-      *tvd.mutable_descriptor_set() = BuildDescriptorSet(TypeDefinition::descriptor());
+      *tvd.mutable_descriptor_set() = artifact::BuildDescriptorSet(TypeDefinition::descriptor());
       WriteStoredArtifact(branch, kTVDForTypeDefId, kTVDForTVDId, "TypeVersionDefinition", tvd.SerializeAsString());
     }
 
@@ -200,7 +177,7 @@ private:
     {
       TypeVersionDefinition tvd;
       tvd.set_type_id(kTypeDefOfTVDId);
-      *tvd.mutable_descriptor_set() = BuildDescriptorSet(TypeVersionDefinition::descriptor());
+      *tvd.mutable_descriptor_set() = artifact::BuildDescriptorSet(TypeVersionDefinition::descriptor());
       WriteStoredArtifact(branch, kTVDForTVDId, kTVDForTVDId, "TypeVersionDefinition", tvd.SerializeAsString());
     }
 

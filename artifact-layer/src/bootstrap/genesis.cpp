@@ -18,7 +18,6 @@
 #include "artifact_options.pb.h"
 #include "artifact_types.pb.h"
 #include "encoding/artifact_path.h"
-#include "index/index_derivation.h"
 #include "index/index_utils.h"
 
 namespace artifact_system::bootstrap {
@@ -26,31 +25,7 @@ namespace {
 
 absl::Status WriteStoredArtifact(StorageInterface* storage, const std::string& branch, uint64_t artifact_id, uint64_t version_id, std::string_view type_name,
                                  const std::string& payload) {
-  StoredArtifact envelope;
-  envelope.set_envelope_version(1);
-  envelope.set_version_id(version_id);
-  envelope.set_type_name(type_name);
-  envelope.set_payload(payload);
-  return storage->PutObject(branch, encoding::ArtifactPath(artifact_id), envelope.SerializeAsString());
-}
-
-absl::Status DeriveAndWriteIndexEntries(StorageInterface* storage, const std::string& branch, const google::protobuf::Descriptor& descriptor,
-                                        const google::protobuf::Message& message, uint64_t artifact_id,
-                                        const std::unordered_map<std::string, uint64_t>& index_def_ids_by_key_type) {
-  auto entries_or = index::DeriveIndexEntries(descriptor, message, artifact_id, index_def_ids_by_key_type);
-  if (!entries_or.ok())
-    return entries_or.status();
-
-  for (const auto& entry : *entries_or) {
-    auto index_def = index::FindIndexDefinition(descriptor, entry.key_type);
-    if (!index_def.has_value()) {
-      return absl::InternalError(absl::StrCat("no IndexDefinition for key_type: ", entry.key_type));
-    }
-    auto status = index::AddIndexRow(storage, branch, entry, artifact_id, *index_def, descriptor);
-    if (!status.ok())
-      return status;
-  }
-  return absl::OkStatus();
+  return storage->PutObject(branch, encoding::ArtifactPath(artifact_id), artifact::SerializeStoredArtifact(version_id, type_name, payload));
 }
 
 std::unordered_map<std::string, uint64_t> BuildIndexDefIdsMap() {
@@ -215,7 +190,7 @@ absl::StatusOr<GenesisResult> RunGenesis(StorageInterface* storage) {
 
   // ── 11. Derive and write all index entries ──
   for (const auto& artifact : staged) {
-    status = DeriveAndWriteIndexEntries(storage, branch, *artifact.descriptor, *artifact.message, artifact.artifact_id, index_def_ids);
+    status = index::DeriveAndWriteIndexEntries(storage, branch, *artifact.descriptor, *artifact.message, artifact.artifact_id, index_def_ids);
     if (!status.ok())
       return status;
   }
