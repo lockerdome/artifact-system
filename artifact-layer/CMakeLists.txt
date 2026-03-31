@@ -117,6 +117,11 @@ add_library(artifact_layer_lib
   src/registry/schema_compatibility.cpp
   src/registry/type_registry.cpp
   src/bootstrap/genesis.cpp
+  src/service/snapshot_transaction_service_impl.cpp
+  src/service/artifact_service_impl.cpp
+  src/service/index_service_impl.cpp
+  src/service/type_registry_service_impl.cpp
+  src/service/server.cpp
 )
 target_include_directories(artifact_layer_lib PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(artifact_layer_lib

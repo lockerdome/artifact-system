@@ -89,6 +89,9 @@ public:
   // BatchGetArtifacts: per-id results preserving positional correlation.
   absl::StatusOr<std::vector<BatchGetEntry>> BatchGetArtifacts(const std::vector<uint64_t>& artifact_ids, const ReadContext& context);
 
+  // Update the index_def_ids_by_key_type map (e.g., after registering new types).
+  void UpdateIndexDefIds(const std::unordered_map<std::string, uint64_t>& new_ids);
+
 private:
   // Resolve a ReadContext to a storage ref (branch name or commit ID).
   absl::StatusOr<std::string> ResolveReadRef(const ReadContext& context);

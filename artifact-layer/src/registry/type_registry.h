@@ -81,6 +81,9 @@ public:
   // GetIndexSchema: return index definition and generated proto schema.
   absl::StatusOr<IndexSchemaInfo> GetIndexSchema(const std::string& key_type);
 
+  // Read-only access to the current index_def_ids_by_key_type map.
+  const std::unordered_map<std::string, uint64_t>& index_def_ids_by_key_type() const { return index_def_ids_by_key_type_; }
+
   // Update the index_def_ids_by_key_type map (called after bootstrap or
   // registration to keep the map current).
   void UpdateIndexDefIds(const std::unordered_map<std::string, uint64_t>& new_ids);
