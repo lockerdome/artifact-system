@@ -57,5 +57,7 @@ target_link_libraries(id_allocator_client_cpp_lib
     Threads::Threads
 )
 
-enable_testing()
-add_subdirectory(tests)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  enable_testing()
+  add_subdirectory(tests)
+endif()
