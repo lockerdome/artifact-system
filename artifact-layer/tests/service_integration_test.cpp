@@ -189,6 +189,31 @@ protected:
     return resp.transaction_id();
   }
 
+  // Get the index schema for the given key_type and build a serialized
+  // IndexKey_* message with the given name value.
+  std::string BuildSerializedIndexKey(const std::string& key_type, const std::string& name_value) {
+    GetIndexSchemaResponse schema;
+    {
+      grpc::ClientContext ctx;
+      GetIndexSchemaRequest req;
+      req.set_key_type(key_type);
+      auto status = type_registry_stub_->GetIndexSchema(&ctx, req, &schema);
+      EXPECT_TRUE(status.ok()) << status.error_message();
+    }
+
+    google::protobuf::DescriptorPool pool;
+    const google::protobuf::Descriptor* key_desc =
+        artifact::BuildPoolAndFindMessage(schema.index_descriptor_set(), schema.key_message_name(), &pool);
+    EXPECT_NE(key_desc, nullptr);
+
+    google::protobuf::DynamicMessageFactory factory;
+    std::unique_ptr<google::protobuf::Message> key_msg(factory.GetPrototype(key_desc)->New());
+    const google::protobuf::FieldDescriptor* name_field = key_desc->FindFieldByName("name");
+    EXPECT_NE(name_field, nullptr);
+    key_msg->GetReflection()->SetString(key_msg.get(), name_field, name_value);
+    return key_msg->SerializeAsString();
+  }
+
   std::unique_ptr<service::ArtifactLayerServer> server_;
   std::thread server_thread_;
   std::unique_ptr<SnapshotTransactionService::Stub> snapshot_txn_stub_;
@@ -555,34 +580,8 @@ TEST_F(ServiceIntegrationTest, CreateSnapshot_InvalidParent) {
 TEST_F(ServiceIntegrationTest, FetchIndex_Success) {
   uint64_t version_id = RegisterTestType();
 
-  // Create an artifact so that the index gets populated.
   CreateTestArtifact(version_id, "indexed_name");
-
-  // Get the index schema to learn the key message format.
-  GetIndexSchemaResponse schema;
-  {
-    grpc::ClientContext ctx;
-    GetIndexSchemaRequest req;
-    req.set_key_type("TestArtifact_by_name");
-    auto status = type_registry_stub_->GetIndexSchema(&ctx, req, &schema);
-    ASSERT_TRUE(status.ok()) << status.error_message();
-  }
-
-  // Build a key using the descriptor set from the schema.
-  google::protobuf::DescriptorPool pool;
-  const google::protobuf::Descriptor* key_desc = artifact::BuildPoolAndFindMessage(schema.index_descriptor_set(), schema.key_message_name(), &pool);
-  ASSERT_NE(key_desc, nullptr);
-
-  google::protobuf::DynamicMessageFactory factory;
-  std::unique_ptr<google::protobuf::Message> key_msg(factory.GetPrototype(key_desc)->New());
-  const google::protobuf::Reflection* refl = key_msg->GetReflection();
-  const google::protobuf::FieldDescriptor* name_field = key_desc->FindFieldByName("name");
-  ASSERT_NE(name_field, nullptr);
-  refl->SetString(key_msg.get(), name_field, "indexed_name");
-
-  std::string serialized_key = key_msg->SerializeAsString();
-
-  // Fetch the index.
+  std::string serialized_key = BuildSerializedIndexKey("TestArtifact_by_name", "indexed_name");
   {
     grpc::ClientContext ctx;
     FetchIndexRequest req;
@@ -610,34 +609,8 @@ TEST_F(ServiceIntegrationTest, FetchIndex_IndexNotFound) {
 TEST_F(ServiceIntegrationTest, FetchIndex_EmptyResult) {
   uint64_t version_id = RegisterTestType();
 
-  // Create at least one artifact so that the index infrastructure is set up.
   CreateTestArtifact(version_id, "some_name");
-
-  // Get the index schema.
-  GetIndexSchemaResponse schema;
-  {
-    grpc::ClientContext ctx;
-    GetIndexSchemaRequest req;
-    req.set_key_type("TestArtifact_by_name");
-    auto status = type_registry_stub_->GetIndexSchema(&ctx, req, &schema);
-    ASSERT_TRUE(status.ok()) << status.error_message();
-  }
-
-  // Build a key for a name that has no matching artifacts.
-  google::protobuf::DescriptorPool pool;
-  const google::protobuf::Descriptor* key_desc = artifact::BuildPoolAndFindMessage(schema.index_descriptor_set(), schema.key_message_name(), &pool);
-  ASSERT_NE(key_desc, nullptr);
-
-  google::protobuf::DynamicMessageFactory factory;
-  std::unique_ptr<google::protobuf::Message> key_msg(factory.GetPrototype(key_desc)->New());
-  const google::protobuf::Reflection* refl = key_msg->GetReflection();
-  const google::protobuf::FieldDescriptor* name_field = key_desc->FindFieldByName("name");
-  ASSERT_NE(name_field, nullptr);
-  refl->SetString(key_msg.get(), name_field, "no_such_name_exists");
-
-  std::string serialized_key = key_msg->SerializeAsString();
-
-  // Fetch the index -- should return OK with empty index payload.
+  std::string serialized_key = BuildSerializedIndexKey("TestArtifact_by_name", "no_such_name_exists");
   {
     grpc::ClientContext ctx;
     FetchIndexRequest req;
