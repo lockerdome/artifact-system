@@ -1,4 +1,4 @@
-#include "client.h"
+#include "id_allocator_client/client.h"
 
 #include <stdexcept>
 #include <utility>

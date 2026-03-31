@@ -1,6 +1,6 @@
 #include "id/id_allocator.h"
 
-#include "client.h"
+#include "id_allocator_client/client.h"
 
 namespace artifact_system {
 

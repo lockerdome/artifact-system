@@ -7,8 +7,8 @@
 #include <grpcpp/grpcpp.h>
 
 #include "id_allocator.grpc.pb.h"
-#include "retry.h"
-#include "types.h"
+#include "id_allocator_client/retry.h"
+#include "id_allocator_client/types.h"
 
 namespace id_allocator::client {
 

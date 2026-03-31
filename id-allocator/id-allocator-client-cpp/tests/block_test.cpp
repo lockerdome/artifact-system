@@ -2,7 +2,7 @@
 
 #include <gtest/gtest.h>
 
-#include "block.h"
+#include "id_allocator_client/block.h"
 
 namespace id_allocator::client {
 namespace {

@@ -6,8 +6,8 @@
 
 #include <grpcpp/grpcpp.h>
 
-#include "block_double_buffer.h"
-#include "grpc_client.h"
+#include "id_allocator_client/block_double_buffer.h"
+#include "id_allocator_client/grpc_client.h"
 
 namespace id_allocator::client {
 

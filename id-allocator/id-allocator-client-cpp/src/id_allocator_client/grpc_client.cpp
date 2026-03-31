@@ -1,4 +1,4 @@
-#include "grpc_client.h"
+#include "id_allocator_client/grpc_client.h"
 
 #include <utility>
 
