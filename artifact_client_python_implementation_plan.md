@@ -31,16 +31,32 @@ dead after its context exits.
 ### Client construction and lifecycle
 
 ```python
+import grpc
+import google.auth
+import google.auth.transport.grpc as google_auth_grpc
 from artifact_client import ArtifactClient
+
+# Production: SSL transport + Google Auth call credentials
+credentials, project = google.auth.default()
+channel_credentials = grpc.composite_channel_credentials(
+    grpc.ssl_channel_credentials(),
+    google_auth_grpc.AuthMetadataPlugin(credentials),
+)
 
 client = ArtifactClient(
     service_address="host:port",
     retry=RetryOptions(max_retries=5, base_delay_s=0.1, max_delay_s=10.0),
-    channel_credentials=None,  # defaults to insecure
+    channel_credentials=channel_credentials,
 )
 
+# Local development only:
+# channel_credentials=grpc.local_channel_credentials()
+
 # Async variant
-client = AsyncArtifactClient(service_address="host:port")
+client = AsyncArtifactClient(
+    service_address="host:port",
+    channel_credentials=channel_credentials,
+)
 ```
 
 The client exposes four methods: `snapshot()`, `transaction()`, `register_type()`, and

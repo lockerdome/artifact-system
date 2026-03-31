@@ -28,12 +28,25 @@ throw) once the callback settles, preventing use-after-commit/rollback bugs.
 
 ```javascript
 const { ArtifactClient } = require('artifact-client-js');
+const grpc = require('@grpc/grpc-js');
+const { GoogleAuth } = require('google-auth-library');
+
+// Production: SSL transport + Google Auth call credentials
+const auth = new GoogleAuth();
+const googleCredential = await auth.getClient();
+const channel_credentials = grpc.credentials.combineChannelCredentials(
+  grpc.credentials.createSsl(),
+  grpc.credentials.createFromGoogleCredential(googleCredential),
+);
 
 const client = new ArtifactClient({
   service_address: 'host:port',
   retry: { max_retries: 5, base_delay_ms: 100, max_delay_ms: 10000 },
-  channel_credentials: grpc.credentials.createInsecure(), // optional
+  channel_credentials,
 });
+
+// Local development only:
+// channel_credentials: grpc.credentials.createInsecure()
 
 await client.initialize(); // connect gRPC channels
 client.close();            // tear down
