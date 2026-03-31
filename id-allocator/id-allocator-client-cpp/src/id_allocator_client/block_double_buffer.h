@@ -6,8 +6,8 @@
 #include <optional>
 #include <thread>
 
-#include "block.h"
-#include "types.h"
+#include "id_allocator_client/block.h"
+#include "id_allocator_client/types.h"
 
 namespace id_allocator::client {
 

@@ -90,6 +90,13 @@ add_library(artifact_layer_proto
 target_include_directories(artifact_layer_proto PUBLIC "${PROTO_OUT}")
 target_link_libraries(artifact_layer_proto PUBLIC ${_GRPC_GRPCPP} ${_PROTOBUF_LIBPROTOBUF})
 
+# ── ID Allocator client library ──────────────────────────────────────────
+add_subdirectory(
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../id-allocator/id-allocator-client-cpp"
+  "${CMAKE_CURRENT_BINARY_DIR}/id-allocator-client-cpp"
+  EXCLUDE_FROM_ALL
+)
+
 # ── Find system libcurl (used by LakeFS storage client) ───────────────────
 find_package(CURL REQUIRED)
 find_package(OpenSSL REQUIRED)
@@ -121,6 +128,7 @@ add_library(artifact_layer_lib
   src/service/artifact_service_impl.cpp
   src/service/index_service_impl.cpp
   src/service/type_registry_service_impl.cpp
+  src/id/id_allocator.cpp
   src/service/server.cpp
 )
 target_include_directories(artifact_layer_lib PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
@@ -138,6 +146,7 @@ target_link_libraries(artifact_layer_lib
     CURL::libcurl
     OpenSSL::Crypto
     nlohmann_json::nlohmann_json
+    id_allocator_client_cpp_lib
 )
 
 # ── Executable ────────────────────────────────────────────────────────────

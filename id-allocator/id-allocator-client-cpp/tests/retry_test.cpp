@@ -2,7 +2,7 @@
 
 #include <gtest/gtest.h>
 
-#include "retry.h"
+#include "id_allocator_client/retry.h"
 
 namespace id_allocator::client {
 namespace {

@@ -11,7 +11,7 @@
 #include <grpcpp/grpcpp.h>
 #include <gtest/gtest.h>
 
-#include "client.h"
+#include "id_allocator_client/client.h"
 #include "id_allocator.grpc.pb.h"
 
 namespace id_allocator::client {

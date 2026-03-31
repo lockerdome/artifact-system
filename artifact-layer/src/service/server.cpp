@@ -6,6 +6,7 @@
 #include "bootstrap/genesis.h"
 #include "grpcpp/health_check_service_interface.h"
 #include "grpcpp/server_builder.h"
+#include "id/id_allocator.h"
 #include "id/id_allocator_interface.h"
 #include "registry/type_registry.h"
 #include "service/artifact_service_impl.h"
@@ -21,7 +22,7 @@ struct ArtifactLayerServer::Impl {
   ServerConfig config;
 
   std::unique_ptr<MemoryStorage> storage;
-  std::unique_ptr<MockIdAllocator> id_allocator;
+  std::unique_ptr<IdAllocatorInterface> id_allocator;
   std::unique_ptr<transaction::TransactionManager> txn_manager;
   std::unique_ptr<artifact::ArtifactStore> artifact_store;
   std::unique_ptr<registry::TypeRegistry> type_registry;
@@ -50,7 +51,17 @@ absl::Status ArtifactLayerServer::Initialize() {
   }
 
   // Must start after pre-allocated genesis IDs.
-  impl_->id_allocator = std::make_unique<MockIdAllocator>(bootstrap::GenesisIds::kFirstUserAllocatableId);
+  if (impl_->config.id_allocator.has_value()) {
+    auto prod_allocator = std::make_unique<ProductionIdAllocator>(impl_->config.id_allocator.value());
+    try {
+      prod_allocator->Initialize();
+    } catch (const std::exception& e) {
+      return absl::UnavailableError(std::string("Failed to initialize ID allocator: ") + e.what());
+    }
+    impl_->id_allocator = std::move(prod_allocator);
+  } else {
+    impl_->id_allocator = std::make_unique<MockIdAllocator>(bootstrap::GenesisIds::kFirstUserAllocatableId);
+  }
   impl_->txn_manager = std::make_unique<transaction::TransactionManager>(impl_->storage.get());
 
   artifact::ArtifactStore::Options store_options{.index_def_ids_by_key_type = genesis_result->index_def_ids_by_key_type};

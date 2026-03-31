@@ -40,10 +40,10 @@ target_include_directories(id_allocator_client_proto PUBLIC "${CMAKE_CURRENT_BIN
 target_link_libraries(id_allocator_client_proto PUBLIC ${_GRPC_GRPCPP} ${_PROTOBUF_LIBPROTOBUF})
 
 add_library(id_allocator_client_cpp_lib
-  src/block.cpp
-  src/block_double_buffer.cpp
-  src/grpc_client.cpp
-  src/client.cpp
+  src/id_allocator_client/block.cpp
+  src/id_allocator_client/block_double_buffer.cpp
+  src/id_allocator_client/grpc_client.cpp
+  src/id_allocator_client/client.cpp
 )
 target_include_directories(id_allocator_client_cpp_lib
   PUBLIC
@@ -57,5 +57,7 @@ target_link_libraries(id_allocator_client_cpp_lib
     Threads::Threads
 )
 
-enable_testing()
-add_subdirectory(tests)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  enable_testing()
+  add_subdirectory(tests)
+endif()

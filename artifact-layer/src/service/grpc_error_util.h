@@ -11,44 +11,10 @@
 
 namespace artifact_system::service {
 
-// Convert absl::StatusCode to grpc::StatusCode.
+// absl::StatusCode and grpc::StatusCode both follow google.rpc.Code and
+// are numerically identical, so a static_cast is a safe 1:1 mapping.
 inline grpc::StatusCode AbslToGrpcCode(absl::StatusCode code) {
-  switch (code) {
-  case absl::StatusCode::kOk:
-    return grpc::OK;
-  case absl::StatusCode::kCancelled:
-    return grpc::CANCELLED;
-  case absl::StatusCode::kInvalidArgument:
-    return grpc::INVALID_ARGUMENT;
-  case absl::StatusCode::kDeadlineExceeded:
-    return grpc::DEADLINE_EXCEEDED;
-  case absl::StatusCode::kNotFound:
-    return grpc::NOT_FOUND;
-  case absl::StatusCode::kAlreadyExists:
-    return grpc::ALREADY_EXISTS;
-  case absl::StatusCode::kPermissionDenied:
-    return grpc::PERMISSION_DENIED;
-  case absl::StatusCode::kResourceExhausted:
-    return grpc::RESOURCE_EXHAUSTED;
-  case absl::StatusCode::kFailedPrecondition:
-    return grpc::FAILED_PRECONDITION;
-  case absl::StatusCode::kAborted:
-    return grpc::ABORTED;
-  case absl::StatusCode::kOutOfRange:
-    return grpc::OUT_OF_RANGE;
-  case absl::StatusCode::kUnimplemented:
-    return grpc::UNIMPLEMENTED;
-  case absl::StatusCode::kInternal:
-    return grpc::INTERNAL;
-  case absl::StatusCode::kUnavailable:
-    return grpc::UNAVAILABLE;
-  case absl::StatusCode::kDataLoss:
-    return grpc::DATA_LOSS;
-  case absl::StatusCode::kUnauthenticated:
-    return grpc::UNAUTHENTICATED;
-  default:
-    return grpc::UNKNOWN;
-  }
+  return static_cast<grpc::StatusCode>(code);
 }
 
 namespace detail {
