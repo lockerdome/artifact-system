@@ -1,13 +1,19 @@
 #pragma once
 #include "absl/status/status.h"
 #include "grpcpp/server.h"
+#include "id/id_allocator.h"
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace artifact_system::service {
 
 struct ServerConfig {
   std::string listen_address = "0.0.0.0:50051";
+
+  // When set, use the production ID allocator connecting to this service.
+  // When empty, use MockIdAllocator (for tests).
+  std::optional<IdAllocatorConfig> id_allocator;
 };
 
 // Owns the gRPC server and all service dependencies.
