@@ -83,8 +83,9 @@ inline grpc::Status AbslToGrpcStatus(const absl::Status& status) {
 
   std::string error_details;
   status.ForEachPayload([&](absl::string_view type_url, const absl::Cord& payload) {
-    if (!error_details.empty())
+    if (!error_details.empty()) {
       return;
+    }
 
     std::string payload_str = std::string(payload);
 

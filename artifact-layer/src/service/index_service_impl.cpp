@@ -22,14 +22,16 @@ IndexServiceImpl::IndexServiceImpl(StorageInterface* storage, transaction::Trans
 absl::StatusOr<std::string> IndexServiceImpl::ResolveReadRef(const ReadContext& read_context) {
   if (read_context.has_snapshot_id()) {
     auto meta = txn_manager_->GetSnapshotMetadata(read_context.snapshot_id());
-    if (!meta.ok())
+    if (!meta.ok()) {
       return MakeSnapshotTxnError(meta.status().message(), SnapshotTransactionError::SNAPSHOT_NOT_FOUND, read_context.snapshot_id());
+    }
     return read_context.snapshot_id();
   }
   if (read_context.has_transaction_id()) {
     auto meta = txn_manager_->GetTransactionMetadata(read_context.transaction_id());
-    if (!meta.ok())
+    if (!meta.ok()) {
       return MakeSnapshotTxnError(meta.status().message(), SnapshotTransactionError::TRANSACTION_NOT_FOUND, read_context.transaction_id());
+    }
     return read_context.transaction_id();
   }
   return std::string(storage_->GetCanonicalBranch());
@@ -40,47 +42,54 @@ grpc::Status IndexServiceImpl::FetchIndex(grpc::ServerContext* /*context*/, cons
 
   auto schema_info_or = registry_->GetIndexSchema(key_type);
   if (!schema_info_or.ok()) {
-    if (absl::IsNotFound(schema_info_or.status()))
+    if (absl::IsNotFound(schema_info_or.status())) {
       return AbslToGrpcStatus(MakeFetchIndexError(absl::StatusCode::kNotFound, absl::StrCat("index not found for key_type: ", key_type),
                                                   FetchIndexError::INDEX_NOT_FOUND, key_type));
+    }
     return AbslToGrpcStatus(schema_info_or.status());
   }
   const registry::IndexSchemaInfo& schema_info = *schema_info_or;
 
   auto ref_or = ResolveReadRef(request->context());
-  if (!ref_or.ok())
+  if (!ref_or.ok()) {
     return AbslToGrpcStatus(ref_or.status());
+  }
   const std::string& ref = *ref_or;
 
   google::protobuf::DescriptorPool pool;
   const google::protobuf::Descriptor* key_desc = artifact::BuildPoolAndFindMessage(schema_info.index_descriptor_set, schema_info.key_message_name, &pool);
-  if (key_desc == nullptr)
+  if (key_desc == nullptr) {
     return AbslToGrpcStatus(MakeFetchIndexError(absl::StatusCode::kInternal, absl::StrCat("failed to build key descriptor for key_type: ", key_type),
                                                 FetchIndexError::KEY_PARSE_FAILURE, key_type));
+  }
 
   google::protobuf::DynamicMessageFactory factory;
   std::unique_ptr<google::protobuf::Message> key_msg(factory.GetPrototype(key_desc)->New());
-  if (!key_msg->ParseFromString(request->key()))
+  if (!key_msg->ParseFromString(request->key())) {
     return AbslToGrpcStatus(MakeFetchIndexError(absl::StatusCode::kInvalidArgument, absl::StrCat("failed to parse key bytes for key_type: ", key_type),
                                                 FetchIndexError::KEY_PARSE_FAILURE, key_type));
+  }
 
   // IndexKey_* fields use proto3_optional (synthetic oneofs) so HasField detects explicit presence.
   const google::protobuf::Reflection* refl = key_msg->GetReflection();
   for (int i = 0; i < key_desc->field_count(); ++i) {
     const google::protobuf::FieldDescriptor* field = key_desc->field(i);
-    if (field->is_repeated())
+    if (field->is_repeated()) {
       continue;
-    if (field->has_presence() && !refl->HasField(*key_msg, field))
+    }
+    if (field->has_presence() && !refl->HasField(*key_msg, field)) {
       return AbslToGrpcStatus(MakeFetchIndexError(absl::StatusCode::kInvalidArgument,
                                                   absl::StrCat("missing key field '", field->name(), "' for key_type: ", key_type),
                                                   FetchIndexError::INCOMPLETE_KEY, key_type));
+    }
   }
 
   auto encoded_key_or = encoding::EncodeKey(*key_desc, *key_msg, schema_info.key_fields);
-  if (!encoded_key_or.ok())
+  if (!encoded_key_or.ok()) {
     return AbslToGrpcStatus(MakeFetchIndexError(absl::StatusCode::kInvalidArgument,
                                                 absl::StrCat("failed to encode key for key_type: ", key_type, ": ", encoded_key_or.status().message()),
                                                 FetchIndexError::KEY_PARSE_FAILURE, key_type));
+  }
 
   std::span<const uint8_t> key_span(*encoded_key_or);
   const std::string path = encoding::IndexPath(schema_info.index_definition_id, key_span);

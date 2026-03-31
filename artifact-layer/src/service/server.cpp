@@ -45,8 +45,9 @@ absl::Status ArtifactLayerServer::Initialize() {
   impl_->storage = std::make_unique<MemoryStorage>();
 
   auto genesis_result = bootstrap::RunGenesis(impl_->storage.get());
-  if (!genesis_result.ok())
+  if (!genesis_result.ok()) {
     return genesis_result.status();
+  }
 
   // Must start after pre-allocated genesis IDs.
   impl_->id_allocator = std::make_unique<MockIdAllocator>(bootstrap::GenesisIds::kFirstUserAllocatableId);
@@ -85,8 +86,9 @@ void ArtifactLayerServer::Start() {
 }
 
 void ArtifactLayerServer::Shutdown() {
-  if (impl_->server)
+  if (impl_->server) {
     impl_->server->Shutdown();
+  }
 }
 
 int ArtifactLayerServer::port() const {

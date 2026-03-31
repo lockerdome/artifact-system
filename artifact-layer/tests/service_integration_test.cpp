@@ -83,8 +83,9 @@ std::string MakeTestPayload(const std::string& name) {
 
 template <typename DetailProto> bool ExtractErrorDetail(const grpc::Status& status, DetailProto* detail) {
   const std::string& error_details = status.error_details();
-  if (error_details.empty())
+  if (error_details.empty()) {
     return false;
+  }
 
   const std::string expected_type_url = absl::StrCat("type.googleapis.com/", DetailProto::descriptor()->full_name());
 
@@ -128,8 +129,9 @@ protected:
     server_thread_ = std::thread([this] { server_->Start(); });
 
     // Poll until the server has bound a port, then connect.
-    while (server_->port() == 0)
+    while (server_->port() == 0) {
       std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
 
     auto channel = grpc::CreateChannel("localhost:" + std::to_string(server_->port()), grpc::InsecureChannelCredentials());
     channel->WaitForConnected(std::chrono::system_clock::now() + std::chrono::seconds(5));
@@ -142,8 +144,9 @@ protected:
 
   void TearDown() override {
     server_->Shutdown();
-    if (server_thread_.joinable())
+    if (server_thread_.joinable()) {
       server_thread_.join();
+    }
   }
 
   // ---- Convenience helpers ------------------------------------------------

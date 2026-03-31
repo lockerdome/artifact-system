@@ -24,8 +24,9 @@ grpc::Status ArtifactServiceImpl::CreateArtifact(grpc::ServerContext* /*context*
     return grpc::Status(grpc::StatusCode::UNAVAILABLE, e.what());
   }
 
-  if (!result.ok())
+  if (!result.ok()) {
     return AbslToGrpcStatus(result.status());
+  }
 
   response->set_artifact_id(result->artifact_id);
   response->set_snapshot_id(result->snapshot_id);
@@ -34,8 +35,9 @@ grpc::Status ArtifactServiceImpl::CreateArtifact(grpc::ServerContext* /*context*
 
 grpc::Status ArtifactServiceImpl::GetArtifact(grpc::ServerContext* /*context*/, const GetArtifactRequest* request, GetArtifactResponse* response) {
   auto result = store_->GetArtifact(request->artifact_id(), request->context());
-  if (!result.ok())
+  if (!result.ok()) {
     return AbslToGrpcStatus(result.status());
+  }
 
   response->set_artifact_id(result->artifact_id);
   response->set_type_name(result->type_name);
@@ -48,8 +50,9 @@ grpc::Status ArtifactServiceImpl::BatchGetArtifacts(grpc::ServerContext* /*conte
                                                     BatchGetArtifactsResponse* response) {
   std::vector<uint64_t> artifact_ids(request->artifact_ids().begin(), request->artifact_ids().end());
   auto result = store_->BatchGetArtifacts(artifact_ids, request->context());
-  if (!result.ok())
+  if (!result.ok()) {
     return AbslToGrpcStatus(result.status());
+  }
 
   for (const auto& entry : *result) {
     auto* artifact_result = response->add_results();
@@ -68,8 +71,9 @@ grpc::Status ArtifactServiceImpl::BatchGetArtifacts(grpc::ServerContext* /*conte
 
 grpc::Status ArtifactServiceImpl::UpdateArtifact(grpc::ServerContext* /*context*/, const UpdateArtifactRequest* request, UpdateArtifactResponse* response) {
   auto result = store_->UpdateArtifact(request->artifact_id(), request->version_id(), request->payload(), OptionalTransactionId(*request));
-  if (!result.ok())
+  if (!result.ok()) {
     return AbslToGrpcStatus(result.status());
+  }
 
   response->set_snapshot_id(result->snapshot_id);
   return grpc::Status::OK;
@@ -77,8 +81,9 @@ grpc::Status ArtifactServiceImpl::UpdateArtifact(grpc::ServerContext* /*context*
 
 grpc::Status ArtifactServiceImpl::DeleteArtifact(grpc::ServerContext* /*context*/, const DeleteArtifactRequest* request, DeleteArtifactResponse* response) {
   auto result = store_->DeleteArtifact(request->artifact_id(), OptionalTransactionId(*request));
-  if (!result.ok())
+  if (!result.ok()) {
     return AbslToGrpcStatus(result.status());
+  }
 
   response->set_snapshot_id(result->snapshot_id);
   return grpc::Status::OK;

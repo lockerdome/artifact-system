@@ -17,8 +17,9 @@ grpc::Status SnapshotTransactionServiceImpl::CreateSnapshot(grpc::ServerContext*
 
   auto result = transaction_manager_->CreateSnapshot(parent_transaction_id);
   if (!result.ok()) {
-    if (absl::IsNotFound(result.status()))
+    if (absl::IsNotFound(result.status())) {
       return AbslToGrpcStatus(MakeSnapshotTxnError(result.status().message(), SnapshotTransactionError::PARENT_NOT_FOUND, request->parent_transaction_id()));
+    }
     return AbslToGrpcStatus(result.status());
   }
 
@@ -47,8 +48,9 @@ grpc::Status SnapshotTransactionServiceImpl::CreateTransaction(grpc::ServerConte
 
   auto result = transaction_manager_->CreateTransaction(parent_snapshot_id, parent_transaction_id);
   if (!result.ok()) {
-    if (absl::IsNotFound(result.status()))
+    if (absl::IsNotFound(result.status())) {
       return AbslToGrpcStatus(MakeSnapshotTxnError(result.status().message(), SnapshotTransactionError::PARENT_NOT_FOUND, parent_id));
+    }
     return AbslToGrpcStatus(result.status());
   }
 
@@ -60,8 +62,9 @@ grpc::Status SnapshotTransactionServiceImpl::CommitTransaction(grpc::ServerConte
                                                                CommitTransactionResponse* response) {
   auto result = transaction_manager_->CommitTransaction(request->transaction_id());
   if (!result.ok()) {
-    if (absl::IsNotFound(result.status()))
+    if (absl::IsNotFound(result.status())) {
       return AbslToGrpcStatus(MakeSnapshotTxnError(result.status().message(), SnapshotTransactionError::TRANSACTION_NOT_FOUND, request->transaction_id()));
+    }
     return AbslToGrpcStatus(result.status());
   }
 
@@ -79,8 +82,9 @@ grpc::Status SnapshotTransactionServiceImpl::RollbackTransaction(grpc::ServerCon
                                                                  RollbackTransactionResponse* response) {
   auto status = transaction_manager_->RollbackTransaction(request->transaction_id());
   if (!status.ok()) {
-    if (absl::IsNotFound(status))
+    if (absl::IsNotFound(status)) {
       return AbslToGrpcStatus(MakeSnapshotTxnError(status.message(), SnapshotTransactionError::TRANSACTION_NOT_FOUND, request->transaction_id()));
+    }
     return AbslToGrpcStatus(status);
   }
 
