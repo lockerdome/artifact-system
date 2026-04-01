@@ -125,6 +125,7 @@ TEST_F(GenesisTest, TypeDefinitionArtifactsAreCorrect) {
       {GenesisIds::kTypeDefinitionTypeDef, "artifact_system.TypeDefinition", GenesisIds::kTypeDefinitionTypeVersionDef},
       {GenesisIds::kTypeVersionDefinitionTypeDef, "artifact_system.TypeVersionDefinition", GenesisIds::kTypeVersionDefinitionTypeVersionDef},
       {GenesisIds::kReferenceDefinitionTypeDef, "artifact_system.ReferenceDefinition", GenesisIds::kReferenceDefinitionTypeVersionDef},
+      {GenesisIds::kTransactionCommitRecordTypeDef, "artifact_system.TransactionCommitRecord", GenesisIds::kTransactionCommitRecordTypeVersionDef},
   };
 
   for (const auto& c : cases) {
@@ -152,6 +153,7 @@ TEST_F(GenesisTest, TypeVersionDefinitionArtifactsAreCorrect) {
       {GenesisIds::kTypeDefinitionTypeVersionDef, GenesisIds::kTypeDefinitionTypeDef},
       {GenesisIds::kTypeVersionDefinitionTypeVersionDef, GenesisIds::kTypeVersionDefinitionTypeDef},
       {GenesisIds::kReferenceDefinitionTypeVersionDef, GenesisIds::kReferenceDefinitionTypeDef},
+      {GenesisIds::kTransactionCommitRecordTypeVersionDef, GenesisIds::kTransactionCommitRecordTypeDef},
   };
 
   for (const auto& c : cases) {
@@ -182,6 +184,7 @@ TEST_F(GenesisTest, IndexDefinitionArtifactsAreCorrect) {
       {GenesisIds::kReferenceKeyTypeUnique, "reference_key_type_unique"},
       {GenesisIds::kReferencesByTargetType, "references_by_target_type"},
       {GenesisIds::kAllReferenceDefinitions, "all_reference_definitions"},
+      {GenesisIds::kTransactionCommitById, "transaction_commit_by_id"},
   };
 
   for (const auto& c : cases) {
@@ -220,6 +223,7 @@ TEST_F(GenesisTest, IndexDefIdsMapIsCorrect) {
       {"reference_key_type_unique", GenesisIds::kReferenceKeyTypeUnique},
       {"references_by_target_type", GenesisIds::kReferencesByTargetType},
       {"all_reference_definitions", GenesisIds::kAllReferenceDefinitions},
+      {"transaction_commit_by_id", GenesisIds::kTransactionCommitById},
   };
   EXPECT_EQ(m, expected);
 }
@@ -255,6 +259,7 @@ TEST_F(GenesisTest, AllBootstrapIndexesAreQueryable) {
         {"artifact_system.TypeDefinition", GenesisIds::kTypeDefinitionTypeDef},
         {"artifact_system.TypeVersionDefinition", GenesisIds::kTypeVersionDefinitionTypeDef},
         {"artifact_system.ReferenceDefinition", GenesisIds::kReferenceDefinitionTypeDef},
+        {"artifact_system.TransactionCommitRecord", GenesisIds::kTransactionCommitRecordTypeDef},
     };
     for (const auto& c : cases) {
       SCOPED_TRACE(c.name);
@@ -265,26 +270,27 @@ TEST_F(GenesisTest, AllBootstrapIndexesAreQueryable) {
     }
   }
 
-  // all_types: contains all 4 TypeDefinition artifact_ids
+  // all_types: contains all 5 TypeDefinition artifact_ids
   {
     auto idx_def = FindIndexDef(*td_desc, "all_types");
     std::vector<uint8_t> empty_key;
     auto obj = ReadIndexObject(storage_, GenesisIds::kAllTypes, empty_key, idx_def, *td_desc);
     auto ids = CollectArtifactIds(obj);
-    EXPECT_EQ(ids.size(), 4);
+    EXPECT_EQ(ids.size(), 5);
     EXPECT_TRUE(ids.count(GenesisIds::kIndexDefinitionTypeDef));
     EXPECT_TRUE(ids.count(GenesisIds::kTypeDefinitionTypeDef));
     EXPECT_TRUE(ids.count(GenesisIds::kTypeVersionDefinitionTypeDef));
     EXPECT_TRUE(ids.count(GenesisIds::kReferenceDefinitionTypeDef));
+    EXPECT_TRUE(ids.count(GenesisIds::kTransactionCommitRecordTypeDef));
   }
 
-  // all_index_definitions: contains all 8 IndexDefinition artifact_ids
+  // all_index_definitions: contains all 9 IndexDefinition artifact_ids
   {
     auto idx_def = FindIndexDef(*idx_desc, "all_index_definitions");
     std::vector<uint8_t> empty_key;
     auto obj = ReadIndexObject(storage_, GenesisIds::kAllIndexDefinitions, empty_key, idx_def, *idx_desc);
     auto ids = CollectArtifactIds(obj);
-    EXPECT_EQ(ids.size(), 8);
+    EXPECT_EQ(ids.size(), 9);
     EXPECT_TRUE(ids.count(GenesisIds::kIndexKeyTypeUnique));
     EXPECT_TRUE(ids.count(GenesisIds::kAllIndexDefinitions));
     EXPECT_TRUE(ids.count(GenesisIds::kTypeNameUnique));
@@ -293,6 +299,7 @@ TEST_F(GenesisTest, AllBootstrapIndexesAreQueryable) {
     EXPECT_TRUE(ids.count(GenesisIds::kReferenceKeyTypeUnique));
     EXPECT_TRUE(ids.count(GenesisIds::kReferencesByTargetType));
     EXPECT_TRUE(ids.count(GenesisIds::kAllReferenceDefinitions));
+    EXPECT_TRUE(ids.count(GenesisIds::kTransactionCommitById));
   }
 
   // index_key_type_unique: look up each key_type
@@ -311,6 +318,7 @@ TEST_F(GenesisTest, AllBootstrapIndexesAreQueryable) {
         {"reference_key_type_unique", GenesisIds::kReferenceKeyTypeUnique},
         {"references_by_target_type", GenesisIds::kReferencesByTargetType},
         {"all_reference_definitions", GenesisIds::kAllReferenceDefinitions},
+        {"transaction_commit_by_id", GenesisIds::kTransactionCommitById},
     };
     for (const auto& c : cases) {
       SCOPED_TRACE(c.key_type);
@@ -333,6 +341,7 @@ TEST_F(GenesisTest, AllBootstrapIndexesAreQueryable) {
         {GenesisIds::kTypeDefinitionTypeDef, GenesisIds::kTypeDefinitionTypeVersionDef},
         {GenesisIds::kTypeVersionDefinitionTypeDef, GenesisIds::kTypeVersionDefinitionTypeVersionDef},
         {GenesisIds::kReferenceDefinitionTypeDef, GenesisIds::kReferenceDefinitionTypeVersionDef},
+        {GenesisIds::kTransactionCommitRecordTypeDef, GenesisIds::kTransactionCommitRecordTypeVersionDef},
     };
     for (const auto& c : cases) {
       SCOPED_TRACE(c.type_id);

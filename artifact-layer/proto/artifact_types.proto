@@ -122,3 +122,23 @@ message ReferenceDefinition {
   // The referential integrity action to take when the target is deleted.
   ReferenceOption.OnDelete on_delete = 6;
 }
+
+// TransactionCommitRecord represents a committed transaction.  One record is
+// created per successful user-initiated CommitTransaction call (both top-level
+// and explicit sub-transactions).  Used for double-commit prevention and
+// commit status queries.
+message TransactionCommitRecord {
+  option (indexes) = {
+    key_type: "transaction_commit_by_id"
+    key: ["transaction_id"]
+    order: { field: "committed_at" direction: ASCENDING }
+    order: { field: "artifact_id" direction: ASCENDING }
+    unique: true
+  };
+
+  // Opaque transaction ID (= ephemeral branch name).
+  string transaction_id = 1;
+
+  // Unix epoch seconds when the commit succeeded.
+  int64 committed_at = 2;
+}

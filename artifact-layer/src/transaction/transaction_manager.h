@@ -12,6 +12,7 @@
 #include "absl/status/statusor.h"
 #include "absl/time/time.h"
 #include "artifact_service.pb.h"
+#include "id/id_allocator_interface.h"
 #include "storage/storage_interface.h"
 #include "transaction/conflict_resolver.h"
 
@@ -19,6 +20,19 @@ namespace artifact_system::transaction {
 
 class TransactionManager {
 public:
+  // Configuration for writing TransactionCommitRecord artifacts on commit.
+  // When present, CommitTransaction writes a record for user-initiated commits.
+  struct CommitRecordConfig {
+    // Artifact ID of the transaction_commit_by_id IndexDefinition.
+    uint64_t index_def_id = 0;
+    // Artifact ID of the TransactionCommitRecord TypeVersionDefinition.
+    uint64_t version_def_id = 0;
+    // Map from index key_type to IndexDefinition artifact_id (for index derivation).
+    std::unordered_map<std::string, uint64_t> index_def_ids_by_key_type;
+    // Allocator for new artifact IDs.
+    IdAllocatorInterface* id_allocator = nullptr;
+  };
+
   struct Options {
     ConflictResolverOptions conflict_options = {
         .max_attempts = 5,
@@ -29,6 +43,7 @@ public:
     RetryConflictResolver retry_conflict_resolver;
     std::function<void(absl::Duration)> sleep_for;
     std::function<void(const absl::Status&)> on_cleanup_failure;
+    std::optional<CommitRecordConfig> commit_record_config;
   };
 
   explicit TransactionManager(StorageInterface* storage);
@@ -63,7 +78,7 @@ public:
 
   absl::StatusOr<std::string> CreateSnapshot(std::optional<std::string> parent_transaction_id = std::nullopt);
   absl::StatusOr<std::string> CreateTransaction(std::optional<std::string> parent_snapshot_id = std::nullopt,
-                                                 std::optional<std::string> parent_transaction_id = std::nullopt);
+                                                std::optional<std::string> parent_transaction_id = std::nullopt);
   absl::StatusOr<CommitResult> CommitTransaction(const std::string& transaction_id);
   absl::Status RollbackTransaction(const std::string& transaction_id);
 
@@ -86,6 +101,7 @@ private:
 
   std::string GenerateBranchName();
   absl::Status RemoveTransactionLocked(const std::string& transaction_id);
+  absl::StatusOr<CommitResult> CommitTransactionImpl(const std::string& transaction_id, bool write_commit_record);
 
   StorageInterface* storage_;
   Options options_;

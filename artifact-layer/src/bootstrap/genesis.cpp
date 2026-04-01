@@ -38,6 +38,7 @@ std::unordered_map<std::string, uint64_t> BuildIndexDefIdsMap() {
       {"reference_key_type_unique", GenesisIds::kReferenceKeyTypeUnique},
       {"references_by_target_type", GenesisIds::kReferencesByTargetType},
       {"all_reference_definitions", GenesisIds::kAllReferenceDefinitions},
+      {"transaction_commit_by_id", GenesisIds::kTransactionCommitById},
   };
 }
 
@@ -70,6 +71,7 @@ absl::StatusOr<GenesisResult> RunGenesis(StorageInterface* storage) {
   const auto* td_desc = TypeDefinition::descriptor();
   const auto* tvd_desc = TypeVersionDefinition::descriptor();
   const auto* rd_desc = ReferenceDefinition::descriptor();
+  const auto* tcr_desc = TransactionCommitRecord::descriptor();
 
   std::vector<StagedArtifact> staged;
 
@@ -153,6 +155,7 @@ absl::StatusOr<GenesisResult> RunGenesis(StorageInterface* storage) {
       {GenesisIds::kTypeDefinitionTypeDef, GenesisIds::kTypeDefinitionTypeVersionDef, td_desc},
       {GenesisIds::kTypeVersionDefinitionTypeDef, GenesisIds::kTypeVersionDefinitionTypeVersionDef, tvd_desc},
       {GenesisIds::kReferenceDefinitionTypeDef, GenesisIds::kReferenceDefinitionTypeVersionDef, rd_desc},
+      {GenesisIds::kTransactionCommitRecordTypeDef, GenesisIds::kTransactionCommitRecordTypeVersionDef, tcr_desc},
   };
 
   absl::Status status;

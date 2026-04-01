@@ -11,8 +11,14 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/time/clock.h"
+#include "artifact/proto_utils.h"
+#include "artifact_types.pb.h"
+#include "encoding/artifact_path.h"
+#include "encoding/index_key_encoder.h"
 #include "index/index_conflict_resolver.h"
+#include "index/index_utils.h"
 #include "transaction/conflict_resolver.h"
+#include "transaction/write_executor.h"
 
 namespace artifact_system::transaction {
 namespace {
@@ -92,7 +98,7 @@ absl::StatusOr<std::string> TransactionManager::CreateSnapshot(std::optional<std
 }
 
 absl::StatusOr<std::string> TransactionManager::CreateTransaction(std::optional<std::string> parent_snapshot_id,
-                                                                   std::optional<std::string> parent_transaction_id) {
+                                                                  std::optional<std::string> parent_transaction_id) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (storage_ == nullptr) {
     return absl::FailedPreconditionError("storage is null");
@@ -179,6 +185,10 @@ absl::Status TransactionManager::RemoveTransactionLocked(const std::string& tran
 }
 
 absl::StatusOr<TransactionManager::CommitResult> TransactionManager::CommitTransaction(const std::string& transaction_id) {
+  return CommitTransactionImpl(transaction_id, /*write_commit_record=*/true);
+}
+
+absl::StatusOr<TransactionManager::CommitResult> TransactionManager::CommitTransactionImpl(const std::string& transaction_id, bool write_commit_record) {
   std::unique_lock<std::mutex> lock(mutex_);
   if (storage_ == nullptr) {
     return absl::FailedPreconditionError("storage is null");
@@ -198,12 +208,6 @@ absl::StatusOr<TransactionManager::CommitResult> TransactionManager::CommitTrans
     return absl::InvalidArgumentError("max attempts must be greater than zero");
   }
 
-  // The transaction_id IS the branch name.
-  auto commit_or = storage_->Commit(transaction_id, absl::StrCat("transaction commit ", transaction_id));
-  if (!commit_or.ok()) {
-    return commit_or.status();
-  }
-
   std::string target_branch;
   if (transaction.parent_transaction_id.has_value()) {
     auto parent_it = transactions_.find(*transaction.parent_transaction_id);
@@ -214,6 +218,91 @@ absl::StatusOr<TransactionManager::CommitResult> TransactionManager::CommitTrans
     target_branch = *transaction.parent_transaction_id;
   } else {
     target_branch = storage_->GetCanonicalBranch();
+  }
+
+  // ── Pre-check: if a TransactionCommitRecord already exists on the target
+  //    branch for this transaction_id, the transaction was already committed.
+  if (write_commit_record && options_.commit_record_config.has_value()) {
+    const auto& cfg = *options_.commit_record_config;
+    const auto* tcr_desc = TransactionCommitRecord::descriptor();
+    auto encoded_key_or = encoding::EncodeSingleStringKey(*tcr_desc, "transaction_id", transaction_id);
+    if (!encoded_key_or.ok()) {
+      return encoded_key_or.status();
+    }
+    const std::string index_path = encoding::IndexPath(cfg.index_def_id, *encoded_key_or);
+    auto data_or = storage_->GetObject(target_branch, index_path);
+    if (data_or.ok()) {
+      // Record exists — transaction already committed. Clean up local state.
+      auto remove_status = RemoveTransactionLocked(transaction_id);
+      if (!remove_status.ok()) {
+        return remove_status;
+      }
+      auto delete_status = storage_->DeleteBranch(transaction_id);
+      if (!delete_status.ok()) {
+        options_.on_cleanup_failure(delete_status);
+      }
+      return CommitSuccess{
+          .transaction_id = transaction_id,
+          .commit_id = "",
+          .snapshot_id = "",
+      };
+    }
+    if (!absl::IsNotFound(data_or.status())) {
+      return data_or.status();
+    }
+    // No existing record — proceed with commit.
+  }
+
+  // Commit any staged changes on the transaction branch before the merge.
+  // This must happen before the WriteExecutor so the branch has no uncommitted state.
+  auto commit_or = storage_->Commit(transaction_id, absl::StrCat("transaction commit ", transaction_id));
+  if (!commit_or.ok()) {
+    return commit_or.status();
+  }
+
+  // ── Write TransactionCommitRecord to the ephemeral branch via sub-branch-per-write.
+  if (write_commit_record && options_.commit_record_config.has_value()) {
+    const auto& cfg = *options_.commit_record_config;
+    const auto* tcr_desc = TransactionCommitRecord::descriptor();
+    const uint64_t record_artifact_id = cfg.id_allocator->AllocateId();
+
+    TransactionCommitRecord record;
+    record.set_transaction_id(transaction_id);
+    record.set_committed_at(absl::ToUnixSeconds(absl::Now()));
+    const std::string payload = record.SerializeAsString();
+
+    lock.unlock();
+
+    WriteExecutorOptions write_opts;
+    write_opts.conflict_options = options_.conflict_options;
+    write_opts.path_conflict_classifier = options_.path_conflict_classifier;
+    write_opts.retry_conflict_resolver = options_.retry_conflict_resolver;
+    write_opts.sleep_for = options_.sleep_for;
+    write_opts.on_cleanup_failure = options_.on_cleanup_failure;
+    WriteExecutor executor(storage_, write_opts);
+
+    auto write_result_or = executor.ExecuteWrite(transaction_id, [&](const std::string& branch) -> absl::Status {
+      auto status = storage_->PutObject(branch, encoding::ArtifactPath(record_artifact_id),
+                                        artifact::SerializeStoredArtifact(cfg.version_def_id, tcr_desc->full_name(), payload));
+      if (!status.ok()) {
+        return status;
+      }
+      return index::DeriveAndWriteIndexEntries(storage_, branch, *tcr_desc, record, record_artifact_id, cfg.index_def_ids_by_key_type);
+    });
+    if (!write_result_or.ok()) {
+      return write_result_or.status();
+    }
+    if (std::holds_alternative<WriteExecutor::WriteConflict>(*write_result_or)) {
+      return absl::InternalError("failed to write TransactionCommitRecord: sub-branch merge conflict");
+    }
+
+    lock.lock();
+
+    // Re-validate transaction state after releasing and re-acquiring the lock.
+    auto refreshed_it = transactions_.find(transaction_id);
+    if (refreshed_it == transactions_.end()) {
+      return absl::NotFoundError(absl::StrCat("transaction not found: ", transaction_id));
+    }
   }
 
   for (uint32_t attempts_performed = 1; attempts_performed <= options_.conflict_options.max_attempts; ++attempts_performed) {
@@ -340,7 +429,7 @@ absl::StatusOr<TransactionManager::CommitResult> TransactionManager::RunImplicit
     return callback_status;
   }
 
-  auto commit_or = CommitTransaction(transaction_id);
+  auto commit_or = CommitTransactionImpl(transaction_id, /*write_commit_record=*/false);
   if (!commit_or.ok()) {
     const absl::Status rollback_status = RollbackTransaction(transaction_id);
     if (!rollback_status.ok()) {

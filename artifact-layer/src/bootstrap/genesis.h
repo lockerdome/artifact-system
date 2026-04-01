@@ -48,8 +48,15 @@ struct GenesisIds {
   // Built-in ReferenceDefinition artifacts
   static constexpr uint64_t kRefTypeVersionDefTypeId = 17;
 
+  // TransactionCommitRecord type
+  static constexpr uint64_t kTransactionCommitRecordTypeDef = 18;
+  static constexpr uint64_t kTransactionCommitRecordTypeVersionDef = 19;
+
+  // Bootstrap IndexDefinition artifact for TransactionCommitRecord type
+  static constexpr uint64_t kTransactionCommitById = 20;
+
   // One past the last pre-allocated ID. The ID allocator should start here.
-  static constexpr uint64_t kFirstUserAllocatableId = 18;
+  static constexpr uint64_t kFirstUserAllocatableId = 21;
 };
 
 // Result of a successful genesis bootstrap.
