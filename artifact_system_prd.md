@@ -193,6 +193,7 @@ permissions live in the App Layer.
 1. Artifact Type registry (with version and schema support)
 1. Referential integrity validation and delete-time enforcement
 1. Genesis bootstrap for built-in types and indexes
+1. Transaction commit records for double-commit prevention and commit status queries
 
 ### Indexes for looking up artifacts
 
@@ -538,8 +539,9 @@ Storage Layer branch name itself (an opaque string).
    serializes writes through the merge step.
 1. `CommitTransaction(transaction_id)` finalizes the transaction: the ephemeral branch is merged into its parent. For a
    top-level transaction, this is a merge into the canonical branch. For a sub-transaction, this is a merge into the
-   parent transaction's ephemeral branch. Conflicts detected during the Storage Layer merge are handled per the Conflict
-   retry policy.
+   parent transaction's ephemeral branch. In both cases, a TransactionCommitRecord is written to the transaction's
+   ephemeral branch before the merge to record the commit and prevent double-commit races (see Transaction commit
+   records). Conflicts detected during the Storage Layer merge are handled per the Conflict retry policy.
 1. `RollbackTransaction(transaction_id)` abandons the transaction without merging. The ephemeral branch is deleted.
 1. Delete operations that cascade or nullify references perform all dependent writes in the same transaction (same
    sub-branch), ensuring the artifact deletion and all referential integrity side-effects are committed atomically.
@@ -600,6 +602,56 @@ If a caller crashes without calling CommitTransaction or RollbackTransaction, th
    eligible for cleanup. The artifact layer periodically scans for expired ephemeral branches and deletes them.
 1. The LakeFS Spark vacuum process also removes Storage Layer commits on branches that are not recent and not pinned by a
    tag or referenced as a branch head, providing a secondary cleanup mechanism.
+
+##### Transaction commit records
+
+When a transaction is committed via `CommitTransaction`, the artifact layer writes a `TransactionCommitRecord` artifact
+to the transaction's ephemeral branch before merging it into its parent branch (canonical branch for top-level
+transactions, parent transaction branch for explicit sub-transactions). This record is an internal bookkeeping object
+that captures the fact that the transaction committed and when it committed.
+TransactionCommitRecords are stored as first-class artifacts with their own indexes (see Built-in types and bootstrapping)
+and use the same storage and merge mechanics as all other artifacts.
+
+**Scope**: TransactionCommitRecords are created for every user-initiated `CommitTransaction` call, including both
+top-level transactions and explicit sub-transactions. Explicit sub-transactions are susceptible to the same race
+conditions as top-level transactions — multiple server nodes may attempt to commit the same sub-transaction into the
+parent transaction's branch. TransactionCommitRecords are **not** created for:
+1. Implicit transactions (single-write convenience wrappers created internally by CreateArtifact, UpdateArtifact, and
+   DeleteArtifact). These are fully managed by a single server instance and are not exposed to external commit races.
+1. Internal sub-branches used by the sub-branch-per-write pattern within a transaction. These are internal mechanics
+   managed by a single server instance.
+1. Internal transactions used by system operations such as RegisterTypeVersion or genesis bootstrapping.
+
+**Write flow**: As the final step before the merge into the parent branch, CommitTransaction creates a
+TransactionCommitRecord artifact on the transaction's ephemeral branch via the sub-branch-per-write pattern, using an
+internal bypass of the `deny_create` restriction (see Internal bypass of mutation restrictions). The record's
+`transaction_id` field is set to the transaction's ID (which is the ephemeral branch name) and `committed_at` is set to
+the current Unix epoch timestamp. The record and its derived index entries are committed to the ephemeral branch and then
+carried to the parent branch by the merge.
+
+**Double-commit prevention**: Before attempting the merge, CommitTransaction checks the target branch (canonical branch
+for top-level transactions, parent transaction branch for sub-transactions) for an existing TransactionCommitRecord with
+the same `transaction_id` (via the `transaction_commit_by_id` unique index). If a record already exists, the transaction
+has already been committed — CommitTransaction returns success without performing another merge. The Storage Layer
+commit ID for the original merge can be recovered via the LakeFS `LogCommits` API filtered by the record's object path
+if needed. This eliminates redundant merge operations when multiple server nodes receive the same
+CommitTransaction request. The unique index on `transaction_id` provides an additional safety net: if two nodes race past
+the pre-check, the merge that lands second will carry a duplicate TransactionCommitRecord whose `transaction_id` collides
+in the unique index, producing a unique index conflict that causes the second merge to fail gracefully.
+
+**Record contents**: A TransactionCommitRecord contains:
+1. `transaction_id`: the transaction's opaque string ID (= the ephemeral branch name). This is the primary lookup key.
+1. `committed_at`: Unix epoch timestamp (int64) recording when the commit succeeded.
+
+The Storage Layer commit hash (snapshot_id) is not stored in the record. It is already returned to the caller in
+`CommitTransactionResponse.snapshot_id` at commit time, and can be recovered after the fact via the LakeFS `LogCommits`
+API filtered by the record's artifact object path. Storing it would require a post-merge write (a new internal
+transaction to update the record on the target branch), adding overhead for information that is already available through
+existing mechanisms.
+
+**Queryability**: Callers can determine whether a transaction committed and when by fetching the
+`transaction_commit_by_id` index with the transaction_id as the key. If an entry exists, the transaction committed; the
+record's `committed_at` field provides the timestamp.
 
 ##### App Layer guidance
 
@@ -674,6 +726,12 @@ artifact layer binary but are also stored as artifacts so the system is fully se
    `deny_create = true, deny_update = true, deny_delete = true` on its TypeDefinition; artifacts cannot be created,
    modified, or deleted through the public CRUD API (creation is handled by RegisterTypeVersion when reference field
    options are detected).
+5. **TransactionCommitRecord**: represents a committed transaction. One TransactionCommitRecord artifact is created per
+   successful user-initiated `CommitTransaction` call (both top-level and explicit sub-transactions). Contains the
+   `transaction_id` (the ephemeral branch name) and `committed_at` timestamp. TransactionCommitRecord
+   has `deny_create = true, deny_update = true, deny_delete = true` on its TypeDefinition; artifacts cannot be created,
+   modified, or deleted through the public CRUD API (creation is handled exclusively by CommitTransaction using an
+   internal bypass of the `deny_create` restriction). See Transaction commit records for the full specification.
 
 All types (including user-defined artifact types) are stored in LakeFS so they are tied to the repo state. This enables
 migration transactions (post-launch): a new branch can add an index, backfill it for existing data, and merge only when
@@ -694,6 +752,8 @@ The built-in types declare the following indexes on themselves:
 | `reference_key_type_unique` | ReferenceDefinition | `[key_type]` | yes | Enforces globally unique reference identifiers; used by the registry to de-duplicate reference definitions |
 | `references_by_target_type` | ReferenceDefinition | `[target_type_name]` | no | Finds references targeting a given type |
 | `all_reference_definitions` | ReferenceDefinition | `[]` | no | Lists all registered reference definition artifact_ids |
+| `transaction_commit_by_id` | TransactionCommitRecord | `[transaction_id]` | yes | Enforces one commit record per transaction; enables commit status lookup by transaction_id |
+
 
 These indexes are created during genesis bootstrapping and use the same storage and merge mechanics as all other indexes.
 
@@ -727,8 +787,12 @@ The genesis commit creates artifacts in the following dependency order:
    artifacts): created for the ReferenceDefinition type's declared indexes; key_type uniqueness enforced by step 2.
 10. **Built-in ReferenceDefinition artifacts**: materialize reference declarations for built-in types (for example,
     `TypeVersionDefinition.type_id` -> `TypeDefinition`, `TypeDefinition.current_version_id` -> `TypeVersionDefinition`).
-11. **All derived index entries**: populate every bootstrap index with entries for all artifacts created above.
-12. **Atomic commit**: the entire genesis state is committed as a single transaction to the canonical branch.
+11. **TransactionCommitRecord type** (TypeDefinition + TypeVersionDefinition artifacts): declares
+    `transaction_commit_by_id` index on itself.
+12. **`transaction_commit_by_id`** (IndexDefinition artifact): created for the TransactionCommitRecord type's declared
+    index; key_type uniqueness enforced by step 2.
+13. **All derived index entries**: populate every bootstrap index with entries for all artifacts created above.
+14. **Atomic commit**: the entire genesis state is committed as a single transaction to the canonical branch.
 
 Each built-in type has exactly one TypeVersionDefinition at genesis, so `previous_version_id` and `next_version_id` are
 both unset. Subsequent versions registered via the standard RegisterTypeVersion path will link to the genesis version.
@@ -895,6 +959,12 @@ message ReferenceDefinition {
   string field_name = 4;
   string covering_index_key_type = 5;
   ReferenceOption.OnDelete on_delete = 6;
+}
+
+message TransactionCommitRecord {
+  option (indexes) = { key_type: "transaction_commit_by_id" key: ["transaction_id"] order: { field: "committed_at" direction: ASCENDING } { field: "artifact_id" direction: ASCENDING } unique: true };
+  string transaction_id = 1;   // opaque transaction ID (= ephemeral branch name)
+  int64 committed_at = 2;      // Unix epoch seconds when the commit succeeded
 }
 
 // Example user-defined artifact type. The type_name for this type is "DataFrameArtifact"

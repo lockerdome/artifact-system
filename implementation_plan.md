@@ -35,6 +35,7 @@ otherwise noted.
 | P8 | Genesis Bootstrap | :white_check_mark: Complete |
 | P9 | gRPC Server & Service Implementation | :white_check_mark: Complete |
 | P10 | ID Allocator Production Integration | :white_check_mark: Complete |
+| P11 | Transaction Commit Records | :white_large_square: Not started |
 
 **Status legend**: :white_large_square: Not started | :construction: In progress | :white_check_mark: Complete
 
@@ -780,6 +781,73 @@ provides the real implementation.
 
 ---
 
+## Phase 11 — Transaction Commit Records
+
+**Goal**: Record user-initiated transaction commits as internal bookkeeping artifacts to
+prevent double-commit races and enable commit status queries.
+
+### PRD references
+- Transaction commit records (subsection under Consistency and transaction semantics)
+- TransactionCommitRecord built-in type (Built-in types and bootstrapping, item 5)
+- Bootstrap indexes: `transaction_commit_by_id`
+- Genesis bootstrap ordering (steps 11–12)
+- TransactionCommitRecord proto definition (Index options schema)
+
+### Deliverables
+
+1. **Proto changes** (`proto/artifact_types.proto`):
+   - Add `TransactionCommitRecord` message with `transaction_id` (string) and
+     `committed_at` (int64)
+   - Declare `transaction_commit_by_id` (unique, keyed on `transaction_id`) index via
+     message-level custom options
+
+2. **Genesis update** (`src/bootstrap/genesis.h/.cpp`):
+   - Add TransactionCommitRecord type (TypeDefinition + TypeVersionDefinition artifacts)
+     with `deny_create = true, deny_update = true, deny_delete = true`
+   - Add `transaction_commit_by_id` IndexDefinition artifact
+   - Pre-allocate IDs for the new built-in artifacts
+   - Populate derived index entries for the new artifacts
+
+3. **CommitTransaction update** (`src/transaction/transaction_manager.h/.cpp`):
+   - **Pre-check**: before merging the transaction branch into its target (canonical
+     branch for top-level, parent transaction branch for sub-transactions), read the
+     `transaction_commit_by_id` index on the target branch for the transaction_id.
+     If a record exists, return success (transaction already committed)
+   - **Record creation**: if no record exists, write a `TransactionCommitRecord` artifact
+     to the transaction's ephemeral branch via the sub-branch-per-write pattern, using an
+     internal bypass of `deny_create`. Set `transaction_id` and `committed_at`
+   - **Scope**: all user-initiated `CommitTransaction` calls (top-level and explicit
+     sub-transactions). Implicit transactions and internal system operations do not
+     create records
+
+4. **Tests**: `tests/transaction_commit_record_test.cpp`
+   - Top-level CommitTransaction creates a TransactionCommitRecord on the canonical branch
+   - Explicit sub-transaction CommitTransaction creates a TransactionCommitRecord on the
+     parent transaction branch
+   - Record is queryable via `transaction_commit_by_id` index after commit
+   - Record contains correct `transaction_id` and `committed_at`
+   - Double-commit of same transaction returns success without duplicate records
+   - Double-commit of same sub-transaction returns success without duplicate records
+   - Implicit transaction writes (Create/Update/Delete without explicit transaction) do
+     not create records
+   - Genesis includes TransactionCommitRecord type, indexes, and derived entries
+
+
+### Checklist
+- [ ] `TransactionCommitRecord` proto message added to `artifact_types.proto`
+- [ ] Genesis creates TransactionCommitRecord TypeDefinition + TypeVersionDefinition
+- [ ] Genesis creates `transaction_commit_by_id` IndexDefinition artifact
+- [ ] Genesis derived index entries include new artifacts
+- [ ] Pre-allocate IDs for all new built-in artifacts
+- [ ] CommitTransaction pre-check for existing record on target branch
+- [ ] CommitTransaction writes TransactionCommitRecord via internal bypass
+- [ ] Records created for all user-initiated CommitTransaction (top-level and explicit sub-transactions)
+- [ ] Implicit transactions and internal system operations excluded
+- [ ] `tests/transaction_commit_record_test.cpp` — all test cases passing
+- [ ] Mark phase complete
+
+---
+
 ## Dependency Graph
 
 ```
@@ -809,6 +877,8 @@ P1 (Protos + StoredArtifact envelope)
  |                                  P9 (gRPC Server) ◄────────────────────────────────┘
  |                                      |                (LakeFS backend available here)
  |                                 P10 (ID Allocator Production)
+ |                                      |
+ |                                 P11 (Transaction Commit Records)
 ```
 
 ### Explicit dependencies per phase
@@ -828,6 +898,7 @@ P1 (Protos + StoredArtifact envelope)
 | P8 | P7b |
 | P9 | P8 + P2b |
 | P10 | P6 |
+| P11 | P8 + P5 (genesis for built-in type bootstrapping, transaction manager for CommitTransaction) |
 
 ### Parallel tracks after P1
 
