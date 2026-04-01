@@ -180,7 +180,7 @@ TEST_F(TransactionCommitRecordTest, RecordContainsCorrectFields) {
   EXPECT_LE(record.committed_at(), after);
 }
 
-TEST_F(TransactionCommitRecordTest, DoubleCommitReturnsSucessWithoutDuplicateRecords) {
+TEST_F(TransactionCommitRecordTest, DoubleCommitReturnsSuccessWithoutDuplicateRecords) {
   auto txn_or = manager_->CreateTransaction();
   ASSERT_TRUE(txn_or.ok()) << txn_or.status();
   const std::string& txn_id = *txn_or;
@@ -224,7 +224,7 @@ TEST_F(TransactionCommitRecordTest, DoubleCommitReturnsSucessWithoutDuplicateRec
   manager2.RollbackTransaction(*txn2_or).IgnoreError();
 }
 
-TEST_F(TransactionCommitRecordTest, DoubleCommitSubTransactionReturnsSucess) {
+TEST_F(TransactionCommitRecordTest, DoubleCommitSubTransactionReturnsSuccess) {
   auto parent_or = manager_->CreateTransaction();
   ASSERT_TRUE(parent_or.ok()) << parent_or.status();
   const std::string& parent_id = *parent_or;

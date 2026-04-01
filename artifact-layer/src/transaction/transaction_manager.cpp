@@ -2,6 +2,7 @@
 
 #include <optional>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <variant>
@@ -222,6 +223,7 @@ absl::StatusOr<TransactionManager::CommitResult> TransactionManager::CommitTrans
 
   // ── Pre-check: if a TransactionCommitRecord already exists on the target
   //    branch for this transaction_id, the transaction was already committed.
+  //    Read from the branch head commit (not staged state) to avoid false positives.
   if (write_commit_record && options_.commit_record_config.has_value()) {
     const auto& cfg = *options_.commit_record_config;
     const auto* tcr_desc = TransactionCommitRecord::descriptor();
@@ -229,8 +231,12 @@ absl::StatusOr<TransactionManager::CommitResult> TransactionManager::CommitTrans
     if (!encoded_key_or.ok()) {
       return encoded_key_or.status();
     }
+    auto target_head_or = storage_->GetBranchHead(target_branch);
+    if (!target_head_or.ok()) {
+      return target_head_or.status();
+    }
     const std::string index_path = encoding::IndexPath(cfg.index_def_id, *encoded_key_or);
-    auto data_or = storage_->GetObject(target_branch, index_path);
+    auto data_or = storage_->GetObject(*target_head_or, index_path);
     if (data_or.ok()) {
       // Record exists — transaction already committed. Clean up local state.
       auto remove_status = RemoveTransactionLocked(transaction_id);
@@ -241,10 +247,14 @@ absl::StatusOr<TransactionManager::CommitResult> TransactionManager::CommitTrans
       if (!delete_status.ok()) {
         options_.on_cleanup_failure(delete_status);
       }
+      const std::string snapshot_id = *target_head_or;
+      snapshots_[snapshot_id] = SnapshotSource{
+          .source_transaction_id = transaction_id,
+      };
       return CommitSuccess{
           .transaction_id = transaction_id,
-          .commit_id = "",
-          .snapshot_id = "",
+          .commit_id = *target_head_or,
+          .snapshot_id = snapshot_id,
       };
     }
     if (!absl::IsNotFound(data_or.status())) {
@@ -264,7 +274,12 @@ absl::StatusOr<TransactionManager::CommitResult> TransactionManager::CommitTrans
   if (write_commit_record && options_.commit_record_config.has_value()) {
     const auto& cfg = *options_.commit_record_config;
     const auto* tcr_desc = TransactionCommitRecord::descriptor();
-    const uint64_t record_artifact_id = cfg.id_allocator->AllocateId();
+    uint64_t record_artifact_id;
+    try {
+      record_artifact_id = cfg.id_allocator->AllocateId();
+    } catch (const std::runtime_error& e) {
+      return absl::UnavailableError(absl::StrCat("failed to allocate ID for TransactionCommitRecord: ", e.what()));
+    }
 
     TransactionCommitRecord record;
     record.set_transaction_id(transaction_id);
