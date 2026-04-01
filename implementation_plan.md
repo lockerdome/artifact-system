@@ -35,7 +35,7 @@ otherwise noted.
 | P8 | Genesis Bootstrap | :white_check_mark: Complete |
 | P9 | gRPC Server & Service Implementation | :white_check_mark: Complete |
 | P10 | ID Allocator Production Integration | :white_check_mark: Complete |
-| P11 | Transaction Commit Records | :construction: In progress |
+| P11 | Transaction Commit Records | :white_check_mark: Complete |
 
 **Status legend**: :white_large_square: Not started | :construction: In progress | :white_check_mark: Complete
 
