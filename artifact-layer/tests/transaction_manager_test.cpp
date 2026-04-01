@@ -120,6 +120,7 @@ TEST(TransactionManagerTest, NestedCommitMergesIntoParentThenCanonicalOnParentCo
 
   // The transaction_id IS the branch name — use directly.
   ASSERT_TRUE(storage.PutObject(*child_tx_id_or, "nested/object.txt", "nested-data").ok());
+  ASSERT_TRUE(storage.Commit(*child_tx_id_or, "child write").ok());
 
   auto child_commit_or = manager.CommitTransaction(*child_tx_id_or);
   ASSERT_TRUE(child_commit_or.ok());
@@ -208,6 +209,7 @@ TEST(TransactionManagerTest, CommitTransactionClassifiesNonRetryableIndexConflic
 
   // The transaction_id IS the branch name.
   ASSERT_TRUE(storage.PutObject(*transaction_id_or, "idx/unique/key", "tx-value").ok());
+  ASSERT_TRUE(storage.Commit(*transaction_id_or, "tx write").ok());
 
   ASSERT_TRUE(storage.PutObject(storage.GetCanonicalBranch(), "idx/unique/key", "canonical-value").ok());
   ASSERT_TRUE(storage.Commit(storage.GetCanonicalBranch(), "canonical update").ok());
@@ -242,6 +244,7 @@ TEST(TransactionManagerTest, CommitTransactionRetriesUntilExhaustedForRetryableC
 
   // The transaction_id IS the branch name.
   ASSERT_TRUE(storage.PutObject(*transaction_id_or, "idx/non_unique/key", "tx-value").ok());
+  ASSERT_TRUE(storage.Commit(*transaction_id_or, "tx write").ok());
 
   ASSERT_TRUE(storage.PutObject(storage.GetCanonicalBranch(), "idx/non_unique/key", "canonical-value").ok());
   ASSERT_TRUE(storage.Commit(storage.GetCanonicalBranch(), "canonical update").ok());
@@ -282,6 +285,7 @@ TEST(TransactionManagerTest, DefaultResolverDoesNotAutoResolveUniqueIndexConflic
 
   // The transaction_id IS the branch name.
   ASSERT_TRUE(storage.PutObject(*transaction_id_or, index_path, "ours").ok());
+  ASSERT_TRUE(storage.Commit(*transaction_id_or, "tx write").ok());
 
   ASSERT_TRUE(storage.PutObject(storage.GetCanonicalBranch(), index_path, "theirs").ok());
   ASSERT_TRUE(storage.Commit(storage.GetCanonicalBranch(), "canonical unique update").ok());
@@ -306,6 +310,7 @@ TEST(TransactionManagerTest, DefaultResolverDoesNotAutoResolveNonIndexConflict) 
 
   // The transaction_id IS the branch name.
   ASSERT_TRUE(storage.PutObject(*transaction_id_or, "payload/object-1", "txn-value").ok());
+  ASSERT_TRUE(storage.Commit(*transaction_id_or, "tx write").ok());
   ASSERT_TRUE(storage.PutObject(storage.GetCanonicalBranch(), "payload/object-1", "canonical-value").ok());
   ASSERT_TRUE(storage.Commit(storage.GetCanonicalBranch(), "canonical payload update").ok());
 
@@ -338,6 +343,7 @@ TEST(TransactionManagerTest, DefaultResolverTreatsMalformedIndexDefinitionAsNonR
 
   // The transaction_id IS the branch name.
   ASSERT_TRUE(storage.PutObject(*transaction_id_or, index_path, "txn-value").ok());
+  ASSERT_TRUE(storage.Commit(*transaction_id_or, "tx write").ok());
   ASSERT_TRUE(storage.PutObject(storage.GetCanonicalBranch(), index_path, "canonical-value").ok());
   ASSERT_TRUE(storage.Commit(storage.GetCanonicalBranch(), "canonical malformed index update").ok());
 
@@ -383,6 +389,7 @@ TEST(TransactionManagerTest, CommitTransactionInvokesRetryConflictResolver) {
 
   // The transaction_id IS the branch name.
   ASSERT_TRUE(storage.PutObject(*transaction_id_or, "idx/non_unique/key", "tx-value").ok());
+  ASSERT_TRUE(storage.Commit(*transaction_id_or, "tx write").ok());
 
   ASSERT_TRUE(storage.PutObject(storage.GetCanonicalBranch(), "idx/non_unique/key", "canonical-value").ok());
   ASSERT_TRUE(storage.Commit(storage.GetCanonicalBranch(), "canonical update").ok());
@@ -463,6 +470,7 @@ TEST(TransactionManagerTest, NestedRollbackChildThenCommitParentSucceeds) {
 
   // The transaction_id IS the branch name — use directly.
   ASSERT_TRUE(storage.PutObject(*parent_tx_id_or, "parent/data.txt", "parent-data").ok());
+  ASSERT_TRUE(storage.Commit(*parent_tx_id_or, "parent write").ok());
 
   // Create child transaction with parent_transaction_id.
   auto child_tx_id_or = manager.CreateTransaction(/*parent_snapshot_id=*/std::nullopt, /*parent_transaction_id=*/*parent_tx_id_or);

@@ -220,13 +220,6 @@ absl::StatusOr<TransactionManager::CommitResult> TransactionManager::CommitTrans
     target_branch = storage_->GetCanonicalBranch();
   }
 
-  // Commit any staged changes on the transaction branch before the merge.
-  // This must happen before the WriteExecutor so the branch has no uncommitted state.
-  auto commit_or = storage_->Commit(transaction_id, absl::StrCat("transaction commit ", transaction_id));
-  if (!commit_or.ok()) {
-    return commit_or.status();
-  }
-
   // ── Write TransactionCommitRecord to the ephemeral branch via sub-branch-per-write.
   if (write_commit_record && options_.commit_record_config.has_value()) {
     const auto& cfg = *options_.commit_record_config;
@@ -399,6 +392,13 @@ absl::StatusOr<TransactionManager::CommitResult> TransactionManager::RunImplicit
       return absl::InternalError(absl::StrCat("callback failed and rollback failed: ", rollback_status.message()));
     }
     return callback_status;
+  }
+
+  // The callback stages writes directly on the transaction branch.
+  // Commit them before the merge.
+  auto staged_commit_or = storage_->Commit(transaction_id, absl::StrCat("implicit transaction ", transaction_id));
+  if (!staged_commit_or.ok()) {
+    return staged_commit_or.status();
   }
 
   auto commit_or = CommitTransactionImpl(transaction_id, /*write_commit_record=*/false);

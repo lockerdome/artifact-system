@@ -100,7 +100,9 @@ TEST_F(TransactionCommitRecordTest, TopLevelCommitCreatesRecord) {
   const std::string& txn_id = *txn_or;
 
   // Write something so the transaction is non-empty.
+  // Tests write directly to storage and commit; production code uses WriteExecutor.
   ASSERT_TRUE(storage_.PutObject(txn_id, "test/data.txt", "value").ok());
+  ASSERT_TRUE(storage_.Commit(txn_id, "test write").ok());
 
   auto commit_or = manager_->CommitTransaction(txn_id);
   ASSERT_TRUE(commit_or.ok()) << commit_or.status();
@@ -127,6 +129,7 @@ TEST_F(TransactionCommitRecordTest, SubTransactionCommitCreatesRecordOnParentBra
   const std::string& child_id = *child_or;
 
   ASSERT_TRUE(storage_.PutObject(child_id, "test/data.txt", "value").ok());
+  ASSERT_TRUE(storage_.Commit(child_id, "test write").ok());
 
   auto commit_or = manager_->CommitTransaction(child_id);
   ASSERT_TRUE(commit_or.ok()) << commit_or.status();
@@ -152,6 +155,7 @@ TEST_F(TransactionCommitRecordTest, RecordContainsCorrectFields) {
   const std::string& txn_id = *txn_or;
 
   ASSERT_TRUE(storage_.PutObject(txn_id, "test/data.txt", "value").ok());
+  ASSERT_TRUE(storage_.Commit(txn_id, "test write").ok());
 
   auto commit_or = manager_->CommitTransaction(txn_id);
   ASSERT_TRUE(commit_or.ok()) << commit_or.status();
@@ -186,6 +190,7 @@ TEST_F(TransactionCommitRecordTest, DoubleCommitReturnsNotFound) {
   const std::string& txn_id = *txn_or;
 
   ASSERT_TRUE(storage_.PutObject(txn_id, "test/data.txt", "value").ok());
+  ASSERT_TRUE(storage_.Commit(txn_id, "test write").ok());
 
   // First commit succeeds.
   auto commit1 = manager_->CommitTransaction(txn_id);
@@ -219,6 +224,7 @@ TEST_F(TransactionCommitRecordTest, DoubleCommitSubTransactionReturnsNotFound) {
   const std::string& child_id = *child_or;
 
   ASSERT_TRUE(storage_.PutObject(child_id, "test/data.txt", "value").ok());
+  ASSERT_TRUE(storage_.Commit(child_id, "test write").ok());
 
   // First commit of sub-transaction succeeds.
   auto commit1 = manager_->CommitTransaction(child_id);
@@ -267,6 +273,7 @@ TEST_F(TransactionCommitRecordTest, RecordIsQueryableViaIndex) {
   const std::string& txn_id = *txn_or;
 
   ASSERT_TRUE(storage_.PutObject(txn_id, "test/data.txt", "value").ok());
+  ASSERT_TRUE(storage_.Commit(txn_id, "test write").ok());
 
   auto commit_or = manager_->CommitTransaction(txn_id);
   ASSERT_TRUE(commit_or.ok()) << commit_or.status();
