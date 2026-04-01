@@ -1,6 +1,7 @@
 #include "bootstrap/genesis.h"
 
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -10,6 +11,7 @@
 #include "absl/status/statusor.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "artifact/artifact_store.h"
 #include "artifact/proto_utils.h"
 #include "artifact_internal.pb.h"
 #include "artifact_options.pb.h"
@@ -59,15 +61,6 @@ bool IndexEntryExists(MemoryStorage& storage, const std::string& branch, uint64_
   return data.ok();
 }
 
-TransactionManager::CommitRecordConfig MakeCommitRecordConfig(const GenesisResult& genesis_result, IdAllocatorInterface* id_alloc) {
-  TransactionManager::CommitRecordConfig cfg;
-  cfg.index_def_id = GenesisIds::kTransactionCommitById;
-  cfg.version_def_id = GenesisIds::kTransactionCommitRecordTypeVersionDef;
-  cfg.index_def_ids_by_key_type = {{"transaction_commit_by_id", GenesisIds::kTransactionCommitById}};
-  cfg.id_allocator = id_alloc;
-  return cfg;
-}
-
 // ---------------------------------------------------------------------------
 // Fixture
 // ---------------------------------------------------------------------------
@@ -79,15 +72,25 @@ protected:
     ASSERT_TRUE(result.ok()) << result.status();
     genesis_result_ = std::move(*result);
 
-    TransactionManager::Options opts;
-    opts.commit_record_config = MakeCommitRecordConfig(genesis_result_, &id_alloc_);
-    manager_ = std::make_unique<TransactionManager>(&storage_, opts);
+    manager_ = std::make_unique<TransactionManager>(&storage_);
+
+    // Create a bypass ArtifactStore for writing TransactionCommitRecords.
+    artifact::ArtifactStore::Options store_opts;
+    store_opts.index_def_ids_by_key_type = genesis_result_.index_def_ids_by_key_type;
+    store_opts.bypass_mutation_check = true;
+    bypass_store_ = std::make_unique<artifact::ArtifactStore>(&storage_, manager_.get(), &id_alloc_, store_opts);
+
+    TransactionManager::CommitRecordConfig cfg;
+    cfg.version_def_id = GenesisIds::kTransactionCommitRecordTypeVersionDef;
+    cfg.artifact_store = bypass_store_.get();
+    manager_->SetCommitRecordConfig(std::move(cfg));
   }
 
   MemoryStorage storage_;
   GenesisResult genesis_result_;
   MockIdAllocator id_alloc_{GenesisIds::kFirstUserAllocatableId};
   std::unique_ptr<TransactionManager> manager_;
+  std::unique_ptr<artifact::ArtifactStore> bypass_store_;
 };
 
 // ---------------------------------------------------------------------------

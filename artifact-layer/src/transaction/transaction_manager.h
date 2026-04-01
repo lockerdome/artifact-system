@@ -12,9 +12,12 @@
 #include "absl/status/statusor.h"
 #include "absl/time/time.h"
 #include "artifact_service.pb.h"
-#include "id/id_allocator_interface.h"
 #include "storage/storage_interface.h"
 #include "transaction/conflict_resolver.h"
+
+namespace artifact_system::artifact {
+class ArtifactStore;
+}
 
 namespace artifact_system::transaction {
 
@@ -22,15 +25,12 @@ class TransactionManager {
 public:
   // Configuration for writing TransactionCommitRecord artifacts on commit.
   // When present, CommitTransaction writes a record for user-initiated commits.
+  // The artifact_store must be configured with bypass_mutation_check=true.
   struct CommitRecordConfig {
-    // Artifact ID of the transaction_commit_by_id IndexDefinition.
-    uint64_t index_def_id = 0;
     // Artifact ID of the TransactionCommitRecord TypeVersionDefinition.
     uint64_t version_def_id = 0;
-    // Map from index key_type to IndexDefinition artifact_id (for index derivation).
-    std::unordered_map<std::string, uint64_t> index_def_ids_by_key_type;
-    // Allocator for new artifact IDs.
-    IdAllocatorInterface* id_allocator = nullptr;
+    // ArtifactStore with bypass_mutation_check=true for creating records.
+    artifact::ArtifactStore* artifact_store = nullptr;
   };
 
   struct Options {
@@ -83,6 +83,8 @@ public:
   absl::Status RollbackTransaction(const std::string& transaction_id);
 
   absl::StatusOr<CommitResult> RunImplicitTransaction(const ImplicitTransactionCallback& callback, std::optional<std::string> parent_id = std::nullopt);
+
+  void SetCommitRecordConfig(CommitRecordConfig config);
 
   absl::StatusOr<SnapshotMetadata> GetSnapshotMetadata(const std::string& snapshot_id) const;
   absl::StatusOr<TransactionMetadata> GetTransactionMetadata(const std::string& transaction_id) const;

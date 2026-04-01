@@ -2,7 +2,6 @@
 
 #include <optional>
 #include <random>
-#include <stdexcept>
 #include <string>
 #include <utility>
 #include <variant>
@@ -12,13 +11,10 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/time/clock.h"
-#include "artifact/proto_utils.h"
+#include "artifact/artifact_store.h"
 #include "artifact_types.pb.h"
-#include "encoding/artifact_path.h"
 #include "index/index_conflict_resolver.h"
-#include "index/index_utils.h"
 #include "transaction/conflict_resolver.h"
-#include "transaction/write_executor.h"
 
 namespace artifact_system::transaction {
 namespace {
@@ -49,6 +45,10 @@ TransactionManager::TransactionManager(StorageInterface* storage, Options option
   if (options_.on_cleanup_failure == nullptr) {
     options_.on_cleanup_failure = [](const absl::Status&) {};
   }
+}
+
+void TransactionManager::SetCommitRecordConfig(CommitRecordConfig config) {
+  options_.commit_record_config = std::move(config);
 }
 
 std::string TransactionManager::GenerateBranchName() {
@@ -220,45 +220,19 @@ absl::StatusOr<TransactionManager::CommitResult> TransactionManager::CommitTrans
     target_branch = storage_->GetCanonicalBranch();
   }
 
-  // ── Write TransactionCommitRecord to the ephemeral branch via sub-branch-per-write.
+  // ── Write TransactionCommitRecord via the internal bypass ArtifactStore.
   if (write_commit_record && options_.commit_record_config.has_value()) {
     const auto& cfg = *options_.commit_record_config;
-    const auto* tcr_desc = TransactionCommitRecord::descriptor();
-    uint64_t record_artifact_id;
-    try {
-      record_artifact_id = cfg.id_allocator->AllocateId();
-    } catch (const std::runtime_error& e) {
-      return absl::UnavailableError(absl::StrCat("failed to allocate ID for TransactionCommitRecord: ", e.what()));
-    }
 
     TransactionCommitRecord record;
     record.set_transaction_id(transaction_id);
     record.set_committed_at(absl::ToUnixSeconds(absl::Now()));
-    const std::string payload = record.SerializeAsString();
 
     lock.unlock();
 
-    WriteExecutorOptions write_opts;
-    write_opts.conflict_options = options_.conflict_options;
-    write_opts.path_conflict_classifier = options_.path_conflict_classifier;
-    write_opts.retry_conflict_resolver = options_.retry_conflict_resolver;
-    write_opts.sleep_for = options_.sleep_for;
-    write_opts.on_cleanup_failure = options_.on_cleanup_failure;
-    WriteExecutor executor(storage_, write_opts);
-
-    auto write_result_or = executor.ExecuteWrite(transaction_id, [&](const std::string& branch) -> absl::Status {
-      auto status = storage_->PutObject(branch, encoding::ArtifactPath(record_artifact_id),
-                                        artifact::SerializeStoredArtifact(cfg.version_def_id, tcr_desc->full_name(), payload));
-      if (!status.ok()) {
-        return status;
-      }
-      return index::DeriveAndWriteIndexEntries(storage_, branch, *tcr_desc, record, record_artifact_id, cfg.index_def_ids_by_key_type);
-    });
-    if (!write_result_or.ok()) {
-      return write_result_or.status();
-    }
-    if (std::holds_alternative<WriteExecutor::WriteConflict>(*write_result_or)) {
-      return absl::InternalError("failed to write TransactionCommitRecord: sub-branch merge conflict");
+    auto create_or = cfg.artifact_store->CreateArtifact(cfg.version_def_id, record.SerializeAsString(), transaction_id);
+    if (!create_or.ok()) {
+      return create_or.status();
     }
 
     lock.lock();
