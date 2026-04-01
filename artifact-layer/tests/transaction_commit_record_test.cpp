@@ -180,36 +180,25 @@ TEST_F(TransactionCommitRecordTest, RecordContainsCorrectFields) {
   EXPECT_LE(record.committed_at(), after);
 }
 
-TEST_F(TransactionCommitRecordTest, DoubleCommitReturnsSuccessWithoutDuplicateRecords) {
+TEST_F(TransactionCommitRecordTest, DoubleCommitReturnsNotFound) {
   auto txn_or = manager_->CreateTransaction();
   ASSERT_TRUE(txn_or.ok()) << txn_or.status();
   const std::string& txn_id = *txn_or;
 
   ASSERT_TRUE(storage_.PutObject(txn_id, "test/data.txt", "value").ok());
 
-  // First commit.
+  // First commit succeeds.
   auto commit1 = manager_->CommitTransaction(txn_id);
   ASSERT_TRUE(commit1.ok()) << commit1.status();
   ASSERT_TRUE(std::holds_alternative<TransactionManager::CommitSuccess>(*commit1));
 
-  // Simulate a second manager seeing the same transaction_id by creating a new
-  // TransactionManager that thinks this transaction still exists.
-  // Since the first commit already merged, we re-create the branch at the same
-  // point to simulate a race.
-  auto head_or = storage_.GetBranchHead(storage_.GetCanonicalBranch());
-  ASSERT_TRUE(head_or.ok());
-  auto branch_or = storage_.CreateBranch(txn_id, *head_or);
-  ASSERT_TRUE(branch_or.ok()) << branch_or.status();
+  // Second commit of same transaction_id returns NotFound — the transaction
+  // was removed from the local map after the first commit.
+  auto commit2 = manager_->CommitTransaction(txn_id);
+  EXPECT_FALSE(commit2.ok());
+  EXPECT_TRUE(absl::IsNotFound(commit2.status())) << commit2.status();
 
-  TransactionManager::Options opts2;
-  opts2.commit_record_config = MakeCommitRecordConfig(genesis_result_, &id_alloc_);
-  TransactionManager manager2(&storage_, opts2);
-
-  // Register the transaction in manager2.
-  auto txn2_or = manager2.CreateTransaction();
-  ASSERT_TRUE(txn2_or.ok());
-  // We can't directly inject the old txn_id, so we test the pre-check path
-  // differently: verify index has exactly 1 row after the first commit.
+  // Verify exactly one record exists on the canonical branch.
   const auto* tcr_desc = TransactionCommitRecord::descriptor();
   auto idx_def = FindIndexDef(*tcr_desc, "transaction_commit_by_id");
   auto encoded_key = encoding::EncodeSingleStringKey(*tcr_desc, "transaction_id", txn_id);
@@ -218,13 +207,9 @@ TEST_F(TransactionCommitRecordTest, DoubleCommitReturnsSuccessWithoutDuplicateRe
   std::string canonical = storage_.GetCanonicalBranch();
   auto idx_obj = ReadIndexObject(storage_, canonical, GenesisIds::kTransactionCommitById, *encoded_key, idx_def, *tcr_desc);
   EXPECT_EQ(idx_obj.rows.size(), 1) << "should have exactly one record, not duplicates";
-
-  // Clean up.
-  storage_.DeleteBranch(txn_id).IgnoreError();
-  manager2.RollbackTransaction(*txn2_or).IgnoreError();
 }
 
-TEST_F(TransactionCommitRecordTest, DoubleCommitSubTransactionReturnsSuccess) {
+TEST_F(TransactionCommitRecordTest, DoubleCommitSubTransactionReturnsNotFound) {
   auto parent_or = manager_->CreateTransaction();
   ASSERT_TRUE(parent_or.ok()) << parent_or.status();
   const std::string& parent_id = *parent_or;
@@ -235,10 +220,15 @@ TEST_F(TransactionCommitRecordTest, DoubleCommitSubTransactionReturnsSuccess) {
 
   ASSERT_TRUE(storage_.PutObject(child_id, "test/data.txt", "value").ok());
 
-  // First commit of sub-transaction.
+  // First commit of sub-transaction succeeds.
   auto commit1 = manager_->CommitTransaction(child_id);
   ASSERT_TRUE(commit1.ok()) << commit1.status();
   ASSERT_TRUE(std::holds_alternative<TransactionManager::CommitSuccess>(*commit1));
+
+  // Second commit returns NotFound.
+  auto commit2 = manager_->CommitTransaction(child_id);
+  EXPECT_FALSE(commit2.ok());
+  EXPECT_TRUE(absl::IsNotFound(commit2.status())) << commit2.status();
 
   // Verify only one record on the parent branch.
   const auto* tcr_desc = TransactionCommitRecord::descriptor();
@@ -249,7 +239,7 @@ TEST_F(TransactionCommitRecordTest, DoubleCommitSubTransactionReturnsSuccess) {
   auto idx_obj = ReadIndexObject(storage_, parent_id, GenesisIds::kTransactionCommitById, *encoded_key, idx_def, *tcr_desc);
   EXPECT_EQ(idx_obj.rows.size(), 1);
 
-  // Clean up.
+  // Clean up: commit parent.
   auto parent_commit = manager_->CommitTransaction(parent_id);
   ASSERT_TRUE(parent_commit.ok()) << parent_commit.status();
 }

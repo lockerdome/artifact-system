@@ -15,7 +15,6 @@
 #include "artifact/proto_utils.h"
 #include "artifact_types.pb.h"
 #include "encoding/artifact_path.h"
-#include "encoding/index_key_encoder.h"
 #include "index/index_conflict_resolver.h"
 #include "index/index_utils.h"
 #include "transaction/conflict_resolver.h"
@@ -219,48 +218,6 @@ absl::StatusOr<TransactionManager::CommitResult> TransactionManager::CommitTrans
     target_branch = *transaction.parent_transaction_id;
   } else {
     target_branch = storage_->GetCanonicalBranch();
-  }
-
-  // ── Pre-check: if a TransactionCommitRecord already exists on the target
-  //    branch for this transaction_id, the transaction was already committed.
-  //    Read from the branch head commit (not staged state) to avoid false positives.
-  if (write_commit_record && options_.commit_record_config.has_value()) {
-    const auto& cfg = *options_.commit_record_config;
-    const auto* tcr_desc = TransactionCommitRecord::descriptor();
-    auto encoded_key_or = encoding::EncodeSingleStringKey(*tcr_desc, "transaction_id", transaction_id);
-    if (!encoded_key_or.ok()) {
-      return encoded_key_or.status();
-    }
-    auto target_head_or = storage_->GetBranchHead(target_branch);
-    if (!target_head_or.ok()) {
-      return target_head_or.status();
-    }
-    const std::string index_path = encoding::IndexPath(cfg.index_def_id, *encoded_key_or);
-    auto data_or = storage_->GetObject(*target_head_or, index_path);
-    if (data_or.ok()) {
-      // Record exists — transaction already committed. Clean up local state.
-      auto remove_status = RemoveTransactionLocked(transaction_id);
-      if (!remove_status.ok()) {
-        return remove_status;
-      }
-      auto delete_status = storage_->DeleteBranch(transaction_id);
-      if (!delete_status.ok()) {
-        options_.on_cleanup_failure(delete_status);
-      }
-      const std::string snapshot_id = *target_head_or;
-      snapshots_[snapshot_id] = SnapshotSource{
-          .source_transaction_id = transaction_id,
-      };
-      return CommitSuccess{
-          .transaction_id = transaction_id,
-          .commit_id = *target_head_or,
-          .snapshot_id = snapshot_id,
-      };
-    }
-    if (!absl::IsNotFound(data_or.status())) {
-      return data_or.status();
-    }
-    // No existing record — proceed with commit.
   }
 
   // Commit any staged changes on the transaction branch before the merge.
