@@ -36,6 +36,7 @@ otherwise noted.
 | P9 | gRPC Server & Service Implementation | :white_check_mark: Complete |
 | P10 | ID Allocator Production Integration | :white_check_mark: Complete |
 | P11 | Transaction Commit Records | :white_check_mark: Complete |
+| P12 | Comprehensive Audit & Statelessness | :white_large_square: Not started |
 
 **Status legend**: :white_large_square: Not started | :construction: In progress | :white_check_mark: Complete
 
@@ -848,6 +849,160 @@ prevent double-commit races and enable commit status queries.
 
 ---
 
+## Phase 12 — Comprehensive Audit & Statelessness
+
+**Goal**: Full audit of the artifact layer codebase to fix bugs, enforce PRD compliance,
+eliminate statefulness violations, and improve code quality. The artifact layer must be
+stateless — multiple instances must be able to run concurrently with the Storage Layer as the
+sole source of truth. Local in-memory structures are acceptable only as caches that can be
+reconstructed from the Storage Layer on demand.
+
+### PRD references
+- Layer overview: "Storage Layer: durable object storage with versioned commits, branches,
+  merges, and conflict detection"
+- Consistency and transaction semantics: snapshots are commit pointers, transactions are
+  branch pointers
+- Transaction commit records: double-commit prevention via `transaction_commit_by_id` index
+  pre-check before merge
+- Conflict retry policy: exponential backoff with jitter, 100ms start, 2s cap, 5 attempts
+
+### Audit areas
+
+#### A. Statelessness violations (critical)
+
+The artifact layer must assume multiple instances are running concurrently. The Storage Layer
+handles distributed coordination; the artifact layer builds on that. Local state that acts
+as the source of truth (rather than a cache) breaks this contract.
+
+**A1. TransactionManager local maps**
+
+`TransactionManager` maintains two in-memory maps (`snapshots_`, `transactions_`) that are
+the sole source of truth for transaction and snapshot lifecycle. If the server restarts, all
+open transactions become unresolvable. If a second instance receives a request for a
+transaction created on the first instance, it fails.
+
+Fix: these maps must become caches backed by Storage Layer queries.
+
+- **Snapshot validation**: a snapshot_id IS a commit hash. Validate by calling
+  `storage_->CommitExists(commit_id)` (or equivalent) rather than checking a local map.
+  The `SnapshotSource.source_transaction_id` field is informational metadata that is not
+  required for correctness — snapshots are immutable commit pointers regardless of which
+  transaction created them.
+- **Transaction validation**: a transaction_id IS a branch name. Validate by checking
+  `storage_->BranchExists(branch_name)`. The branch's existence in the Storage Layer is
+  the canonical state.
+- **Parent/child tracking**: parent-child relationships are currently only tracked locally.
+  Evaluate whether these relationships are needed for correctness or only for convenience
+  validation (e.g., preventing commit when children exist). If needed, consider encoding
+  parent metadata in the branch name convention or in a lightweight metadata object on the
+  branch. If only used for safety checks, document the limitation and consider whether the
+  check is worth maintaining given that it cannot work across instances.
+- **Depth tracking**: transaction nesting depth is tracked locally. Same analysis as
+  parent/child — determine if this is a correctness requirement or a convenience limit.
+- **Cache lifecycle**: if local maps are retained as caches, they must handle misses
+  gracefully by falling back to Storage Layer queries. A cache miss is not an error.
+
+**A2. TypeRegistry index_def_ids_by_key_type cache**
+
+`TypeRegistry::index_def_ids_by_key_type_` is populated at startup and updated only when
+the local instance registers a type. If another instance registers a new type, this
+instance's cache is stale and cannot derive indexes for the new type's artifacts.
+
+Fix: on cache miss for a key_type, fall back to reading the `index_key_type_unique` index
+from the Storage Layer and update the cache. The cache should be treated as a warm-start
+optimization, not a closed set. The same applies to the duplicated map in `ArtifactStore::Options::index_def_ids_by_key_type`.
+
+**A3. WriteExecutor next_child_branch_id counter**
+
+`WriteExecutor` uses a per-instance atomic counter combined with the object's memory address
+to generate child branch names. This is an unnecessary divergence from the UUID-based
+naming that `TransactionManager` already uses for transaction branches. Sub-transaction
+branches should use the same UUID mechanism regardless of whether the parent is the
+canonical branch or another transaction.
+
+Fix: replace the counter+address scheme with UUID-based branch names, matching
+`TransactionManager::GenerateBranchName()`.
+
+#### B. PRD compliance audit
+
+Systematically verify each PRD requirement against the implementation:
+
+**B1. Error mapping completeness**
+- Audit every `ArtifactWriteViolation::Category` value in the PRD against the code
+- Verify gRPC status codes match PRD specifications for each error path
+- Verify `ArtifactWriteError`, `CommitConflict`, `SnapshotTransactionError`,
+  `FetchIndexError`, `RegisterTypeVersionError`, `ArtifactNotFoundError` detail messages
+  are attached with correct fields
+
+**B2. Referential integrity edge cases**
+- Cascade cycle detection: PRD says track scheduled deletes to prevent infinite recursion
+- SET_NULL on repeated fields: should remove the specific value, not clear the list
+- RESTRICT should allow deleting an artifact referenced by another artifact being deleted
+  in the same transaction
+
+#### C. Code quality and DRY
+
+**C1. Duplicated index_def_ids_by_key_type**
+- This map exists in both `TypeRegistry` and `ArtifactStore::Options`. When one is updated,
+  the other must be manually synchronized via `UpdateIndexDefIds`. This is fragile and
+  error-prone. Consider a shared reference or single owner.
+
+**C2. Error message consistency**
+- Audit error messages for consistency in format and information provided
+- Verify all error paths include enough context for debugging
+
+**C3. Unused/dead code**
+- Identify any code paths that are unreachable or any helper functions that are no longer
+  called after refactoring across phases
+
+**C4. Test coverage gaps**
+- Identify any PRD-specified behaviors that lack test coverage
+- Ensure multi-instance scenarios are tested (at least at the unit level with two
+  TransactionManager instances sharing the same Storage)
+
+#### D. Concurrency correctness
+
+**D1. Lock contention**
+- `TransactionManager` uses a single mutex for all operations. Under high concurrency this
+  becomes a bottleneck. After fixing statelessness (A1), evaluate whether the mutex is still
+  needed and at what granularity.
+
+**D2. Storage Layer call ordering**
+- Verify that Storage Layer operations are called in the correct order and that partial
+  failures are handled (e.g., branch created but commit fails — is the branch cleaned up?)
+
+### Deliverables
+
+1. **Stateless TransactionManager**: remove `snapshots_` and `transactions_` maps as sources
+   of truth. Replace with Storage Layer queries (with optional caching). Snapshot validation
+   via commit existence. Transaction validation via branch existence.
+
+2. **Stateless TypeRegistry cache**: add fallback-on-miss behavior for
+   `index_def_ids_by_key_type_`. Cache miss triggers Storage Layer read of
+   `index_key_type_unique` index.
+
+3. **PRD compliance fixes**: address any gaps found in B1–B2.
+
+4. **Code quality improvements**: address C1–C4, refactor duplicated state, clean up
+   error messages.
+
+6. **Tests**: add tests for multi-instance scenarios and any newly discovered edge cases.
+
+### Checklist
+- [ ] **A1**: TransactionManager validates snapshots via Storage Layer commit existence
+- [ ] **A1**: TransactionManager validates transactions via Storage Layer branch existence
+- [ ] **A1**: Parent/child relationship tracking analyzed and fixed or documented
+- [ ] **A2**: TypeRegistry falls back to Storage Layer on index_def_ids cache miss
+- [ ] **A2**: ArtifactStore index_def_ids synchronized or deduplicated with TypeRegistry
+- [ ] **A3**: WriteExecutor child branch names use UUID instead of sequential counter
+- [ ] **B1–B2**: PRD compliance audit complete, all gaps fixed
+- [ ] **C1**: Duplicated index_def_ids_by_key_type consolidated
+- [ ] **C4**: Test coverage for multi-instance scenarios added
+- [ ] All existing tests passing after changes
+- [ ] Mark phase complete
+
+---
+
 ## Dependency Graph
 
 ```
@@ -879,6 +1034,8 @@ P1 (Protos + StoredArtifact envelope)
  |                                 P10 (ID Allocator Production)
  |                                      |
  |                                 P11 (Transaction Commit Records)
+ |                                      |
+ |                                 P12 (Comprehensive Audit & Statelessness)
 ```
 
 ### Explicit dependencies per phase
@@ -899,6 +1056,7 @@ P1 (Protos + StoredArtifact envelope)
 | P9 | P8 + P2b |
 | P10 | P6 |
 | P11 | P8 + P5 (genesis for built-in type bootstrapping, transaction manager for CommitTransaction) |
+| P12 | P11 (all prior phases — full codebase audit) |
 
 ### Parallel tracks after P1
 
