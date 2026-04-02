@@ -7,6 +7,7 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/time/time.h"
 #include "artifact_options.pb.h"
 #include "encoding/artifact_path.h"
@@ -658,6 +659,61 @@ TEST(TransactionManagerTest, MultiInstanceNestedTransactionOnDifferentInstance) 
   auto canonical_read_or = storage.GetObject(storage.GetCanonicalBranch(), "nested/cross.txt");
   ASSERT_TRUE(canonical_read_or.ok());
   EXPECT_EQ(*canonical_read_or, "nested-cross-data");
+}
+
+TEST(TransactionManagerTest, MissingTxnMetadataDoesNotTreatNestedTransactionAsRoot) {
+  MemoryStorage storage;
+
+  TransactionManager::Options opts;
+  opts.sleep_for = [](absl::Duration) {};
+
+  TransactionManager manager_a(&storage, opts);
+  TransactionManager manager_b(&storage, opts);
+
+  auto parent_txn_id_or = manager_a.CreateTransaction();
+  ASSERT_TRUE(parent_txn_id_or.ok());
+
+  auto child_txn_id_or = manager_a.CreateTransaction(
+      /*parent_snapshot_id=*/std::nullopt,
+      /*parent_transaction_id=*/*parent_txn_id_or);
+  ASSERT_TRUE(child_txn_id_or.ok());
+
+  ASSERT_TRUE(storage.PutObject(*child_txn_id_or, "nested/missing-meta.txt", "child-data").ok());
+  ASSERT_TRUE(storage.Commit(*child_txn_id_or, "child write").ok());
+
+  ASSERT_TRUE(storage.DeleteObject(*child_txn_id_or, absl::StrCat("_txn_meta/", *child_txn_id_or)).ok());
+  ASSERT_TRUE(storage.Commit(*child_txn_id_or, "simulate missing txn metadata").ok());
+
+  auto commit_or = manager_b.CommitTransaction(*child_txn_id_or);
+  ASSERT_FALSE(commit_or.ok());
+  EXPECT_EQ(commit_or.status().code(), absl::StatusCode::kFailedPrecondition);
+
+  auto canonical_read_or = storage.GetObject(storage.GetCanonicalBranch(), "nested/missing-meta.txt");
+  ASSERT_FALSE(canonical_read_or.ok());
+  EXPECT_EQ(canonical_read_or.status().code(), absl::StatusCode::kNotFound);
+
+  auto parent_read_or = storage.GetObject(*parent_txn_id_or, "nested/missing-meta.txt");
+  ASSERT_FALSE(parent_read_or.ok());
+  EXPECT_EQ(parent_read_or.status().code(), absl::StatusCode::kNotFound);
+}
+
+TEST(TransactionManagerTest, CreateNestedTransactionFailsWhenParentMetadataMissing) {
+  MemoryStorage storage;
+
+  TransactionManager manager_a(&storage);
+  TransactionManager manager_b(&storage);
+
+  auto parent_txn_id_or = manager_a.CreateTransaction();
+  ASSERT_TRUE(parent_txn_id_or.ok());
+
+  ASSERT_TRUE(storage.DeleteObject(*parent_txn_id_or, absl::StrCat("_txn_meta/", *parent_txn_id_or)).ok());
+  ASSERT_TRUE(storage.Commit(*parent_txn_id_or, "remove parent txn metadata").ok());
+
+  auto child_txn_id_or = manager_b.CreateTransaction(
+      /*parent_snapshot_id=*/std::nullopt,
+      /*parent_transaction_id=*/*parent_txn_id_or);
+  ASSERT_FALSE(child_txn_id_or.ok());
+  EXPECT_EQ(child_txn_id_or.status().code(), absl::StatusCode::kFailedPrecondition);
 }
 
 TEST(TransactionManagerTest, MultiInstanceGetSnapshotMetadata) {

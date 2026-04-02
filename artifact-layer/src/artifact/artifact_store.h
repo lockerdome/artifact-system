@@ -116,6 +116,8 @@ private:
   absl::Status ApplySetNullEffect(const std::string& branch, const SetNullUpdate& set_null);
 
   const std::unordered_map<std::string, uint64_t>& GetIndexDefIds() const;
+  absl::StatusOr<uint64_t> ResolveIndexDefId(const std::string& key_type);
+  absl::Status ResolveMissingIndexDefIds(std::vector<index::DerivedIndexEntry>* entries, bool best_effort);
 
   StorageInterface* storage_;
   transaction::TransactionManager* transaction_manager_;

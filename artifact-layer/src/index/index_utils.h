@@ -22,6 +22,13 @@ namespace artifact_system::index {
 // Find an IndexDefinition by key_type from descriptor message options.
 std::optional<IndexDefinition> FindIndexDefinition(const google::protobuf::Descriptor& descriptor, const std::string& key_type);
 
+// Resolve IndexDefinition artifact ID for key_type.
+//
+// First checks index_def_ids_by_key_type. On cache miss, falls back to reading
+// the index_key_type_unique index from the canonical branch.
+absl::StatusOr<uint64_t> ResolveIndexDefinitionId(StorageInterface* storage, const std::unordered_map<std::string, uint64_t>& index_def_ids_by_key_type,
+                                                  const std::string& key_type);
+
 // Build a proto-serialized key message from raw key values and a generated
 // index schema. Returns an empty string for empty key_values.
 absl::StatusOr<std::string> BuildProtoSerializedKey(const GeneratedIndexSchema& schema, const std::vector<IndexCell>& key_values);

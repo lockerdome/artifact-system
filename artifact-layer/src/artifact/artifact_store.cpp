@@ -103,6 +103,27 @@ const std::unordered_map<std::string, uint64_t>& ArtifactStore::GetIndexDefIds()
   return options_.index_def_ids_by_key_type ? *options_.index_def_ids_by_key_type : kEmpty;
 }
 
+absl::StatusOr<uint64_t> ArtifactStore::ResolveIndexDefId(const std::string& key_type) {
+  return index::ResolveIndexDefinitionId(storage_, GetIndexDefIds(), key_type);
+}
+
+absl::Status ArtifactStore::ResolveMissingIndexDefIds(std::vector<index::DerivedIndexEntry>* entries, bool best_effort) {
+  for (auto& entry : *entries) {
+    if (entry.index_def_id != 0) {
+      continue;
+    }
+    auto id_or = ResolveIndexDefId(entry.key_type);
+    if (!id_or.ok()) {
+      if (best_effort) {
+        continue;
+      }
+      return id_or.status();
+    }
+    entry.index_def_id = *id_or;
+  }
+  return absl::OkStatus();
+}
+
 // ── Read operations ────────────��────────────────────────────────────────────
 
 absl::StatusOr<std::string> ArtifactStore::ResolveReadRef(const ReadContext& context) {
@@ -297,6 +318,10 @@ absl::Status ArtifactStore::StageCreate(const std::string& branch, uint64_t arti
   auto entries_or = index::DeriveIndexEntriesFromPayload(descriptor_set, type_name, payload, artifact_id, GetIndexDefIds());
   if (!entries_or.ok())
     return entries_or.status();
+  auto entries = std::move(*entries_or);
+  auto resolve_ids_status = ResolveMissingIndexDefIds(&entries, /*best_effort=*/false);
+  if (!resolve_ids_status.ok())
+    return resolve_ids_status;
 
   google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
   const auto* descriptor = BuildPoolAndFindMessage(descriptor_set, type_name, &pool);
@@ -304,7 +329,7 @@ absl::Status ArtifactStore::StageCreate(const std::string& branch, uint64_t arti
     return absl::InternalError(absl::StrCat("message '", type_name, "' not found in descriptor set for index derivation"));
   }
 
-  for (const auto& entry : *entries_or) {
+  for (const auto& entry : entries) {
     auto index_def = FindIndexDefinition(*descriptor, entry.key_type);
     if (!index_def.has_value()) {
       return absl::InternalError(absl::StrCat("IndexDefinition not found for key_type: ", entry.key_type));
@@ -341,6 +366,7 @@ absl::Status ArtifactStore::StageUpdate(const std::string& branch, uint64_t arti
     auto old_or = index::DeriveIndexEntriesFromPayload(old_descriptor_set, type_name, existing_or->payload(), artifact_id, GetIndexDefIds());
     if (old_or.ok()) {
       old_entries = std::move(*old_or);
+      (void)ResolveMissingIndexDefIds(&old_entries, /*best_effort=*/true);
     }
     // If derivation fails for old payload, we continue — best effort cleanup.
   }
@@ -356,6 +382,10 @@ absl::Status ArtifactStore::StageUpdate(const std::string& branch, uint64_t arti
   auto new_entries_or = index::DeriveIndexEntriesFromPayload(descriptor_set, type_name, payload, artifact_id, GetIndexDefIds());
   if (!new_entries_or.ok())
     return new_entries_or.status();
+  auto new_entries = std::move(*new_entries_or);
+  auto resolve_new_ids_status = ResolveMissingIndexDefIds(&new_entries, /*best_effort=*/false);
+  if (!resolve_new_ids_status.ok())
+    return resolve_new_ids_status;
 
   // 5. Build descriptor pool for new-schema index operations.
   google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
@@ -373,6 +403,8 @@ absl::Status ArtifactStore::StageUpdate(const std::string& branch, uint64_t arti
     // If the old descriptor can't be resolved, skip cleanup (best-effort).
     if (old_descriptor != nullptr) {
       for (const auto& old_entry : old_entries) {
+        if (old_entry.index_def_id == 0)
+          continue;
         auto index_def = FindIndexDefinition(*old_descriptor, old_entry.key_type);
         if (!index_def.has_value())
           continue;
@@ -382,7 +414,7 @@ absl::Status ArtifactStore::StageUpdate(const std::string& branch, uint64_t arti
   }
 
   // 7. Add new index entries.
-  for (const auto& new_entry : *new_entries_or) {
+  for (const auto& new_entry : new_entries) {
     auto index_def = FindIndexDefinition(*descriptor, new_entry.key_type);
     if (!index_def.has_value())
       continue;
@@ -425,6 +457,8 @@ absl::Status ArtifactStore::StageDelete(const std::string& branch, uint64_t arti
   if (!old_entries_or.ok()) {
     return absl::OkStatus(); // best-effort
   }
+  auto old_entries = std::move(*old_entries_or);
+  (void)ResolveMissingIndexDefIds(&old_entries, /*best_effort=*/true);
 
   // Build descriptor pool.
   google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
@@ -433,7 +467,9 @@ absl::Status ArtifactStore::StageDelete(const std::string& branch, uint64_t arti
     return absl::OkStatus(); // best-effort
   }
 
-  for (const auto& entry : *old_entries_or) {
+  for (const auto& entry : old_entries) {
+    if (entry.index_def_id == 0)
+      continue;
     auto index_def = FindIndexDefinition(*descriptor, entry.key_type);
     if (!index_def.has_value())
       continue;

@@ -19,6 +19,7 @@
 #include "encoding/index_key_encoder.h"
 #include "google/protobuf/descriptor.h"
 #include "google/protobuf/descriptor.pb.h"
+#include "google/protobuf/dynamic_message.h"
 #include "id/id_allocator_interface.h"
 #include "index/index_derivation.h"
 #include "index/index_object.h"
@@ -31,6 +32,7 @@
 namespace artifact_system::testing {
 namespace {
 
+using artifact_system::artifact::ArtifactStore;
 using artifact_system::registry::IndexSchemaInfo;
 using artifact_system::registry::RegisterResult;
 using artifact_system::registry::TypeRegistry;
@@ -90,6 +92,32 @@ std::optional<RegisterTypeVersionError> ExtractRegistrationError(const absl::Sta
   if (!error.ParseFromString(std::string(payload->Flatten())))
     return std::nullopt;
   return error;
+}
+
+absl::StatusOr<std::string> BuildPayload(const google::protobuf::FileDescriptorSet& descriptor_set, const std::string& type_name, const std::string& name,
+                                         const std::string& value) {
+  google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
+  const auto* descriptor = artifact::BuildPoolAndFindMessage(descriptor_set, type_name, &pool);
+  if (descriptor == nullptr) {
+    return absl::NotFoundError("message descriptor not found");
+  }
+
+  google::protobuf::DynamicMessageFactory factory;
+  const auto* prototype = factory.GetPrototype(descriptor);
+  if (prototype == nullptr) {
+    return absl::InternalError("failed to construct dynamic message prototype");
+  }
+
+  std::unique_ptr<google::protobuf::Message> message(prototype->New());
+  const auto* reflection = message->GetReflection();
+  const auto* name_field = descriptor->FindFieldByName("name");
+  const auto* value_field = descriptor->FindFieldByName("value");
+  if (name_field == nullptr || value_field == nullptr) {
+    return absl::InternalError("test descriptor missing expected fields");
+  }
+  reflection->SetString(message.get(), name_field, name);
+  reflection->SetString(message.get(), value_field, value);
+  return message->SerializeAsString();
 }
 
 // Assert that a failed registration status contains a violation with the given category.
@@ -820,6 +848,60 @@ TEST_F(TypeRegistryTest, ConcurrentRegistrationConflict) {
     // Both succeeded — they created two different versions.
     EXPECT_NE(v2a_or->version_id, v2b_or->version_id);
   }
+}
+
+TEST_F(TypeRegistryTest, ArtifactStoreResolvesStaleIndexDefMapOnCreate) {
+  std::unordered_map<std::string, uint64_t> stale_index_def_ids = index_def_ids_;
+
+  auto registry2 = std::make_unique<TypeRegistry>(storage_.get(), transaction_manager_.get(), id_allocator_.get(), stale_index_def_ids);
+  auto reg_or = registry2->RegisterTypeVersion("test.SimpleArtifact", kSimpleProtoSource);
+  ASSERT_TRUE(reg_or.ok()) << reg_or.status();
+
+  auto type_info_or = registry2->GetTypeVersion(reg_or->version_id);
+  ASSERT_TRUE(type_info_or.ok()) << type_info_or.status();
+
+  auto payload_or = BuildPayload(type_info_or->descriptor_set, "test.SimpleArtifact", "stale-map-name", "payload-value");
+  ASSERT_TRUE(payload_or.ok()) << payload_or.status();
+
+  ArtifactStore::Options store_opts;
+  store_opts.index_def_ids_by_key_type = &stale_index_def_ids;
+  ArtifactStore store(storage_.get(), transaction_manager_.get(), id_allocator_.get(), store_opts);
+
+  auto create_or = store.CreateArtifact(reg_or->version_id, *payload_or);
+  ASSERT_TRUE(create_or.ok()) << create_or.status();
+
+  auto index_schema_or = registry_->GetIndexSchema("simple_by_name");
+  ASSERT_TRUE(index_schema_or.ok()) << index_schema_or.status();
+
+  google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
+  const auto* descriptor = artifact::BuildPoolAndFindMessage(type_info_or->descriptor_set, "test.SimpleArtifact", &pool);
+  ASSERT_NE(descriptor, nullptr);
+
+  auto encoded_key_or = encoding::EncodeSingleStringKey(*descriptor, "name", "stale-map-name");
+  ASSERT_TRUE(encoded_key_or.ok()) << encoded_key_or.status();
+
+  const std::string ref = storage_->GetCanonicalBranch();
+  const std::string index_path = encoding::IndexPath(index_schema_or->index_definition_id, *encoded_key_or);
+  auto index_data_or = storage_->GetObject(ref, index_path);
+  ASSERT_TRUE(index_data_or.ok()) << index_data_or.status();
+
+  auto wrong_index_data_or = storage_->GetObject(ref, encoding::IndexPath(0, *encoded_key_or));
+  ASSERT_FALSE(wrong_index_data_or.ok());
+  EXPECT_EQ(wrong_index_data_or.status().code(), absl::StatusCode::kNotFound);
+
+  auto index_def_stored_or = artifact::ReadStoredArtifact(storage_.get(), ref, index_schema_or->index_definition_id);
+  ASSERT_TRUE(index_def_stored_or.ok()) << index_def_stored_or.status();
+
+  IndexDefinition index_def;
+  ASSERT_TRUE(index_def.ParseFromString(index_def_stored_or->payload()));
+
+  auto generated_schema_or = index::GenerateIndexSchema(index_def, *descriptor);
+  ASSERT_TRUE(generated_schema_or.ok()) << generated_schema_or.status();
+
+  auto index_object_or = index::DeserializeIndexObject(*generated_schema_or, index_def, *index_data_or);
+  ASSERT_TRUE(index_object_or.ok()) << index_object_or.status();
+  ASSERT_EQ(index_object_or->rows.size(), 1U);
+  EXPECT_EQ(index_object_or->rows[0].artifact_id, create_or->artifact_id);
 }
 
 } // namespace

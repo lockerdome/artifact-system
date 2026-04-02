@@ -51,6 +51,10 @@ std::string TransactionManager::TxnMetaPath(const std::string& transaction_id) {
   return absl::StrCat("_txn_meta/", transaction_id);
 }
 
+absl::Status MissingTransactionMetadataStatus(const std::string& transaction_id) {
+  return absl::FailedPreconditionError(absl::StrCat("transaction metadata missing for branch: ", transaction_id));
+}
+
 absl::Status TransactionManager::WriteTxnMeta(const std::string& branch, const TransactionRecord& record) {
   std::string data = absl::StrCat(record.parent_transaction_id.value_or(""), "\n", record.parent_snapshot_id.value_or(""), "\n", record.depth);
   auto put_status = storage_->PutObject(branch, TxnMetaPath(branch), data);
@@ -114,11 +118,7 @@ absl::StatusOr<TransactionManager::TransactionRecord> TransactionManager::Resolv
   auto record_or = LoadTxnMeta(transaction_id);
   if (!record_or.ok()) {
     if (absl::IsNotFound(record_or.status())) {
-      // Branch exists but no metadata — treat as a root transaction
-      // (may have been created by another instance without metadata, or metadata was already cleaned up).
-      TransactionRecord record;
-      transactions_[transaction_id] = record;
-      return record;
+      return MissingTransactionMetadataStatus(transaction_id);
     }
     return record_or.status();
   }
@@ -203,10 +203,10 @@ absl::StatusOr<std::string> TransactionManager::CreateTransaction(std::optional<
 
     // Get depth from cache or metadata.
     auto parent_record_or = ResolveTransaction(parent_id);
-    if (parent_record_or.ok()) {
-      depth = parent_record_or->depth + 1;
+    if (!parent_record_or.ok()) {
+      return parent_record_or.status();
     }
-    // If we can't read parent metadata, depth stays 0 (best-effort).
+    depth = parent_record_or->depth + 1;
   } else if (parent_snapshot_id.has_value()) {
     const auto& parent_id = *parent_snapshot_id;
 
@@ -406,9 +406,12 @@ absl::StatusOr<TransactionManager::CommitResult> TransactionManager::CommitTrans
 
       // Re-validate transaction exists after re-acquiring lock.
       auto branch_exists_or = storage_->BranchExists(transaction_id);
-      if (!branch_exists_or.ok())
+      if (!branch_exists_or.ok()) {
+        restore_meta();
         return branch_exists_or.status();
+      }
       if (!*branch_exists_or) {
+        restore_meta();
         return absl::NotFoundError(absl::StrCat("transaction not found: ", transaction_id));
       }
       // Re-check children from local cache (best-effort).
@@ -579,8 +582,7 @@ absl::StatusOr<TransactionManager::TransactionMetadata> TransactionManager::GetT
   auto record_or = LoadTxnMeta(transaction_id);
   if (!record_or.ok()) {
     if (absl::IsNotFound(record_or.status())) {
-      // Branch exists but no metadata — return basic metadata.
-      return TransactionMetadata{.transaction_id = transaction_id};
+      return MissingTransactionMetadataStatus(transaction_id);
     }
     return record_or.status();
   }

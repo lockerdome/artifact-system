@@ -15,6 +15,7 @@
 #include "google/protobuf/dynamic_message.h"
 
 #include "encoding/artifact_path.h"
+#include "encoding/index_key_encoder.h"
 
 namespace artifact_system::index {
 
@@ -27,6 +28,51 @@ std::optional<IndexDefinition> FindIndexDefinition(const google::protobuf::Descr
     }
   }
   return std::nullopt;
+}
+
+absl::StatusOr<uint64_t> ResolveIndexDefinitionId(StorageInterface* storage, const std::unordered_map<std::string, uint64_t>& index_def_ids_by_key_type,
+                                                  const std::string& key_type) {
+  auto id_it = index_def_ids_by_key_type.find(key_type);
+  if (id_it != index_def_ids_by_key_type.end()) {
+    return id_it->second;
+  }
+
+  auto lookup_index_it = index_def_ids_by_key_type.find("index_key_type_unique");
+  if (lookup_index_it == index_def_ids_by_key_type.end()) {
+    return absl::InternalError("index_key_type_unique index not in cache -- cannot resolve cache miss");
+  }
+
+  const auto* descriptor = IndexDefinition::descriptor();
+  auto encoded_or = encoding::EncodeSingleStringKey(*descriptor, "key_type", key_type);
+  if (!encoded_or.ok()) {
+    return encoded_or.status();
+  }
+
+  const IndexDefinition& lookup_index_definition = descriptor->options().GetExtension(artifact_system::indexes, 0);
+  auto schema_or = GenerateIndexSchema(lookup_index_definition, *descriptor);
+  if (!schema_or.ok()) {
+    return schema_or.status();
+  }
+
+  const std::string ref = storage->GetCanonicalBranch();
+  const std::string index_path = encoding::IndexPath(lookup_index_it->second, *encoded_or);
+  auto index_data_or = storage->GetObject(ref, index_path);
+  if (!index_data_or.ok()) {
+    if (absl::IsNotFound(index_data_or.status())) {
+      return absl::NotFoundError(absl::StrCat("index definition not found for key_type: ", key_type));
+    }
+    return index_data_or.status();
+  }
+
+  auto index_obj_or = DeserializeIndexObject(*schema_or, lookup_index_definition, *index_data_or);
+  if (!index_obj_or.ok()) {
+    return index_obj_or.status();
+  }
+  if (index_obj_or->rows.empty()) {
+    return absl::NotFoundError(absl::StrCat("index definition not found for key_type: ", key_type));
+  }
+
+  return index_obj_or->rows.front().artifact_id;
 }
 
 absl::StatusOr<std::string> BuildProtoSerializedKey(const GeneratedIndexSchema& schema, const std::vector<IndexCell>& key_values) {

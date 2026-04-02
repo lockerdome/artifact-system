@@ -27,6 +27,7 @@
 #include "encoding/index_key_encoder.h"
 #include "index/index_object.h"
 #include "index/index_schema_generator.h"
+#include "index/index_utils.h"
 
 namespace artifact_system::registry {
 namespace {
@@ -355,29 +356,12 @@ TypeRegistrationViolation TypeRegistry::MakeViolation(TypeRegistrationViolation:
 }
 
 absl::StatusOr<uint64_t> TypeRegistry::ResolveIndexDefId(const std::string& key_type) {
-  auto it = index_def_ids_by_key_type_.find(key_type);
-  if (it != index_def_ids_by_key_type_.end()) {
-    return it->second;
+  auto id_or = index::ResolveIndexDefinitionId(storage_, index_def_ids_by_key_type_, key_type);
+  if (!id_or.ok()) {
+    return id_or.status();
   }
-
-  // Cache miss: look up via the index_key_type_unique index.
-  // This index maps IndexDefinition key_type strings to their artifact IDs.
-  auto meta_it = index_def_ids_by_key_type_.find("index_key_type_unique");
-  if (meta_it == index_def_ids_by_key_type_.end()) {
-    return absl::InternalError("index_key_type_unique index not in cache — cannot resolve cache miss");
-  }
-
-  const std::string ref = storage_->GetCanonicalBranch();
-  auto result_or = LookupIndexDefinition(ref, key_type);
-  if (!result_or.ok())
-    return result_or.status();
-  if (!result_or->has_value()) {
-    return absl::NotFoundError(absl::StrCat("index definition not found for key_type: ", key_type));
-  }
-
-  uint64_t artifact_id = result_or->value().first;
-  index_def_ids_by_key_type_[key_type] = artifact_id;
-  return artifact_id;
+  index_def_ids_by_key_type_[key_type] = *id_or;
+  return *id_or;
 }
 
 absl::StatusOr<std::optional<std::pair<uint64_t, TypeDefinition>>> TypeRegistry::LookupTypeDefinition(const std::string& ref, const std::string& type_name) {
