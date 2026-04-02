@@ -1,6 +1,5 @@
 #pragma once
 
-#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -53,7 +52,6 @@ private:
 
   StorageInterface* storage_ = nullptr;
   WriteExecutorOptions options_;
-  std::atomic<uint64_t> next_child_branch_id_{1};
 };
 
 } // namespace artifact_system::transaction

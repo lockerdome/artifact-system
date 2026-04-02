@@ -10,6 +10,7 @@
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "index/index_conflict_resolver.h"
+#include "util/uuid.h"
 
 namespace artifact_system::transaction {
 
@@ -30,7 +31,7 @@ WriteExecutor::WriteExecutor(StorageInterface* storage, WriteExecutorOptions opt
 }
 
 std::string WriteExecutor::NextChildBranchName(const std::string& transaction_branch) {
-  return absl::StrCat(transaction_branch, ".write-", reinterpret_cast<uintptr_t>(this), "-", next_child_branch_id_.fetch_add(1));
+  return absl::StrCat(transaction_branch, ".write-", util::GenerateUUID());
 }
 
 absl::StatusOr<WriteExecutor::WriteResult> WriteExecutor::ExecuteWrite(const std::string& transaction_branch, const StagingCallback& staging_callback) {

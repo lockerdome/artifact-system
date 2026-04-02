@@ -18,6 +18,7 @@ public:
   absl::StatusOr<std::string> CreateBranch(const std::string& name, const std::string& base_commit_id) override;
   absl::Status DeleteBranch(const std::string& branch) override;
   absl::StatusOr<std::string> GetBranchHead(const std::string& branch) override;
+  absl::StatusOr<bool> BranchExists(const std::string& branch) override;
 
   // Object I/O
   absl::Status PutObject(const std::string& branch, const std::string& path, const std::string& data) override;
@@ -32,6 +33,9 @@ public:
 
   // Canonical branch
   std::string GetCanonicalBranch() const override;
+
+  // Ref validation
+  absl::StatusOr<bool> CommitExists(const std::string& commit_id) override;
 
 private:
   struct CommitData {

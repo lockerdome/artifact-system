@@ -36,7 +36,7 @@ otherwise noted.
 | P9 | gRPC Server & Service Implementation | :white_check_mark: Complete |
 | P10 | ID Allocator Production Integration | :white_check_mark: Complete |
 | P11 | Transaction Commit Records | :white_check_mark: Complete |
-| P12 | Comprehensive Audit & Statelessness | :white_large_square: Not started |
+| P12 | Comprehensive Audit & Statelessness | :construction: In progress |
 
 **Status legend**: :white_large_square: Not started | :construction: In progress | :white_check_mark: Complete
 

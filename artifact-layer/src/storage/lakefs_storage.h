@@ -27,6 +27,7 @@ public:
   absl::StatusOr<std::string> CreateBranch(const std::string& name, const std::string& base_commit_id) override;
   absl::Status DeleteBranch(const std::string& branch) override;
   absl::StatusOr<std::string> GetBranchHead(const std::string& branch) override;
+  absl::StatusOr<bool> BranchExists(const std::string& branch) override;
 
   // ── Object I/O ─────────────────────────────────────────────────────────
 
@@ -44,6 +45,10 @@ public:
   // ── Canonical branch ───────────────────────────────────────────────────
 
   std::string GetCanonicalBranch() const override;
+
+  // ── Ref validation ────────────────────────────────────────────────────
+
+  absl::StatusOr<bool> CommitExists(const std::string& commit_id) override;
 
 private:
   /// HTTP response from a LakeFS API call.
@@ -69,12 +74,6 @@ private:
 
   /// URL-encode a path component.
   static std::string UrlEncode(const std::string& value);
-
-  /// Check if a branch exists. Returns true if found, false if not.
-  absl::StatusOr<bool> BranchExists(const std::string& branch);
-
-  /// Check if a commit exists. Returns true if found, false if not.
-  absl::StatusOr<bool> CommitExists(const std::string& commit_id);
 
   /// Validate a ref and classify whether it resolves to a branch.
   /// Returns true if ref is a branch, false if ref is a commit, or NOT_FOUND

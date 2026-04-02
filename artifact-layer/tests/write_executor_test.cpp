@@ -36,6 +36,7 @@ public:
   MOCK_METHOD(absl::StatusOr<std::string>, CreateBranch, (const std::string&, const std::string&), (override));
   MOCK_METHOD(absl::Status, DeleteBranch, (const std::string&), (override));
   MOCK_METHOD(absl::StatusOr<std::string>, GetBranchHead, (const std::string&), (override));
+  MOCK_METHOD(absl::StatusOr<bool>, BranchExists, (const std::string&), (override));
   MOCK_METHOD(absl::Status, PutObject, (const std::string&, const std::string&, const std::string&), (override));
   MOCK_METHOD(absl::StatusOr<std::string>, GetObject, (const std::string&, const std::string&), (override));
   MOCK_METHOD(absl::Status, DeleteObject, (const std::string&, const std::string&), (override));
@@ -44,6 +45,7 @@ public:
   MOCK_METHOD(absl::StatusOr<std::string>, Commit, (const std::string&, const std::string&), (override));
   MOCK_METHOD(absl::StatusOr<MergeResult>, Merge, (const std::string&, const std::string&), (override));
   MOCK_METHOD(std::string, GetCanonicalBranch, (), (const, override));
+  MOCK_METHOD(absl::StatusOr<bool>, CommitExists, (const std::string&), (override));
 };
 
 MergeResult BuildMergeSuccess(const std::string& commit_id) {

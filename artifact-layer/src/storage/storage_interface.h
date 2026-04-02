@@ -73,6 +73,10 @@ public:
   /// @return The commit ID of the branch head.
   virtual absl::StatusOr<std::string> GetBranchHead(const std::string& branch) = 0;
 
+  /// Check if a branch exists.
+  /// @return true if the branch exists, false if not.
+  virtual absl::StatusOr<bool> BranchExists(const std::string& branch) = 0;
+
   // ── Object I/O ─────────────────────────────────────────────────────────
 
   /// Write an object to a branch's staging area.
@@ -117,6 +121,12 @@ public:
 
   /// Get the name of the canonical (main) branch.
   virtual std::string GetCanonicalBranch() const = 0;
+
+  // ── Ref validation ────────────────────────────────────────────────────
+
+  /// Check if a commit exists by ID.
+  /// @return true if the commit exists, false if not.
+  virtual absl::StatusOr<bool> CommitExists(const std::string& commit_id) = 0;
 };
 
 } // namespace artifact_system

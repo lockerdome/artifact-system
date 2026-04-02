@@ -98,10 +98,24 @@ private:
     std::optional<std::string> parent_transaction_id;
     std::optional<std::string> parent_snapshot_id;
     uint32_t depth = 0;
+    // Local-only: tracks child transactions created on THIS instance.
+    // Cannot detect children created on other instances.
     std::set<std::string> child_transaction_ids;
   };
 
   std::string GenerateBranchName();
+
+  // Transaction metadata persistence helpers.
+  // Metadata is stored at _txn_meta/{transaction_id} on the branch.
+  static std::string TxnMetaPath(const std::string& transaction_id);
+  absl::Status WriteTxnMeta(const std::string& branch, const TransactionRecord& record);
+  absl::StatusOr<TransactionRecord> LoadTxnMeta(const std::string& branch) const;
+  absl::Status CleanupTxnMeta(const std::string& branch);
+
+  // Load transaction record from cache or Storage Layer.
+  // On cache miss, reads _txn_meta from the branch and populates cache.
+  absl::StatusOr<TransactionRecord> ResolveTransaction(const std::string& transaction_id);
+
   absl::Status RemoveTransactionLocked(const std::string& transaction_id);
   absl::StatusOr<CommitResult> CommitTransactionImpl(const std::string& transaction_id, bool write_commit_record);
 
@@ -109,7 +123,11 @@ private:
   Options options_;
 
   mutable std::mutex mutex_;
-  std::unordered_map<std::string, SnapshotSource> snapshots_;
+  // Cache: source_transaction_id for snapshots created on this instance.
+  // Best-effort — not required for correctness.
+  std::unordered_map<std::string, SnapshotSource> snapshot_source_cache_;
+  // Cache: transaction records for transactions known to this instance.
+  // On cache miss, the Storage Layer is queried (branch existence + _txn_meta).
   std::unordered_map<std::string, TransactionRecord> transactions_;
 };
 

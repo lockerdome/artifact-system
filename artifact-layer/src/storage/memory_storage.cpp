@@ -231,6 +231,10 @@ absl::StatusOr<std::string> MemoryStorage::GetBranchHead(const std::string& bran
   return it->second.head_commit_id;
 }
 
+absl::StatusOr<bool> MemoryStorage::BranchExists(const std::string& branch) {
+  return branches_.contains(branch);
+}
+
 // ---------------------------------------------------------------------------
 // Object I/O
 // ---------------------------------------------------------------------------
@@ -477,6 +481,14 @@ absl::StatusOr<MergeResult> MemoryStorage::Merge(const std::string& source, cons
 
 std::string MemoryStorage::GetCanonicalBranch() const {
   return kCanonicalBranch;
+}
+
+// ---------------------------------------------------------------------------
+// Ref validation
+// ---------------------------------------------------------------------------
+
+absl::StatusOr<bool> MemoryStorage::CommitExists(const std::string& commit_id) {
+  return commits_.contains(commit_id);
 }
 
 } // namespace artifact_system
