@@ -795,13 +795,10 @@ TEST_F(TypeRegistryTest, ConcurrentRegistrationConflict) {
 
   // Create a second TypeRegistry pointing at the same storage.
   // Both registries will try to update the same TypeDefinition and tail version.
+  // Create a second TypeRegistry pointing at the same storage.
+  // With ResolveIndexDefId fallback, registry2 will automatically discover
+  // the simple_by_name index via the storage layer on cache miss.
   auto registry2 = std::make_unique<TypeRegistry>(storage_.get(), transaction_manager_.get(), id_allocator_.get(), index_def_ids_);
-  // Update registry2's index map to include the simple_by_name index from v1.
-  auto schema_or = registry_->GetIndexSchema("simple_by_name");
-  if (schema_or.ok()) {
-    std::unordered_map<std::string, uint64_t> extra = {{"simple_by_name", schema_or->index_definition_id}};
-    registry2->UpdateIndexDefIds(extra);
-  }
 
   // Both registries now try to register v2 of the same type. One should succeed
   // and the other should fail with a conflict (ABORTED).

@@ -76,7 +76,7 @@ protected:
 
     // Create a bypass ArtifactStore for writing TransactionCommitRecords.
     artifact::ArtifactStore::Options store_opts;
-    store_opts.index_def_ids_by_key_type = genesis_result_.index_def_ids_by_key_type;
+    store_opts.index_def_ids_by_key_type = &genesis_result_.index_def_ids_by_key_type;
     store_opts.bypass_mutation_check = true;
     bypass_store_ = std::make_unique<artifact::ArtifactStore>(&storage_, manager_.get(), &id_alloc_, store_opts);
 

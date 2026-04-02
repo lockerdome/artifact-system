@@ -98,10 +98,9 @@ ArtifactStore::ArtifactStore(StorageInterface* storage, transaction::Transaction
     : storage_(storage), transaction_manager_(transaction_manager), id_allocator_(id_allocator), options_(std::move(options)) {
 }
 
-void ArtifactStore::UpdateIndexDefIds(const std::unordered_map<std::string, uint64_t>& new_ids) {
-  for (const auto& [key, id] : new_ids) {
-    options_.index_def_ids_by_key_type[key] = id;
-  }
+const std::unordered_map<std::string, uint64_t>& ArtifactStore::GetIndexDefIds() const {
+  static const std::unordered_map<std::string, uint64_t> kEmpty;
+  return options_.index_def_ids_by_key_type ? *options_.index_def_ids_by_key_type : kEmpty;
 }
 
 //── Read operations ────────────��────────────────────────────────────────────
@@ -259,7 +258,7 @@ absl::Status ArtifactStore::StageCreate(const std::string& branch, uint64_t arti
     return status;
 
   // 2. Derive and write index entries.
-  auto entries_or = index::DeriveIndexEntriesFromPayload(descriptor_set, type_name, payload, artifact_id, options_.index_def_ids_by_key_type);
+  auto entries_or = index::DeriveIndexEntriesFromPayload(descriptor_set, type_name, payload, artifact_id, GetIndexDefIds());
   if (!entries_or.ok())
     return entries_or.status();
 
@@ -303,7 +302,7 @@ absl::Status ArtifactStore::StageUpdate(const std::string& branch, uint64_t arti
         old_descriptor_set = old_tvd.descriptor_set();
       }
     }
-    auto old_or = index::DeriveIndexEntriesFromPayload(old_descriptor_set, type_name, existing_or->payload(), artifact_id, options_.index_def_ids_by_key_type);
+    auto old_or = index::DeriveIndexEntriesFromPayload(old_descriptor_set, type_name, existing_or->payload(), artifact_id, GetIndexDefIds());
     if (old_or.ok()) {
       old_entries = std::move(*old_or);
     }
@@ -318,7 +317,7 @@ absl::Status ArtifactStore::StageUpdate(const std::string& branch, uint64_t arti
     return status;
 
   // 4. Derive new index entries.
-  auto new_entries_or = index::DeriveIndexEntriesFromPayload(descriptor_set, type_name, payload, artifact_id, options_.index_def_ids_by_key_type);
+  auto new_entries_or = index::DeriveIndexEntriesFromPayload(descriptor_set, type_name, payload, artifact_id, GetIndexDefIds());
   if (!new_entries_or.ok())
     return new_entries_or.status();
 
@@ -387,7 +386,7 @@ absl::Status ArtifactStore::StageDelete(const std::string& branch, uint64_t arti
   }
 
   auto old_entries_or =
-      index::DeriveIndexEntriesFromPayload(tvd.descriptor_set(), existing.type_name(), existing.payload(), artifact_id, options_.index_def_ids_by_key_type);
+      index::DeriveIndexEntriesFromPayload(tvd.descriptor_set(), existing.type_name(), existing.payload(), artifact_id, GetIndexDefIds());
   if (!old_entries_or.ok()) {
     return absl::OkStatus(); // best-effort
   }
@@ -487,7 +486,7 @@ absl::StatusOr<CreateResult> ArtifactStore::CreateArtifact(uint64_t version_id, 
 
   // Run validation pipeline (phases 1-5).
   ValidationContext vctx{storage_, read_ref, options_.bypass_mutation_check};
-  auto val_result_or = ValidateCreateOrUpdate(WriteOperation::kCreate, version_id, payload, vctx, std::nullopt, options_.index_def_ids_by_key_type);
+  auto val_result_or = ValidateCreateOrUpdate(WriteOperation::kCreate, version_id, payload, vctx, std::nullopt, GetIndexDefIds());
   if (!val_result_or.ok())
     return val_result_or.status();
 
@@ -542,7 +541,7 @@ absl::StatusOr<WriteResult> ArtifactStore::UpdateArtifact(uint64_t artifact_id, 
 
   // Run validation pipeline (phases 1-5).
   ValidationContext vctx{storage_, read_ref, options_.bypass_mutation_check};
-  auto val_result_or = ValidateCreateOrUpdate(WriteOperation::kUpdate, version_id, payload, vctx, artifact_id, options_.index_def_ids_by_key_type);
+  auto val_result_or = ValidateCreateOrUpdate(WriteOperation::kUpdate, version_id, payload, vctx, artifact_id, GetIndexDefIds());
   if (!val_result_or.ok())
     return val_result_or.status();
 
@@ -604,7 +603,7 @@ absl::StatusOr<WriteResult> ArtifactStore::DeleteArtifact(uint64_t artifact_id, 
   // Referential integrity enforcement.
   RefIntegrityContext ri_ctx{storage_, read_ref};
   std::set<uint64_t> scheduled_deletes{artifact_id};
-  auto enforce_or = EnforceDeleteIntegrity(artifact_id, existing.type_name(), ri_ctx, scheduled_deletes, options_.index_def_ids_by_key_type);
+  auto enforce_or = EnforceDeleteIntegrity(artifact_id, existing.type_name(), ri_ctx, scheduled_deletes, GetIndexDefIds());
   if (!enforce_or.ok())
     return enforce_or.status();
 

@@ -84,10 +84,6 @@ public:
   // Read-only access to the current index_def_ids_by_key_type map.
   const std::unordered_map<std::string, uint64_t>& index_def_ids_by_key_type() const { return index_def_ids_by_key_type_; }
 
-  // Update the index_def_ids_by_key_type map (called after bootstrap or
-  // registration to keep the map current).
-  void UpdateIndexDefIds(const std::unordered_map<std::string, uint64_t>& new_ids);
-
 private:
   // Build a RegisterTypeVersionError status from violations.
   static absl::Status MakeRegistrationError(const std::vector<TypeRegistrationViolation>& violations);
@@ -119,8 +115,9 @@ private:
   // Read TypeVersionDefinition artifact IDs for a type via type_versions_by_type index.
   absl::StatusOr<std::vector<uint64_t>> ReadVersionIdsByType(const std::string& ref, uint64_t type_def_id);
 
-  // Rebuild bypass_store_ with current index_def_ids_by_key_type_.
-  void RebuildBypassStore();
+  // Resolve an index_def_id for a key_type, falling back to Storage Layer on cache miss.
+  // Queries the index_key_type_unique index if the key_type is not in the local map.
+  absl::StatusOr<uint64_t> ResolveIndexDefId(const std::string& key_type);
 
   StorageInterface* storage_;
   transaction::TransactionManager* transaction_manager_;

@@ -324,19 +324,8 @@ TypeRegistry::TypeRegistry(StorageInterface* storage, transaction::TransactionMa
                            const std::unordered_map<std::string, uint64_t>& index_def_ids_by_key_type)
     : storage_(storage), transaction_manager_(transaction_manager), id_allocator_(id_allocator), index_def_ids_by_key_type_(index_def_ids_by_key_type),
       bypass_token_() {
-  RebuildBypassStore();
-}
-
-void TypeRegistry::UpdateIndexDefIds(const std::unordered_map<std::string, uint64_t>& new_ids) {
-  for (const auto& [key, id] : new_ids) {
-    index_def_ids_by_key_type_[key] = id;
-  }
-  RebuildBypassStore();
-}
-
-void TypeRegistry::RebuildBypassStore() {
   artifact::ArtifactStore::Options opts;
-  opts.index_def_ids_by_key_type = index_def_ids_by_key_type_;
+  opts.index_def_ids_by_key_type = &index_def_ids_by_key_type_;
   opts.bypass_mutation_check = true;
   opts.bypass_referential_integrity = true;
   bypass_store_ = std::make_unique<artifact::ArtifactStore>(storage_, transaction_manager_, id_allocator_, opts);
@@ -365,10 +354,34 @@ TypeRegistrationViolation TypeRegistry::MakeViolation(TypeRegistrationViolation:
   return v;
 }
 
+absl::StatusOr<uint64_t> TypeRegistry::ResolveIndexDefId(const std::string& key_type) {
+  auto it = index_def_ids_by_key_type_.find(key_type);
+  if (it != index_def_ids_by_key_type_.end()) {
+    return it->second;
+  }
+
+  // Cache miss: look up via the index_key_type_unique index.
+  // This index maps IndexDefinition key_type strings to their artifact IDs.
+  auto meta_it = index_def_ids_by_key_type_.find("index_key_type_unique");
+  if (meta_it == index_def_ids_by_key_type_.end()) {
+    return absl::InternalError("index_key_type_unique index not in cache — cannot resolve cache miss");
+  }
+
+  const std::string ref = storage_->GetCanonicalBranch();
+  auto result_or = LookupIndexDefinition(ref, key_type);
+  if (!result_or.ok()) return result_or.status();
+  if (!result_or->has_value()) {
+    return absl::NotFoundError(absl::StrCat("index definition not found for key_type: ", key_type));
+  }
+
+  uint64_t artifact_id = result_or->value().first;
+  index_def_ids_by_key_type_[key_type] = artifact_id;
+  return artifact_id;
+}
+
 absl::StatusOr<std::optional<std::pair<uint64_t, TypeDefinition>>> TypeRegistry::LookupTypeDefinition(const std::string& ref, const std::string& type_name) {
-  auto it = index_def_ids_by_key_type_.find("type_name_unique");
-  if (it == index_def_ids_by_key_type_.end())
-    return absl::InternalError("type_name_unique index not registered");
+  auto id_or = ResolveIndexDefId("type_name_unique");
+  if (!id_or.ok()) return id_or.status();
 
   const auto* td_descriptor = TypeDefinition::descriptor();
   auto encoded_or = EncodeStringIndexKey(*td_descriptor, "type_name", type_name);
@@ -376,7 +389,7 @@ absl::StatusOr<std::optional<std::pair<uint64_t, TypeDefinition>>> TypeRegistry:
     return encoded_or.status();
 
   const IndexDefinition& idx_def = td_descriptor->options().GetExtension(artifact_system::indexes, 0); // type_name_unique is first
-  auto ids_or = ReadIndexArtifactIds(ref, it->second, *encoded_or, idx_def, *td_descriptor);
+  auto ids_or = ReadIndexArtifactIds(ref, *id_or, *encoded_or, idx_def, *td_descriptor);
   if (!ids_or.ok()) {
     if (absl::IsNotFound(ids_or.status()))
       return std::nullopt;
@@ -420,9 +433,8 @@ absl::StatusOr<std::optional<std::pair<uint64_t, TypeVersionDefinition>>> TypeRe
 template <typename T>
 absl::StatusOr<std::optional<std::pair<uint64_t, T>>> TypeRegistry::LookupByKeyType(const std::string& ref, const std::string& index_name,
                                                                                     const std::string& key_type) {
-  auto it = index_def_ids_by_key_type_.find(index_name);
-  if (it == index_def_ids_by_key_type_.end())
-    return absl::InternalError(absl::StrCat(index_name, " index not registered"));
+  auto id_or = ResolveIndexDefId(index_name);
+  if (!id_or.ok()) return id_or.status();
 
   const auto* descriptor = T::descriptor();
   auto encoded_or = EncodeStringIndexKey(*descriptor, "key_type", key_type);
@@ -430,7 +442,7 @@ absl::StatusOr<std::optional<std::pair<uint64_t, T>>> TypeRegistry::LookupByKeyT
     return encoded_or.status();
 
   const IndexDefinition& idx_def = descriptor->options().GetExtension(artifact_system::indexes, 0);
-  auto ids_or = ReadIndexArtifactIds(ref, it->second, *encoded_or, idx_def, *descriptor);
+  auto ids_or = ReadIndexArtifactIds(ref, *id_or, *encoded_or, idx_def, *descriptor);
   if (!ids_or.ok()) {
     if (absl::IsNotFound(ids_or.status()))
       return std::nullopt;
@@ -455,9 +467,8 @@ absl::StatusOr<std::optional<std::pair<uint64_t, ReferenceDefinition>>> TypeRegi
 }
 
 absl::StatusOr<std::vector<uint64_t>> TypeRegistry::ReadVersionIdsByType(const std::string& ref, uint64_t type_def_id) {
-  auto it = index_def_ids_by_key_type_.find("type_versions_by_type");
-  if (it == index_def_ids_by_key_type_.end())
-    return absl::InternalError("type_versions_by_type index not registered");
+  auto id_or = ResolveIndexDefId("type_versions_by_type");
+  if (!id_or.ok()) return id_or.status();
 
   const auto* tvd_descriptor = TypeVersionDefinition::descriptor();
   auto encoded_or = EncodeUint64IndexKey(*tvd_descriptor, "type_id", type_def_id);
@@ -465,7 +476,7 @@ absl::StatusOr<std::vector<uint64_t>> TypeRegistry::ReadVersionIdsByType(const s
     return encoded_or.status();
 
   const IndexDefinition& idx_def = tvd_descriptor->options().GetExtension(artifact_system::indexes, 0);
-  return ReadIndexArtifactIds(ref, it->second, *encoded_or, idx_def, *tvd_descriptor);
+  return ReadIndexArtifactIds(ref, *id_or, *encoded_or, idx_def, *tvd_descriptor);
 }
 
 absl::StatusOr<std::vector<uint64_t>> TypeRegistry::ReadIndexArtifactIds(const std::string& ref, uint64_t index_def_id, const std::vector<uint8_t>& encoded_key,
@@ -823,9 +834,9 @@ absl::StatusOr<RegisterResult> TypeRegistry::RegisterTypeVersion(const std::stri
     return absl::AbortedError("concurrent type registration conflict");
   }
 
-  // Update the index map and rebuild bypass_store_ with current map.
-  if (!new_index_ids.empty()) {
-    UpdateIndexDefIds(new_index_ids);
+  // Update the index map with newly created index IDs.
+  for (const auto& [key, id] : new_index_ids) {
+    index_def_ids_by_key_type_[key] = id;
   }
 
   return RegisterResult{new_tvd_artifact_id};

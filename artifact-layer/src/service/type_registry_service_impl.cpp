@@ -6,8 +6,8 @@
 
 namespace artifact_system::service {
 
-TypeRegistryServiceImpl::TypeRegistryServiceImpl(registry::TypeRegistry* registry, artifact::ArtifactStore* artifact_store)
-    : registry_(registry), artifact_store_(artifact_store) {
+TypeRegistryServiceImpl::TypeRegistryServiceImpl(registry::TypeRegistry* registry)
+    : registry_(registry) {
 }
 
 grpc::Status TypeRegistryServiceImpl::RegisterTypeVersion(grpc::ServerContext* /*context*/, const RegisterTypeVersionRequest* request,
@@ -25,12 +25,6 @@ grpc::Status TypeRegistryServiceImpl::RegisterTypeVersion(grpc::ServerContext* /
 
   if (!result.ok()) {
     return AbslToGrpcStatus(result.status());
-  }
-
-  // Propagate new index IDs to the artifact store so subsequent CRUD operations
-  // can derive indexes for the newly registered type.
-  if (artifact_store_) {
-    artifact_store_->UpdateIndexDefIds(registry_->index_def_ids_by_key_type());
   }
 
   response->set_version_id(result->version_id);

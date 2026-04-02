@@ -64,15 +64,16 @@ absl::Status ArtifactLayerServer::Initialize() {
   }
   impl_->txn_manager = std::make_unique<transaction::TransactionManager>(impl_->storage.get());
 
-  artifact::ArtifactStore::Options store_options{.index_def_ids_by_key_type = genesis_result->index_def_ids_by_key_type};
-  impl_->artifact_store = std::make_unique<artifact::ArtifactStore>(impl_->storage.get(), impl_->txn_manager.get(), impl_->id_allocator.get(), store_options);
   impl_->type_registry = std::make_unique<registry::TypeRegistry>(impl_->storage.get(), impl_->txn_manager.get(), impl_->id_allocator.get(),
                                                                   genesis_result->index_def_ids_by_key_type);
+
+  artifact::ArtifactStore::Options store_options{.index_def_ids_by_key_type = &impl_->type_registry->index_def_ids_by_key_type()};
+  impl_->artifact_store = std::make_unique<artifact::ArtifactStore>(impl_->storage.get(), impl_->txn_manager.get(), impl_->id_allocator.get(), store_options);
 
   impl_->snapshot_txn_service = std::make_unique<SnapshotTransactionServiceImpl>(impl_->txn_manager.get());
   impl_->artifact_service = std::make_unique<ArtifactServiceImpl>(impl_->artifact_store.get());
   impl_->index_service = std::make_unique<IndexServiceImpl>(impl_->storage.get(), impl_->txn_manager.get(), impl_->type_registry.get());
-  impl_->type_registry_service = std::make_unique<TypeRegistryServiceImpl>(impl_->type_registry.get(), impl_->artifact_store.get());
+  impl_->type_registry_service = std::make_unique<TypeRegistryServiceImpl>(impl_->type_registry.get());
 
   return absl::OkStatus();
 }

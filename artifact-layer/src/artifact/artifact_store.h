@@ -53,9 +53,9 @@ struct BatchGetEntry {
 class ArtifactStore {
 public:
   struct Options {
-    // Map from index key_type to IndexDefinition artifact_id.
-    // Required for index derivation and referential integrity lookups.
-    std::unordered_map<std::string, uint64_t> index_def_ids_by_key_type;
+    // Pointer to the index_def_ids_by_key_type map (owned externally, e.g. by TypeRegistry).
+    // When null, an empty map is used.
+    const std::unordered_map<std::string, uint64_t>* index_def_ids_by_key_type = nullptr;
     // When true, bypass mutation restriction checks (for internal operations).
     bool bypass_mutation_check = false;
     // When true, bypass referential integrity validation (for internal operations
@@ -89,9 +89,6 @@ public:
   // BatchGetArtifacts: per-id results preserving positional correlation.
   absl::StatusOr<std::vector<BatchGetEntry>> BatchGetArtifacts(const std::vector<uint64_t>& artifact_ids, const ReadContext& context);
 
-  // Update the index_def_ids_by_key_type map (e.g., after registering new types).
-  void UpdateIndexDefIds(const std::unordered_map<std::string, uint64_t>& new_ids);
-
 private:
   // Resolve a ReadContext to a storage ref (branch name or commit ID).
   absl::StatusOr<std::string> ResolveReadRef(const ReadContext& context);
@@ -118,6 +115,8 @@ private:
   // Apply delete side effects within a write transaction.
   absl::Status ApplyCascadeEffect(const std::string& branch, const CascadeDelete& cascade);
   absl::Status ApplySetNullEffect(const std::string& branch, const SetNullUpdate& set_null);
+
+  const std::unordered_map<std::string, uint64_t>& GetIndexDefIds() const;
 
   StorageInterface* storage_;
   transaction::TransactionManager* transaction_manager_;
