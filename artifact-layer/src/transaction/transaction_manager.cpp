@@ -340,14 +340,21 @@ absl::StatusOr<TransactionManager::CommitResult> TransactionManager::CommitTrans
   }
 
   // Clean up transaction metadata before merge to avoid polluting the target branch.
+  // If the merge fails, metadata is restored so the transaction remains usable.
   auto cleanup_status = CleanupTxnMeta(transaction_id);
   if (!cleanup_status.ok()) {
     return cleanup_status;
   }
 
+  // Restore metadata on any exit path that does not delete the branch.
+  auto restore_meta = [&]() {
+    (void)WriteTxnMeta(transaction_id, transaction);
+  };
+
   for (uint32_t attempts_performed = 1; attempts_performed <= options_.conflict_options.max_attempts; ++attempts_performed) {
     auto merge_or = storage_->Merge(transaction_id, target_branch);
     if (!merge_or.ok()) {
+      restore_meta();
       return merge_or.status();
     }
 
@@ -359,6 +366,7 @@ absl::StatusOr<TransactionManager::CommitResult> TransactionManager::CommitTrans
           BuildCommitConflict(merge_result.GetConflict(), attempts_performed, options_.conflict_options, options_.path_conflict_classifier);
 
       if (!retry_decision.retryable) {
+        restore_meta();
         return CommitConflict{
             .transaction_id = transaction_id,
             .conflict = merge_result.GetConflict(),
@@ -374,10 +382,12 @@ absl::StatusOr<TransactionManager::CommitResult> TransactionManager::CommitTrans
         resolution_context.attempts_performed = attempts_performed;
         auto resolved_or = options_.retry_conflict_resolver(resolution_context);
         if (!resolved_or.ok()) {
+          restore_meta();
           return resolved_or.status();
         }
         if (!*resolved_or) {
           detail.set_retryable(false);
+          restore_meta();
           return CommitConflict{
               .transaction_id = transaction_id,
               .conflict = merge_result.GetConflict(),
@@ -399,6 +409,7 @@ absl::StatusOr<TransactionManager::CommitResult> TransactionManager::CommitTrans
       // Re-check children from local cache (best-effort).
       auto cache_it = transactions_.find(transaction_id);
       if (cache_it != transactions_.end() && !cache_it->second.child_transaction_ids.empty()) {
+        restore_meta();
         return absl::InvalidArgumentError(absl::StrCat("transaction has active nested children: ", transaction_id));
       }
       continue;
@@ -427,6 +438,7 @@ absl::StatusOr<TransactionManager::CommitResult> TransactionManager::CommitTrans
     };
   }
 
+  restore_meta();
   return absl::InternalError("commit loop exited unexpectedly");
 }
 
