@@ -109,15 +109,39 @@ absl::StatusOr<std::string> ArtifactStore::ResolveReadRef(const ReadContext& con
   if (context.has_snapshot_id()) {
     // The snapshot_id IS the commit hash — validate it's known, then return directly.
     auto meta_or = transaction_manager_->GetSnapshotMetadata(context.snapshot_id());
-    if (!meta_or.ok())
+    if (!meta_or.ok()) {
+      if (absl::IsNotFound(meta_or.status())) {
+        SnapshotTransactionError detail;
+        detail.set_category(SnapshotTransactionError::SNAPSHOT_NOT_FOUND);
+        detail.set_description(absl::StrCat("snapshot not found: ", context.snapshot_id()));
+        detail.set_id(context.snapshot_id());
+        absl::Status status = absl::NotFoundError(detail.description());
+        std::string serialized;
+        detail.SerializeToString(&serialized);
+        status.SetPayload("type.googleapis.com/artifact_system.SnapshotTransactionError", absl::Cord(serialized));
+        return status;
+      }
       return meta_or.status();
+    }
     return context.snapshot_id();
   }
   if (context.has_transaction_id()) {
     // The transaction_id IS the branch name — validate it's known, then return directly.
     auto meta_or = transaction_manager_->GetTransactionMetadata(context.transaction_id());
-    if (!meta_or.ok())
+    if (!meta_or.ok()) {
+      if (absl::IsNotFound(meta_or.status())) {
+        SnapshotTransactionError detail;
+        detail.set_category(SnapshotTransactionError::TRANSACTION_NOT_FOUND);
+        detail.set_description(absl::StrCat("transaction not found: ", context.transaction_id()));
+        detail.set_id(context.transaction_id());
+        absl::Status status = absl::NotFoundError(detail.description());
+        std::string serialized;
+        detail.SerializeToString(&serialized);
+        status.SetPayload("type.googleapis.com/artifact_system.SnapshotTransactionError", absl::Cord(serialized));
+        return status;
+      }
       return meta_or.status();
+    }
     return context.transaction_id();
   }
   // No context: read from canonical branch head.
@@ -195,8 +219,20 @@ absl::StatusOr<std::string> ArtifactStore::ResolveWriteBranch(const std::optiona
   if (transaction_id.has_value()) {
     // The transaction_id IS the branch name — validate it's known, then return directly.
     auto meta_or = transaction_manager_->GetTransactionMetadata(*transaction_id);
-    if (!meta_or.ok())
+    if (!meta_or.ok()) {
+      if (absl::IsNotFound(meta_or.status())) {
+        SnapshotTransactionError detail;
+        detail.set_category(SnapshotTransactionError::TRANSACTION_NOT_FOUND);
+        detail.set_description(absl::StrCat("transaction not found: ", *transaction_id));
+        detail.set_id(*transaction_id);
+        absl::Status status = absl::NotFoundError(detail.description());
+        std::string serialized;
+        detail.SerializeToString(&serialized);
+        status.SetPayload("type.googleapis.com/artifact_system.SnapshotTransactionError", absl::Cord(serialized));
+        return status;
+      }
       return meta_or.status();
+    }
     return *transaction_id;
   }
   return std::string(storage_->GetCanonicalBranch());

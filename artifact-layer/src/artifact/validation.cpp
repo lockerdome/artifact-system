@@ -93,13 +93,14 @@ absl::StatusOr<ResolvedType> ResolveVersionId(uint64_t version_id, const Validat
 
   // Step 2: Verify it is a TypeVersionDefinition.
   if (version_stored.type_name() != "TypeVersionDefinition" && version_stored.type_name() != "artifact_system.TypeVersionDefinition") {
-    return absl::InvalidArgumentError(absl::StrCat("version_id ", version_id, " does not resolve to a valid TypeVersionDefinition"));
+    return absl::InvalidArgumentError(
+        absl::StrCat("version_id ", version_id, " has type_name '", version_stored.type_name(), "', expected TypeVersionDefinition"));
   }
 
   // Step 3: Parse payload as TypeVersionDefinition.
   TypeVersionDefinition tvd;
   if (!tvd.ParseFromString(version_stored.payload())) {
-    return absl::InvalidArgumentError(absl::StrCat("version_id ", version_id, " does not resolve to a valid TypeVersionDefinition"));
+    return absl::InvalidArgumentError(absl::StrCat("version_id ", version_id, " failed to parse as TypeVersionDefinition"));
   }
 
   // Step 4: Read the parent TypeDefinition artifact.
@@ -111,13 +112,16 @@ absl::StatusOr<ResolvedType> ResolveVersionId(uint64_t version_id, const Validat
 
   // Step 5: Verify it is a TypeDefinition.
   if (type_stored.type_name() != "TypeDefinition" && type_stored.type_name() != "artifact_system.TypeDefinition") {
-    return absl::InvalidArgumentError(absl::StrCat("version_id ", version_id, " does not resolve to a valid TypeVersionDefinition"));
+    return absl::InvalidArgumentError(
+        absl::StrCat("version_id ", version_id, " references type_id ", tvd.type_id(), " which has type_name '", type_stored.type_name(),
+                     "', expected TypeDefinition"));
   }
 
   // Step 6: Parse payload as TypeDefinition.
   TypeDefinition td;
   if (!td.ParseFromString(type_stored.payload())) {
-    return absl::InvalidArgumentError(absl::StrCat("version_id ", version_id, " does not resolve to a valid TypeVersionDefinition"));
+    return absl::InvalidArgumentError(
+        absl::StrCat("version_id ", version_id, " references type_id ", tvd.type_id(), " which failed to parse as TypeDefinition"));
   }
 
   // Step 7: Build and return ResolvedType.

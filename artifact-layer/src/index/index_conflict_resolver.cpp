@@ -67,6 +67,7 @@ std::vector<const google::protobuf::Descriptor*> CandidateIndexedDescriptors() {
       artifact_system::TypeDefinition::descriptor(),
       artifact_system::TypeVersionDefinition::descriptor(),
       artifact_system::ReferenceDefinition::descriptor(),
+      artifact_system::TransactionCommitRecord::descriptor(),
   };
 }
 
