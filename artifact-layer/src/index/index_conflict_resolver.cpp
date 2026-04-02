@@ -63,10 +63,8 @@ bool IndexDefinitionsEqual(const artifact_system::IndexDefinition& lhs, const ar
 
 std::vector<const google::protobuf::Descriptor*> CandidateIndexedDescriptors() {
   return {
-      artifact_system::IndexDefinition::descriptor(),
-      artifact_system::TypeDefinition::descriptor(),
-      artifact_system::TypeVersionDefinition::descriptor(),
-      artifact_system::ReferenceDefinition::descriptor(),
+      artifact_system::IndexDefinition::descriptor(),         artifact_system::TypeDefinition::descriptor(),
+      artifact_system::TypeVersionDefinition::descriptor(),   artifact_system::ReferenceDefinition::descriptor(),
       artifact_system::TransactionCommitRecord::descriptor(),
   };
 }

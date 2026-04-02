@@ -2,8 +2,8 @@
 
 #include <cstdint>
 #include <functional>
-#include <set>
 #include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -369,7 +369,8 @@ absl::StatusOr<uint64_t> TypeRegistry::ResolveIndexDefId(const std::string& key_
 
   const std::string ref = storage_->GetCanonicalBranch();
   auto result_or = LookupIndexDefinition(ref, key_type);
-  if (!result_or.ok()) return result_or.status();
+  if (!result_or.ok())
+    return result_or.status();
   if (!result_or->has_value()) {
     return absl::NotFoundError(absl::StrCat("index definition not found for key_type: ", key_type));
   }
@@ -381,7 +382,8 @@ absl::StatusOr<uint64_t> TypeRegistry::ResolveIndexDefId(const std::string& key_
 
 absl::StatusOr<std::optional<std::pair<uint64_t, TypeDefinition>>> TypeRegistry::LookupTypeDefinition(const std::string& ref, const std::string& type_name) {
   auto id_or = ResolveIndexDefId("type_name_unique");
-  if (!id_or.ok()) return id_or.status();
+  if (!id_or.ok())
+    return id_or.status();
 
   const auto* td_descriptor = TypeDefinition::descriptor();
   auto encoded_or = EncodeStringIndexKey(*td_descriptor, "type_name", type_name);
@@ -434,7 +436,8 @@ template <typename T>
 absl::StatusOr<std::optional<std::pair<uint64_t, T>>> TypeRegistry::LookupByKeyType(const std::string& ref, const std::string& index_name,
                                                                                     const std::string& key_type) {
   auto id_or = ResolveIndexDefId(index_name);
-  if (!id_or.ok()) return id_or.status();
+  if (!id_or.ok())
+    return id_or.status();
 
   const auto* descriptor = T::descriptor();
   auto encoded_or = EncodeStringIndexKey(*descriptor, "key_type", key_type);
@@ -468,7 +471,8 @@ absl::StatusOr<std::optional<std::pair<uint64_t, ReferenceDefinition>>> TypeRegi
 
 absl::StatusOr<std::vector<uint64_t>> TypeRegistry::ReadVersionIdsByType(const std::string& ref, uint64_t type_def_id) {
   auto id_or = ResolveIndexDefId("type_versions_by_type");
-  if (!id_or.ok()) return id_or.status();
+  if (!id_or.ok())
+    return id_or.status();
 
   const auto* tvd_descriptor = TypeVersionDefinition::descriptor();
   auto encoded_or = EncodeUint64IndexKey(*tvd_descriptor, "type_id", type_def_id);

@@ -112,9 +112,8 @@ absl::StatusOr<ResolvedType> ResolveVersionId(uint64_t version_id, const Validat
 
   // Step 5: Verify it is a TypeDefinition.
   if (type_stored.type_name() != "TypeDefinition" && type_stored.type_name() != "artifact_system.TypeDefinition") {
-    return absl::InvalidArgumentError(
-        absl::StrCat("version_id ", version_id, " references type_id ", tvd.type_id(), " which has type_name '", type_stored.type_name(),
-                     "', expected TypeDefinition"));
+    return absl::InvalidArgumentError(absl::StrCat("version_id ", version_id, " references type_id ", tvd.type_id(), " which has type_name '",
+                                                   type_stored.type_name(), "', expected TypeDefinition"));
   }
 
   // Step 6: Parse payload as TypeDefinition.

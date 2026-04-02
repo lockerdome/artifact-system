@@ -103,7 +103,7 @@ const std::unordered_map<std::string, uint64_t>& ArtifactStore::GetIndexDefIds()
   return options_.index_def_ids_by_key_type ? *options_.index_def_ids_by_key_type : kEmpty;
 }
 
-//── Read operations ────────────��────────────────────────────────────────────
+// ── Read operations ────────────��────────────────────────────────────────────
 
 absl::StatusOr<std::string> ArtifactStore::ResolveReadRef(const ReadContext& context) {
   if (context.has_snapshot_id()) {
@@ -421,8 +421,7 @@ absl::Status ArtifactStore::StageDelete(const std::string& branch, uint64_t arti
     return absl::OkStatus(); // best-effort
   }
 
-  auto old_entries_or =
-      index::DeriveIndexEntriesFromPayload(tvd.descriptor_set(), existing.type_name(), existing.payload(), artifact_id, GetIndexDefIds());
+  auto old_entries_or = index::DeriveIndexEntriesFromPayload(tvd.descriptor_set(), existing.type_name(), existing.payload(), artifact_id, GetIndexDefIds());
   if (!old_entries_or.ok()) {
     return absl::OkStatus(); // best-effort
   }

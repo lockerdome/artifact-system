@@ -6,8 +6,7 @@
 
 namespace artifact_system::service {
 
-TypeRegistryServiceImpl::TypeRegistryServiceImpl(registry::TypeRegistry* registry)
-    : registry_(registry) {
+TypeRegistryServiceImpl::TypeRegistryServiceImpl(registry::TypeRegistry* registry) : registry_(registry) {
 }
 
 grpc::Status TypeRegistryServiceImpl::RegisterTypeVersion(grpc::ServerContext* /*context*/, const RegisterTypeVersionRequest* request,

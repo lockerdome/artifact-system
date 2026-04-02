@@ -82,7 +82,9 @@ public:
   absl::StatusOr<IndexSchemaInfo> GetIndexSchema(const std::string& key_type);
 
   // Read-only access to the current index_def_ids_by_key_type map.
-  const std::unordered_map<std::string, uint64_t>& index_def_ids_by_key_type() const { return index_def_ids_by_key_type_; }
+  const std::unordered_map<std::string, uint64_t>& index_def_ids_by_key_type() const {
+    return index_def_ids_by_key_type_;
+  }
 
 private:
   // Build a RegisterTypeVersionError status from violations.

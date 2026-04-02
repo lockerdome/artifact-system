@@ -52,20 +52,20 @@ std::string TransactionManager::TxnMetaPath(const std::string& transaction_id) {
 }
 
 absl::Status TransactionManager::WriteTxnMeta(const std::string& branch, const TransactionRecord& record) {
-  std::string data = absl::StrCat(
-      record.parent_transaction_id.value_or(""), "\n",
-      record.parent_snapshot_id.value_or(""), "\n",
-      record.depth);
+  std::string data = absl::StrCat(record.parent_transaction_id.value_or(""), "\n", record.parent_snapshot_id.value_or(""), "\n", record.depth);
   auto put_status = storage_->PutObject(branch, TxnMetaPath(branch), data);
-  if (!put_status.ok()) return put_status;
+  if (!put_status.ok())
+    return put_status;
   auto commit_or = storage_->Commit(branch, "txn metadata");
-  if (!commit_or.ok()) return commit_or.status();
+  if (!commit_or.ok())
+    return commit_or.status();
   return absl::OkStatus();
 }
 
 absl::StatusOr<TransactionManager::TransactionRecord> TransactionManager::LoadTxnMeta(const std::string& branch) const {
   auto data_or = storage_->GetObject(branch, TxnMetaPath(branch));
-  if (!data_or.ok()) return data_or.status();
+  if (!data_or.ok())
+    return data_or.status();
 
   const std::string& data = *data_or;
   std::vector<std::string> lines = absl::StrSplit(data, '\n');
@@ -74,8 +74,10 @@ absl::StatusOr<TransactionManager::TransactionRecord> TransactionManager::LoadTx
   }
 
   TransactionRecord record;
-  if (!lines[0].empty()) record.parent_transaction_id = lines[0];
-  if (!lines[1].empty()) record.parent_snapshot_id = lines[1];
+  if (!lines[0].empty())
+    record.parent_transaction_id = lines[0];
+  if (!lines[1].empty())
+    record.parent_snapshot_id = lines[1];
   uint32_t depth = 0;
   if (!absl::SimpleAtoi(lines[2], &depth)) {
     return absl::InternalError(absl::StrCat("invalid depth in txn metadata: ", lines[2]));
@@ -86,9 +88,11 @@ absl::StatusOr<TransactionManager::TransactionRecord> TransactionManager::LoadTx
 
 absl::Status TransactionManager::CleanupTxnMeta(const std::string& branch) {
   auto del_status = storage_->DeleteObject(branch, TxnMetaPath(branch));
-  if (!del_status.ok()) return del_status;
+  if (!del_status.ok())
+    return del_status;
   auto commit_or = storage_->Commit(branch, "cleanup txn metadata");
-  if (!commit_or.ok()) return commit_or.status();
+  if (!commit_or.ok())
+    return commit_or.status();
   return absl::OkStatus();
 }
 
@@ -208,7 +212,8 @@ absl::StatusOr<std::string> TransactionManager::CreateTransaction(std::optional<
 
     // Validate snapshot via Storage Layer: a snapshot_id IS a commit hash.
     auto commit_exists_or = storage_->CommitExists(parent_id);
-    if (!commit_exists_or.ok()) return commit_exists_or.status();
+    if (!commit_exists_or.ok())
+      return commit_exists_or.status();
     if (!*commit_exists_or) {
       return absl::NotFoundError(absl::StrCat("parent snapshot not found: ", parent_id));
     }
@@ -286,7 +291,8 @@ absl::StatusOr<TransactionManager::CommitResult> TransactionManager::CommitTrans
   }
 
   auto record_or = ResolveTransaction(transaction_id);
-  if (!record_or.ok()) return record_or.status();
+  if (!record_or.ok())
+    return record_or.status();
 
   const TransactionRecord transaction = *record_or;
   if (!transaction.child_transaction_ids.empty()) {
@@ -347,9 +353,7 @@ absl::StatusOr<TransactionManager::CommitResult> TransactionManager::CommitTrans
   }
 
   // Restore metadata on any exit path that does not delete the branch.
-  auto restore_meta = [&]() {
-    (void)WriteTxnMeta(transaction_id, transaction);
-  };
+  auto restore_meta = [&]() { (void)WriteTxnMeta(transaction_id, transaction); };
 
   for (uint32_t attempts_performed = 1; attempts_performed <= options_.conflict_options.max_attempts; ++attempts_performed) {
     auto merge_or = storage_->Merge(transaction_id, target_branch);
@@ -402,7 +406,8 @@ absl::StatusOr<TransactionManager::CommitResult> TransactionManager::CommitTrans
 
       // Re-validate transaction exists after re-acquiring lock.
       auto branch_exists_or = storage_->BranchExists(transaction_id);
-      if (!branch_exists_or.ok()) return branch_exists_or.status();
+      if (!branch_exists_or.ok())
+        return branch_exists_or.status();
       if (!*branch_exists_or) {
         return absl::NotFoundError(absl::StrCat("transaction not found: ", transaction_id));
       }
@@ -418,7 +423,8 @@ absl::StatusOr<TransactionManager::CommitResult> TransactionManager::CommitTrans
     auto remove_status = RemoveTransactionLocked(transaction_id);
     if (!remove_status.ok()) {
       // Ignore NOT_FOUND — transaction may have been removed from cache by another path.
-      if (!absl::IsNotFound(remove_status)) return remove_status;
+      if (!absl::IsNotFound(remove_status))
+        return remove_status;
     }
     auto delete_status = storage_->DeleteBranch(transaction_id);
     if (!delete_status.ok()) {
@@ -450,7 +456,8 @@ absl::Status TransactionManager::RollbackTransaction(const std::string& transact
 
   // Validate transaction exists via Storage Layer.
   auto branch_exists_or = storage_->BranchExists(transaction_id);
-  if (!branch_exists_or.ok()) return branch_exists_or.status();
+  if (!branch_exists_or.ok())
+    return branch_exists_or.status();
   if (!*branch_exists_or) {
     return absl::NotFoundError(absl::StrCat("transaction not found: ", transaction_id));
   }
@@ -527,7 +534,8 @@ absl::StatusOr<TransactionManager::SnapshotMetadata> TransactionManager::GetSnap
 
   // A snapshot_id IS a commit hash. Validate via Storage Layer.
   auto commit_exists_or = storage_->CommitExists(snapshot_id);
-  if (!commit_exists_or.ok()) return commit_exists_or.status();
+  if (!commit_exists_or.ok())
+    return commit_exists_or.status();
   if (!*commit_exists_or) {
     return absl::NotFoundError(absl::StrCat("snapshot not found: ", snapshot_id));
   }

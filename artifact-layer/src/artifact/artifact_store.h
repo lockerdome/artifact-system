@@ -71,8 +71,7 @@ public:
   // CreateArtifact: allocate ID, validate, derive indexes, stage writes.
   // If transaction_id is set, writes into that transaction.
   // Otherwise, wraps in an implicit transaction.
-  absl::StatusOr<CreateResult> CreateArtifact(uint64_t version_id, const std::string& payload,
-                                              const std::optional<std::string>& transaction_id = std::nullopt);
+  absl::StatusOr<CreateResult> CreateArtifact(uint64_t version_id, const std::string& payload, const std::optional<std::string>& transaction_id = std::nullopt);
 
   // UpdateArtifact: validate type match, revalidate payload, compute index diff.
   absl::StatusOr<WriteResult> UpdateArtifact(uint64_t artifact_id, uint64_t version_id, const std::string& payload,
