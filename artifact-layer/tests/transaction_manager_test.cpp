@@ -498,5 +498,189 @@ TEST(TransactionManagerTest, NestedRollbackChildThenCommitParentSucceeds) {
   EXPECT_EQ(child_read_or.status().code(), absl::StatusCode::kNotFound);
 }
 
+// ---------------------------------------------------------------------------
+// Multi-instance tests (C4 — Phase 12)
+// Verify that two TransactionManager instances sharing the same Storage
+// can correctly handle each other's transactions (statelessness validation).
+// ---------------------------------------------------------------------------
+
+TEST(TransactionManagerTest, MultiInstanceSnapshotCreatedOnOneInstanceVisibleOnAnother) {
+  MemoryStorage storage;
+
+  TransactionManager::Options opts;
+  opts.sleep_for = [](absl::Duration) {};
+
+  TransactionManager manager_a(&storage, opts);
+  TransactionManager manager_b(&storage, opts);
+
+  // On manager A: create a transaction, write, commit, get snapshot.
+  auto txn_id_or = manager_a.CreateTransaction();
+  ASSERT_TRUE(txn_id_or.ok());
+  ASSERT_TRUE(storage.PutObject(*txn_id_or, "multi/a.txt", "value-a").ok());
+  ASSERT_TRUE(storage.Commit(*txn_id_or, "write from A").ok());
+
+  auto commit_result_or = manager_a.CommitTransaction(*txn_id_or);
+  ASSERT_TRUE(commit_result_or.ok());
+  ASSERT_TRUE(std::holds_alternative<TransactionManager::CommitSuccess>(*commit_result_or));
+  const auto& commit_a = std::get<TransactionManager::CommitSuccess>(*commit_result_or);
+
+  auto snapshot_a_or = manager_a.CreateSnapshot();
+  ASSERT_TRUE(snapshot_a_or.ok());
+
+  // On manager B: CreateSnapshot should return the same canonical head.
+  auto snapshot_b_or = manager_b.CreateSnapshot();
+  ASSERT_TRUE(snapshot_b_or.ok());
+
+  // Both snapshots should refer to the same commit (canonical head).
+  EXPECT_EQ(*snapshot_a_or, *snapshot_b_or);
+  EXPECT_EQ(*snapshot_a_or, commit_a.snapshot_id);
+}
+
+TEST(TransactionManagerTest, MultiInstanceTransactionCreatedOnOneCommittedOnAnother) {
+  MemoryStorage storage;
+
+  TransactionManager::Options opts;
+  opts.sleep_for = [](absl::Duration) {};
+
+  TransactionManager manager_a(&storage, opts);
+  TransactionManager manager_b(&storage, opts);
+
+  // On A: create a transaction.
+  auto txn_id_or = manager_a.CreateTransaction();
+  ASSERT_TRUE(txn_id_or.ok());
+  const std::string txn_id = *txn_id_or;
+
+  // Write objects on the transaction branch directly via storage.
+  ASSERT_TRUE(storage.PutObject(txn_id, "cross/obj.txt", "cross-value").ok());
+  ASSERT_TRUE(storage.Commit(txn_id, "write on A's txn").ok());
+
+  // On B: CommitTransaction should succeed — B reads the metadata from storage.
+  auto commit_result_or = manager_b.CommitTransaction(txn_id);
+  ASSERT_TRUE(commit_result_or.ok());
+  ASSERT_TRUE(std::holds_alternative<TransactionManager::CommitSuccess>(*commit_result_or));
+
+  // Verify the written objects are now on the canonical branch.
+  auto read_or = storage.GetObject(storage.GetCanonicalBranch(), "cross/obj.txt");
+  ASSERT_TRUE(read_or.ok());
+  EXPECT_EQ(*read_or, "cross-value");
+}
+
+TEST(TransactionManagerTest, MultiInstanceTransactionRollbackOnDifferentInstance) {
+  MemoryStorage storage;
+
+  TransactionManager::Options opts;
+  opts.sleep_for = [](absl::Duration) {};
+
+  TransactionManager manager_a(&storage, opts);
+  TransactionManager manager_b(&storage, opts);
+
+  // On A: create a transaction.
+  auto txn_id_or = manager_a.CreateTransaction();
+  ASSERT_TRUE(txn_id_or.ok());
+  const std::string txn_id = *txn_id_or;
+
+  // On B: rollback should succeed — B sees the branch exists.
+  ASSERT_TRUE(manager_b.RollbackTransaction(txn_id).ok());
+
+  // Verify the branch is deleted from storage.
+  auto branch_head = storage.GetBranchHead(txn_id);
+  ASSERT_FALSE(branch_head.ok());
+  EXPECT_EQ(branch_head.status().code(), absl::StatusCode::kNotFound);
+
+  // On B: GetTransactionMetadata should return NOT_FOUND.
+  auto meta_b = manager_b.GetTransactionMetadata(txn_id);
+  ASSERT_FALSE(meta_b.ok());
+  EXPECT_EQ(meta_b.status().code(), absl::StatusCode::kNotFound);
+}
+
+TEST(TransactionManagerTest, MultiInstanceGetTransactionMetadata) {
+  MemoryStorage storage;
+
+  TransactionManager::Options opts;
+  opts.sleep_for = [](absl::Duration) {};
+
+  TransactionManager manager_a(&storage, opts);
+  TransactionManager manager_b(&storage, opts);
+
+  // On A: create a transaction with no parent.
+  auto txn_id_or = manager_a.CreateTransaction();
+  ASSERT_TRUE(txn_id_or.ok());
+  const std::string txn_id = *txn_id_or;
+
+  // On B: GetTransactionMetadata should succeed.
+  auto meta_b_or = manager_b.GetTransactionMetadata(txn_id);
+  ASSERT_TRUE(meta_b_or.ok());
+  EXPECT_EQ(meta_b_or->transaction_id, txn_id);
+  EXPECT_EQ(meta_b_or->depth, 0);
+}
+
+TEST(TransactionManagerTest, MultiInstanceNestedTransactionOnDifferentInstance) {
+  MemoryStorage storage;
+
+  TransactionManager::Options opts;
+  opts.sleep_for = [](absl::Duration) {};
+
+  TransactionManager manager_a(&storage, opts);
+  TransactionManager manager_b(&storage, opts);
+
+  // On A: create parent transaction.
+  auto parent_txn_id_or = manager_a.CreateTransaction();
+  ASSERT_TRUE(parent_txn_id_or.ok());
+  const std::string parent_txn_id = *parent_txn_id_or;
+
+  // On B: create child transaction with parent_transaction_id from A.
+  auto child_txn_id_or = manager_b.CreateTransaction(
+      /*parent_snapshot_id=*/std::nullopt,
+      /*parent_transaction_id=*/parent_txn_id);
+  ASSERT_TRUE(child_txn_id_or.ok());
+  const std::string child_txn_id = *child_txn_id_or;
+
+  // Write on child branch, commit child branch.
+  ASSERT_TRUE(storage.PutObject(child_txn_id, "nested/cross.txt", "nested-cross-data").ok());
+  ASSERT_TRUE(storage.Commit(child_txn_id, "child write from B").ok());
+
+  // On B: CommitTransaction(child_txn_id) should merge into parent.
+  auto child_commit_or = manager_b.CommitTransaction(child_txn_id);
+  ASSERT_TRUE(child_commit_or.ok());
+  ASSERT_TRUE(std::holds_alternative<TransactionManager::CommitSuccess>(*child_commit_or));
+
+  // Verify the child's data is on the parent branch.
+  auto parent_read_or = storage.GetObject(parent_txn_id, "nested/cross.txt");
+  ASSERT_TRUE(parent_read_or.ok());
+  EXPECT_EQ(*parent_read_or, "nested-cross-data");
+
+  // On A: CommitTransaction(parent_txn_id) should merge into canonical.
+  auto parent_commit_or = manager_a.CommitTransaction(parent_txn_id);
+  ASSERT_TRUE(parent_commit_or.ok());
+  ASSERT_TRUE(std::holds_alternative<TransactionManager::CommitSuccess>(*parent_commit_or));
+
+  // Verify the data is on canonical.
+  auto canonical_read_or = storage.GetObject(storage.GetCanonicalBranch(), "nested/cross.txt");
+  ASSERT_TRUE(canonical_read_or.ok());
+  EXPECT_EQ(*canonical_read_or, "nested-cross-data");
+}
+
+TEST(TransactionManagerTest, MultiInstanceGetSnapshotMetadata) {
+  MemoryStorage storage;
+
+  TransactionManager::Options opts;
+  opts.sleep_for = [](absl::Duration) {};
+
+  TransactionManager manager_a(&storage, opts);
+  TransactionManager manager_b(&storage, opts);
+
+  // On A: create a snapshot.
+  auto snapshot_id_or = manager_a.CreateSnapshot();
+  ASSERT_TRUE(snapshot_id_or.ok());
+  const std::string snapshot_id = *snapshot_id_or;
+
+  // On B: GetSnapshotMetadata should succeed.
+  auto meta_b_or = manager_b.GetSnapshotMetadata(snapshot_id);
+  ASSERT_TRUE(meta_b_or.ok());
+  EXPECT_EQ(meta_b_or->snapshot_id, snapshot_id);
+  // source_transaction_id may be empty cross-instance (best-effort cache).
+  // We do not assert on source_transaction_id.
+}
+
 } // namespace
 } // namespace artifact_system::testing
