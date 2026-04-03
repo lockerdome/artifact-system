@@ -55,6 +55,30 @@ absl::Status MakeNotFoundError(uint64_t artifact_id, bool tombstoned) {
   return status;
 }
 
+absl::Status MakeSnapshotTransactionNotFoundStatus(SnapshotTransactionError::Category category, const std::string& id) {
+  SnapshotTransactionError detail;
+  detail.set_category(category);
+  if (category == SnapshotTransactionError::SNAPSHOT_NOT_FOUND) {
+    detail.set_description(absl::StrCat("snapshot not found: ", id));
+  } else {
+    detail.set_description(absl::StrCat("transaction not found: ", id));
+  }
+  detail.set_id(id);
+
+  absl::Status status = absl::NotFoundError(detail.description());
+  std::string serialized;
+  detail.SerializeToString(&serialized);
+  status.SetPayload("type.googleapis.com/artifact_system.SnapshotTransactionError", absl::Cord(serialized));
+  return status;
+}
+
+absl::Status RewriteSnapshotTransactionNotFound(const absl::Status& status, SnapshotTransactionError::Category category, const std::string& id) {
+  if (absl::IsNotFound(status)) {
+    return MakeSnapshotTransactionNotFoundStatus(category, id);
+  }
+  return status;
+}
+
 // Aliases for shared index utilities used throughout this file.
 using index::AddIndexRow;
 using index::FindIndexDefinition;
@@ -131,18 +155,7 @@ absl::StatusOr<std::string> ArtifactStore::ResolveReadRef(const ReadContext& con
     // The snapshot_id IS the commit hash — validate it's known, then return directly.
     auto meta_or = transaction_manager_->GetSnapshotMetadata(context.snapshot_id());
     if (!meta_or.ok()) {
-      if (absl::IsNotFound(meta_or.status())) {
-        SnapshotTransactionError detail;
-        detail.set_category(SnapshotTransactionError::SNAPSHOT_NOT_FOUND);
-        detail.set_description(absl::StrCat("snapshot not found: ", context.snapshot_id()));
-        detail.set_id(context.snapshot_id());
-        absl::Status status = absl::NotFoundError(detail.description());
-        std::string serialized;
-        detail.SerializeToString(&serialized);
-        status.SetPayload("type.googleapis.com/artifact_system.SnapshotTransactionError", absl::Cord(serialized));
-        return status;
-      }
-      return meta_or.status();
+      return RewriteSnapshotTransactionNotFound(meta_or.status(), SnapshotTransactionError::SNAPSHOT_NOT_FOUND, context.snapshot_id());
     }
     return context.snapshot_id();
   }
@@ -150,18 +163,7 @@ absl::StatusOr<std::string> ArtifactStore::ResolveReadRef(const ReadContext& con
     // The transaction_id IS the branch name — validate it's known, then return directly.
     auto meta_or = transaction_manager_->GetTransactionMetadata(context.transaction_id());
     if (!meta_or.ok()) {
-      if (absl::IsNotFound(meta_or.status())) {
-        SnapshotTransactionError detail;
-        detail.set_category(SnapshotTransactionError::TRANSACTION_NOT_FOUND);
-        detail.set_description(absl::StrCat("transaction not found: ", context.transaction_id()));
-        detail.set_id(context.transaction_id());
-        absl::Status status = absl::NotFoundError(detail.description());
-        std::string serialized;
-        detail.SerializeToString(&serialized);
-        status.SetPayload("type.googleapis.com/artifact_system.SnapshotTransactionError", absl::Cord(serialized));
-        return status;
-      }
-      return meta_or.status();
+      return RewriteSnapshotTransactionNotFound(meta_or.status(), SnapshotTransactionError::TRANSACTION_NOT_FOUND, context.transaction_id());
     }
     return context.transaction_id();
   }
@@ -241,18 +243,7 @@ absl::StatusOr<std::string> ArtifactStore::ResolveWriteBranch(const std::optiona
     // The transaction_id IS the branch name — validate it's known, then return directly.
     auto meta_or = transaction_manager_->GetTransactionMetadata(*transaction_id);
     if (!meta_or.ok()) {
-      if (absl::IsNotFound(meta_or.status())) {
-        SnapshotTransactionError detail;
-        detail.set_category(SnapshotTransactionError::TRANSACTION_NOT_FOUND);
-        detail.set_description(absl::StrCat("transaction not found: ", *transaction_id));
-        detail.set_id(*transaction_id);
-        absl::Status status = absl::NotFoundError(detail.description());
-        std::string serialized;
-        detail.SerializeToString(&serialized);
-        status.SetPayload("type.googleapis.com/artifact_system.SnapshotTransactionError", absl::Cord(serialized));
-        return status;
-      }
-      return meta_or.status();
+      return RewriteSnapshotTransactionNotFound(meta_or.status(), SnapshotTransactionError::TRANSACTION_NOT_FOUND, *transaction_id);
     }
     return *transaction_id;
   }
@@ -262,13 +253,13 @@ absl::StatusOr<std::string> ArtifactStore::ResolveWriteBranch(const std::optiona
 absl::StatusOr<std::string> ArtifactStore::ExecuteWrite(const std::optional<std::string>& transaction_id, const WriteFn& write_fn) {
   if (transaction_id.has_value()) {
     // Explicit transaction: use WriteExecutor against the transaction branch.
-    // The transaction_id IS the branch name.
-    auto meta_or = transaction_manager_->GetTransactionMetadata(*transaction_id);
-    if (!meta_or.ok())
-      return meta_or.status();
+    auto branch_or = ResolveWriteBranch(transaction_id);
+    if (!branch_or.ok())
+      return branch_or.status();
+    const std::string& transaction_branch = *branch_or;
 
     transaction::WriteExecutor executor(storage_);
-    auto result_or = executor.ExecuteWrite(*transaction_id, [&write_fn](const std::string& child_branch) { return write_fn(child_branch); });
+    auto result_or = executor.ExecuteWrite(transaction_branch, [&write_fn](const std::string& child_branch) { return write_fn(child_branch); });
     if (!result_or.ok())
       return result_or.status();
 
@@ -279,7 +270,7 @@ absl::StatusOr<std::string> ArtifactStore::ExecuteWrite(const std::optional<std:
     }
 
     // Create a snapshot pointing to the transaction branch head.
-    auto snapshot_or = transaction_manager_->CreateSnapshot(*transaction_id);
+    auto snapshot_or = transaction_manager_->CreateSnapshot(transaction_branch);
     if (!snapshot_or.ok())
       return snapshot_or.status();
     return *snapshot_or;

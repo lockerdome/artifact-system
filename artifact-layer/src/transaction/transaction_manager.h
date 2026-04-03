@@ -116,6 +116,10 @@ private:
   // On cache miss, reads _txn_meta from the branch and populates cache.
   absl::StatusOr<TransactionRecord> ResolveTransaction(const std::string& transaction_id);
 
+  // Load transaction record directly from Storage Layer.
+  // Validates branch existence and reads _txn_meta for cross-instance use.
+  absl::StatusOr<TransactionRecord> LoadTransactionRecordFromStorage(const std::string& transaction_id) const;
+
   absl::Status RemoveTransactionLocked(const std::string& transaction_id);
   absl::StatusOr<CommitResult> CommitTransactionImpl(const std::string& transaction_id, bool write_commit_record);
 

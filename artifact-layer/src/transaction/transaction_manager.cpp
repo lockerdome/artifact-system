@@ -51,8 +51,27 @@ std::string TransactionManager::TxnMetaPath(const std::string& transaction_id) {
   return absl::StrCat("_txn_meta/", transaction_id);
 }
 
+absl::Status TransactionNotFoundStatus(const std::string& transaction_id) {
+  return absl::NotFoundError(absl::StrCat("transaction not found: ", transaction_id));
+}
+
+absl::Status ParentTransactionNotFoundStatus(const std::string& transaction_id) {
+  return absl::NotFoundError(absl::StrCat("parent transaction not found: ", transaction_id));
+}
+
+absl::Status SnapshotNotFoundStatus(const std::string& snapshot_id) {
+  return absl::NotFoundError(absl::StrCat("snapshot not found: ", snapshot_id));
+}
+
 absl::Status MissingTransactionMetadataStatus(const std::string& transaction_id) {
   return absl::FailedPreconditionError(absl::StrCat("transaction metadata missing for branch: ", transaction_id));
+}
+
+absl::Status RewriteNotFound(const absl::Status& status, const absl::Status& replacement) {
+  if (absl::IsNotFound(status)) {
+    return replacement;
+  }
+  return status;
 }
 
 absl::Status TransactionManager::WriteTxnMeta(const std::string& branch, const TransactionRecord& record) {
@@ -100,19 +119,10 @@ absl::Status TransactionManager::CleanupTxnMeta(const std::string& branch) {
   return absl::OkStatus();
 }
 
-absl::StatusOr<TransactionManager::TransactionRecord> TransactionManager::ResolveTransaction(const std::string& transaction_id) {
-  auto cache_it = transactions_.find(transaction_id);
-  if (cache_it != transactions_.end()) {
-    return cache_it->second;
-  }
-
-  // Cache miss: check if branch exists and load metadata.
+absl::StatusOr<TransactionManager::TransactionRecord> TransactionManager::LoadTransactionRecordFromStorage(const std::string& transaction_id) const {
   auto branch_head_or = storage_->GetBranchHead(transaction_id);
   if (!branch_head_or.ok()) {
-    if (absl::IsNotFound(branch_head_or.status())) {
-      return absl::NotFoundError(absl::StrCat("transaction not found: ", transaction_id));
-    }
-    return branch_head_or.status();
+    return RewriteNotFound(branch_head_or.status(), TransactionNotFoundStatus(transaction_id));
   }
 
   auto record_or = LoadTxnMeta(transaction_id);
@@ -120,6 +130,20 @@ absl::StatusOr<TransactionManager::TransactionRecord> TransactionManager::Resolv
     if (absl::IsNotFound(record_or.status())) {
       return MissingTransactionMetadataStatus(transaction_id);
     }
+    return record_or.status();
+  }
+
+  return *record_or;
+}
+
+absl::StatusOr<TransactionManager::TransactionRecord> TransactionManager::ResolveTransaction(const std::string& transaction_id) {
+  auto cache_it = transactions_.find(transaction_id);
+  if (cache_it != transactions_.end()) {
+    return cache_it->second;
+  }
+
+  auto record_or = LoadTransactionRecordFromStorage(transaction_id);
+  if (!record_or.ok()) {
     return record_or.status();
   }
 
@@ -148,7 +172,7 @@ absl::StatusOr<std::string> TransactionManager::CreateSnapshot(std::optional<std
         if (commit_exists_or.ok() && *commit_exists_or) {
           return absl::InvalidArgumentError(absl::StrCat("parent id references snapshot; expected transaction id: ", parent_id));
         }
-        return absl::NotFoundError(absl::StrCat("transaction not found: ", parent_id));
+        return TransactionNotFoundStatus(parent_id);
       }
       return branch_head_or.status();
     }
@@ -192,10 +216,7 @@ absl::StatusOr<std::string> TransactionManager::CreateTransaction(std::optional<
     // Validate parent transaction via Storage Layer.
     auto branch_head_or = storage_->GetBranchHead(parent_id);
     if (!branch_head_or.ok()) {
-      if (absl::IsNotFound(branch_head_or.status())) {
-        return absl::NotFoundError(absl::StrCat("parent transaction not found: ", parent_id));
-      }
-      return branch_head_or.status();
+      return RewriteNotFound(branch_head_or.status(), ParentTransactionNotFoundStatus(parent_id));
     }
 
     resolved_parent_transaction_id = parent_id;
@@ -215,7 +236,7 @@ absl::StatusOr<std::string> TransactionManager::CreateTransaction(std::optional<
     if (!commit_exists_or.ok())
       return commit_exists_or.status();
     if (!*commit_exists_or) {
-      return absl::NotFoundError(absl::StrCat("parent snapshot not found: ", parent_id));
+      return SnapshotNotFoundStatus(parent_id);
     }
 
     resolved_parent_snapshot_id = parent_id;
@@ -266,7 +287,7 @@ absl::StatusOr<std::string> TransactionManager::CreateTransaction(std::optional<
 absl::Status TransactionManager::RemoveTransactionLocked(const std::string& transaction_id) {
   auto transaction_it = transactions_.find(transaction_id);
   if (transaction_it == transactions_.end()) {
-    return absl::NotFoundError(absl::StrCat("transaction not found: ", transaction_id));
+    return TransactionNotFoundStatus(transaction_id);
   }
 
   if (transaction_it->second.parent_transaction_id.has_value()) {
@@ -308,10 +329,7 @@ absl::StatusOr<TransactionManager::CommitResult> TransactionManager::CommitTrans
     // Validate parent still exists.
     auto parent_head_or = storage_->GetBranchHead(*transaction.parent_transaction_id);
     if (!parent_head_or.ok()) {
-      if (absl::IsNotFound(parent_head_or.status())) {
-        return absl::NotFoundError(absl::StrCat("parent transaction not found: ", *transaction.parent_transaction_id));
-      }
-      return parent_head_or.status();
+      return RewriteNotFound(parent_head_or.status(), ParentTransactionNotFoundStatus(*transaction.parent_transaction_id));
     }
     target_branch = *transaction.parent_transaction_id;
   } else {
@@ -338,10 +356,7 @@ absl::StatusOr<TransactionManager::CommitResult> TransactionManager::CommitTrans
     // Re-validate transaction state after releasing and re-acquiring the lock.
     auto branch_head_or = storage_->GetBranchHead(transaction_id);
     if (!branch_head_or.ok()) {
-      if (absl::IsNotFound(branch_head_or.status())) {
-        return absl::NotFoundError(absl::StrCat("transaction not found: ", transaction_id));
-      }
-      return branch_head_or.status();
+      return RewriteNotFound(branch_head_or.status(), TransactionNotFoundStatus(transaction_id));
     }
   }
 
@@ -412,7 +427,7 @@ absl::StatusOr<TransactionManager::CommitResult> TransactionManager::CommitTrans
       }
       if (!*branch_exists_or) {
         restore_meta();
-        return absl::NotFoundError(absl::StrCat("transaction not found: ", transaction_id));
+        return TransactionNotFoundStatus(transaction_id);
       }
       // Re-check children from local cache (best-effort).
       auto cache_it = transactions_.find(transaction_id);
@@ -462,7 +477,7 @@ absl::Status TransactionManager::RollbackTransaction(const std::string& transact
   if (!branch_exists_or.ok())
     return branch_exists_or.status();
   if (!*branch_exists_or) {
-    return absl::NotFoundError(absl::StrCat("transaction not found: ", transaction_id));
+    return TransactionNotFoundStatus(transaction_id);
   }
 
   // Check for children in local cache (best-effort).
@@ -540,7 +555,7 @@ absl::StatusOr<TransactionManager::SnapshotMetadata> TransactionManager::GetSnap
   if (!commit_exists_or.ok())
     return commit_exists_or.status();
   if (!*commit_exists_or) {
-    return absl::NotFoundError(absl::StrCat("snapshot not found: ", snapshot_id));
+    return SnapshotNotFoundStatus(snapshot_id);
   }
 
   // source_transaction_id is informational, from local cache (best-effort).
@@ -570,20 +585,8 @@ absl::StatusOr<TransactionManager::TransactionMetadata> TransactionManager::GetT
     };
   }
 
-  // Cache miss: check if branch exists and load metadata.
-  auto branch_head_or = storage_->GetBranchHead(transaction_id);
-  if (!branch_head_or.ok()) {
-    if (absl::IsNotFound(branch_head_or.status())) {
-      return absl::NotFoundError(absl::StrCat("transaction not found: ", transaction_id));
-    }
-    return branch_head_or.status();
-  }
-
-  auto record_or = LoadTxnMeta(transaction_id);
+  auto record_or = LoadTransactionRecordFromStorage(transaction_id);
   if (!record_or.ok()) {
-    if (absl::IsNotFound(record_or.status())) {
-      return MissingTransactionMetadataStatus(transaction_id);
-    }
     return record_or.status();
   }
 

@@ -18,6 +18,13 @@
 #include "encoding/index_key_encoder.h"
 
 namespace artifact_system::index {
+namespace {
+
+absl::Status IndexDefinitionNotFoundStatus(const std::string& key_type) {
+  return absl::NotFoundError(absl::StrCat("index definition not found for key_type: ", key_type));
+}
+
+} // namespace
 
 std::optional<IndexDefinition> FindIndexDefinition(const google::protobuf::Descriptor& descriptor, const std::string& key_type) {
   const auto& options = descriptor.options();
@@ -59,7 +66,7 @@ absl::StatusOr<uint64_t> ResolveIndexDefinitionId(StorageInterface* storage, con
   auto index_data_or = storage->GetObject(ref, index_path);
   if (!index_data_or.ok()) {
     if (absl::IsNotFound(index_data_or.status())) {
-      return absl::NotFoundError(absl::StrCat("index definition not found for key_type: ", key_type));
+      return IndexDefinitionNotFoundStatus(key_type);
     }
     return index_data_or.status();
   }
@@ -69,7 +76,7 @@ absl::StatusOr<uint64_t> ResolveIndexDefinitionId(StorageInterface* storage, con
     return index_obj_or.status();
   }
   if (index_obj_or->rows.empty()) {
-    return absl::NotFoundError(absl::StrCat("index definition not found for key_type: ", key_type));
+    return IndexDefinitionNotFoundStatus(key_type);
   }
 
   return index_obj_or->rows.front().artifact_id;
