@@ -69,7 +69,8 @@ grpc::Status TypeRegistryServiceImpl::ListTypeVersions(grpc::ServerContext* /*co
 grpc::Status TypeRegistryServiceImpl::GetIndexSchema(grpc::ServerContext* /*context*/, const GetIndexSchemaRequest* request, GetIndexSchemaResponse* response) {
   auto result = registry_->GetIndexSchema(request->key_type(), request->read_context());
   if (!result.ok()) {
-    if (absl::IsNotFound(result.status())) {
+    if (absl::IsNotFound(result.status()) &&
+        !result.status().GetPayload("type.googleapis.com/artifact_system.SnapshotTransactionError").has_value()) {
       return AbslToGrpcStatus(
           MakeFetchIndexError(absl::StatusCode::kNotFound, result.status().message(), FetchIndexError::INDEX_NOT_FOUND, request->key_type()));
     }
