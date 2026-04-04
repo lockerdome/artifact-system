@@ -2,7 +2,8 @@
 
 A Node.js client library that wraps the four artifact-layer gRPC services behind a
 high-level, Firebase-style API. Transactions auto-commit on success and auto-rollback
-on failure. Snapshot and transaction IDs are surfaced where needed for consistent reads.
+on failure. Snapshot and transaction IDs are kept internal except where needed for
+server RPC composition.
 
 The implementation lives at `artifact-system/artifact-client-js/` and follows the same
 conventions as `id-allocator/id-allocator-client/` (pure JavaScript, `@grpc/grpc-js`,
@@ -33,10 +34,10 @@ const { GoogleAuth } = require('google-auth-library');
 
 // Production: SSL transport + Google Auth call credentials
 const auth = new GoogleAuth();
-const googleCredential = await auth.getClient();
+const google_credential = await auth.getClient();
 const channel_credentials = grpc.credentials.combineChannelCredentials(
   grpc.credentials.createSsl(),
-  grpc.credentials.createFromGoogleCredential(googleCredential),
+  grpc.credentials.createFromGoogleCredential(google_credential),
 );
 
 const client = new ArtifactClient({
@@ -62,18 +63,16 @@ the type introspection helpers. No reads, no writes.
 ```javascript
 const snapshot = await client.snapshot();
 
-const a1 = await snapshot.get(artifactId1);
+const a1 = await snapshot.get(artifact_id_1);
 // => { artifact_id, type_name, version_id, payload }
 
-const a2 = await snapshot.get(artifactId2); // guaranteed consistent with a1
+const a2 = await snapshot.get(artifact_id_2); // guaranteed consistent with a1
 
-const artifacts = await snapshot.batch_get([id1, id2, id3]);
+const artifacts = await snapshot.batch_get([id_1, id_2, id_3]);
 // => [{ artifact_id, ... }, null, { artifact_id, ... }]  (null = not found)
 
-const index = await snapshot.fetch_index(keyType, keyBytes);
+const index = await snapshot.fetch_index(key_type, key_bytes);
 // => { index_payload, index_message_name }
-
-snapshot.id // the opaque snapshot_id string (commit hash)
 ```
 
 Snapshots are long-lived and can be used freely after creation. They represent a frozen
@@ -87,12 +86,12 @@ inside the async callback passed to `client.transaction()`.
 ```javascript
 const result = await client.transaction(async (txn) => {
   // Reads within the transaction see snapshot isolation + own writes
-  const existing = await txn.get(artifactId);
+  const existing = await txn.get(artifact_id);
 
   // Write operations — only available on txn, not on snapshot or client
-  const created = await txn.create(versionId, payload);
-  await txn.update(artifactId, versionId, newPayload);
-  await txn.delete(artifactId);
+  const created = await txn.create(version_id, payload);
+  await txn.update(artifact_id, version_id, new_payload);
+  await txn.delete(artifact_id);
 
   // Snapshot from transaction state (for handing to other code that only needs reads)
   const snap = await txn.snapshot();
@@ -124,21 +123,29 @@ a method on it, the call throws `TransactionSettledError`. This is enforced by a
 on callback success and rolls back on failure, without affecting the parent. The
 sub-transaction's `txn` object follows the same settled-after-callback rule.
 
+```javascript
+await client.transaction(async (txn) => {
+  await txn.transaction(async (subtxn) => {
+    // Do something in subtxn
+  });
+});
+```
+
 ### Type registry
 
 Type registry methods live on the client because they are administrative operations
 that don't participate in the snapshot/transaction read model.
 
 ```javascript
-const { version_id } = await client.register_type(typeName, protoSource, {
+const { version_id } = await client.register_type(type_name, proto_source, {
   deny_create: false,
   deny_update: false,
   deny_delete: false,
 });
 
-const version  = await client.get_type_version(versionId);
-const versions = await client.list_type_versions(typeName);
-const schema   = await client.get_index_schema(keyType);
+const version  = await client.get_type_version(version_id);
+const versions = await client.list_type_versions(type_name);
+const schema   = await client.get_index_schema(key_type);
 ```
 
 ### Error classes
@@ -203,16 +210,16 @@ can inspect conflict types, violation categories, etc.
      detail), `grpc_error` (original).
 
 4. **`lib/snapshot.js`** — `Snapshot` class (primary read interface):
-   - Constructor: `new Snapshot(grpc_client, snapshot_id)`.
-   - Properties: `id` — the opaque snapshot_id string.
+    - Constructor: `new Snapshot(grpc_client, snapshot_id)`.
+    - Internal state: `_snapshot_id` only (no public `id` accessor).
    - Methods: `get(artifact_id)`, `batch_get(artifact_ids)`,
      `fetch_index(key_type, key)`.
    - All methods construct a `ReadContext { snapshot_id }` and delegate to grpc_client.
    - Long-lived — no settled state, can be used freely after creation.
 
 5. **`lib/transaction.js`** — `Transaction` class (reads + writes, scoped to callback):
-   - Constructor: `new Transaction(grpc_client, transaction_id)`.
-   - Properties: `id` — the opaque transaction_id string.
+    - Constructor: `new Transaction(grpc_client, transaction_id)`.
+    - Internal state: `_transaction_id` only (no public `id` accessor).
    - Internal: `_settled` flag, initially `false`.
    - **Settled guard**: every public method checks `_settled` first and throws
      `TransactionSettledError` if true. `_settle()` is called by the
@@ -221,11 +228,12 @@ can inspect conflict types, violation categories, etc.
      `fetch_index(key_type, key)` — scoped to `ReadContext { transaction_id }`.
    - Write methods: `create(version_id, payload)`, `update(artifact_id, version_id, payload)`,
      `delete(artifact_id)` — pass transaction_id to the write RPC.
-   - `snapshot()` — create a snapshot from the transaction's current state
-     (parent_transaction_id = this.id). Returns a `Snapshot` that remains usable
-     after the transaction settles.
-   - `transaction(callback)` — nested sub-transaction (parent_transaction_id = this.id).
-     Uses the same auto-commit/rollback/settle pattern as `client.transaction()`.
+    - `snapshot()` — create a snapshot from the transaction's current state
+      (parent_transaction_id = this._transaction_id). Returns a `Snapshot` that remains usable
+      after the transaction settles.
+    - `transaction(callback)` — nested sub-transaction
+      (parent_transaction_id = this._transaction_id).
+      Uses the same auto-commit/rollback/settle pattern as `client.transaction()`.
    - The `Transaction` class does **not** call commit/rollback itself — that is the
      responsibility of the `client.transaction()` wrapper.
 
@@ -264,7 +272,7 @@ can inspect conflict types, violation categories, etc.
    - `result.snapshot_id` available for read-after-write
    - Reads within transaction (get, batch_get, fetch_index)
    - Writes within transaction (create, update, delete)
-   - Nested transactions (txn.transaction)
+   - Nested transactions (`txn.transaction(async (subtxn) => { ... })`)
    - `ConflictError` on commit conflicts
    - Rollback failure handling (AggregateError)
    - **Settled enforcement**: calling any method after callback settles throws
@@ -275,7 +283,7 @@ can inspect conflict types, violation categories, etc.
     - Snapshot from canonical branch (`client.snapshot()`)
     - Snapshot from transaction (`txn.snapshot()` inside callback)
     - All read methods: get, batch_get, fetch_index
-    - `snapshot.id` is the opaque commit hash
+    - Snapshot does not expose `snapshot_id` via a public `id` field
     - Snapshot remains usable indefinitely after creation
     - `ArtifactNotFoundError` for missing artifacts
     - `IndexFetchError` for bad index queries
