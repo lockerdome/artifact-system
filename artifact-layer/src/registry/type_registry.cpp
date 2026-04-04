@@ -28,6 +28,7 @@
 #include "index/index_object.h"
 #include "index/index_schema_generator.h"
 #include "index/index_utils.h"
+#include "transaction/context_ref_resolver.h"
 
 namespace artifact_system::registry {
 namespace {
@@ -494,7 +495,8 @@ absl::StatusOr<std::vector<uint64_t>> TypeRegistry::ReadIndexArtifactIds(const s
 // ── RegisterTypeVersion ────────────────────────────────────────────────────
 
 absl::StatusOr<RegisterResult> TypeRegistry::RegisterTypeVersion(const std::string& type_name, const std::string& proto_source, std::optional<bool> deny_create,
-                                                                 std::optional<bool> deny_update, std::optional<bool> deny_delete) {
+                                                                 std::optional<bool> deny_update, std::optional<bool> deny_delete,
+                                                                 std::optional<std::string> transaction_id) {
   // Step 0: Compile .proto source.
   auto compile_result = compiler_.Compile(proto_source, type_name);
   if (std::holds_alternative<CompilationError>(compile_result)) {
@@ -515,8 +517,11 @@ absl::StatusOr<RegisterResult> TypeRegistry::RegisterTypeVersion(const std::stri
   // Collect all non-fatal violations.
   std::vector<TypeRegistrationViolation> violations;
 
-  // Read from canonical branch for all lookups.
-  const std::string ref = storage_->GetCanonicalBranch();
+  auto ref_or = transaction::ResolveWriteRef(storage_, transaction_manager_, transaction_id);
+  if (!ref_or.ok()) {
+    return ref_or.status();
+  }
+  const std::string ref = *ref_or;
 
   // Step 1: Look up TypeDefinition.
   auto td_or = LookupTypeDefinition(ref, type_name);
@@ -644,7 +649,7 @@ absl::StatusOr<RegisterResult> TypeRegistry::RegisterTypeVersion(const std::stri
   // All these artifacts get IDs allocated before we start.
   // We use an explicit transaction so all writes are atomic.
 
-  auto txn_or = transaction_manager_->CreateTransaction();
+  auto txn_or = transaction_manager_->CreateTransaction(std::nullopt, transaction_id);
   if (!txn_or.ok())
     return txn_or.status();
   const std::string& txn_id = *txn_or;
@@ -832,8 +837,12 @@ absl::StatusOr<RegisterResult> TypeRegistry::RegisterTypeVersion(const std::stri
 
 // ── Introspection APIs ─────────────────────────────────────────────────────
 
-absl::StatusOr<TypeVersionInfo> TypeRegistry::GetTypeVersion(uint64_t version_id) {
-  const std::string ref = storage_->GetCanonicalBranch();
+absl::StatusOr<TypeVersionInfo> TypeRegistry::GetTypeVersion(uint64_t version_id, const ReadContext& read_context) {
+  auto ref_or = transaction::ResolveReadRef(storage_, transaction_manager_, read_context);
+  if (!ref_or.ok()) {
+    return ref_or.status();
+  }
+  const std::string ref = *ref_or;
   auto tvd_or = ParseArtifactPayload<TypeVersionDefinition>(storage_, ref, version_id);
   if (!tvd_or.ok())
     return tvd_or.status();
@@ -850,8 +859,12 @@ absl::StatusOr<TypeVersionInfo> TypeRegistry::GetTypeVersion(uint64_t version_id
   return info;
 }
 
-absl::StatusOr<std::vector<uint64_t>> TypeRegistry::ListTypeVersions(const std::string& type_name) {
-  const std::string ref = storage_->GetCanonicalBranch();
+absl::StatusOr<std::vector<uint64_t>> TypeRegistry::ListTypeVersions(const std::string& type_name, const ReadContext& read_context) {
+  auto ref_or = transaction::ResolveReadRef(storage_, transaction_manager_, read_context);
+  if (!ref_or.ok()) {
+    return ref_or.status();
+  }
+  const std::string ref = *ref_or;
 
   auto td_or = LookupTypeDefinition(ref, type_name);
   if (!td_or.ok())
@@ -868,8 +881,12 @@ absl::StatusOr<std::vector<uint64_t>> TypeRegistry::ListTypeVersions(const std::
   return *ids_or;
 }
 
-absl::StatusOr<IndexSchemaInfo> TypeRegistry::GetIndexSchema(const std::string& key_type) {
-  const std::string ref = storage_->GetCanonicalBranch();
+absl::StatusOr<IndexSchemaInfo> TypeRegistry::GetIndexSchema(const std::string& key_type, const ReadContext& read_context) {
+  auto ref_or = transaction::ResolveReadRef(storage_, transaction_manager_, read_context);
+  if (!ref_or.ok()) {
+    return ref_or.status();
+  }
+  const std::string ref = *ref_or;
 
   auto idx_or = LookupIndexDefinition(ref, key_type);
   if (!idx_or.ok())

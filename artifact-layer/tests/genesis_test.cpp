@@ -405,7 +405,8 @@ message MyType {
   ASSERT_TRUE(result.ok()) << result.status();
   EXPECT_GT(result->version_id, 0);
 
-  auto versions = registry.ListTypeVersions("test.MyType");
+  ReadContext read_context;
+  auto versions = registry.ListTypeVersions("test.MyType", read_context);
   ASSERT_TRUE(versions.ok()) << versions.status();
   EXPECT_EQ(versions->size(), 1);
 }

@@ -14,10 +14,11 @@ grpc::Status TypeRegistryServiceImpl::RegisterTypeVersion(grpc::ServerContext* /
   std::optional<bool> deny_create = request->has_deny_create() ? std::optional(request->deny_create()) : std::nullopt;
   std::optional<bool> deny_update = request->has_deny_update() ? std::optional(request->deny_update()) : std::nullopt;
   std::optional<bool> deny_delete = request->has_deny_delete() ? std::optional(request->deny_delete()) : std::nullopt;
+  std::optional<std::string> transaction_id = request->has_transaction_id() ? std::optional(request->transaction_id()) : std::nullopt;
 
   absl::StatusOr<registry::RegisterResult> result;
   try {
-    result = registry_->RegisterTypeVersion(request->type_name(), request->proto_source(), deny_create, deny_update, deny_delete);
+    result = registry_->RegisterTypeVersion(request->type_name(), request->proto_source(), deny_create, deny_update, deny_delete, transaction_id);
   } catch (const std::runtime_error& e) {
     return grpc::Status(grpc::StatusCode::UNAVAILABLE, e.what());
   }
@@ -31,7 +32,7 @@ grpc::Status TypeRegistryServiceImpl::RegisterTypeVersion(grpc::ServerContext* /
 }
 
 grpc::Status TypeRegistryServiceImpl::GetTypeVersion(grpc::ServerContext* /*context*/, const GetTypeVersionRequest* request, GetTypeVersionResponse* response) {
-  auto result = registry_->GetTypeVersion(request->version_id());
+  auto result = registry_->GetTypeVersion(request->version_id(), request->read_context());
   if (!result.ok()) {
     return AbslToGrpcStatus(result.status());
   }
@@ -53,7 +54,7 @@ grpc::Status TypeRegistryServiceImpl::GetTypeVersion(grpc::ServerContext* /*cont
 
 grpc::Status TypeRegistryServiceImpl::ListTypeVersions(grpc::ServerContext* /*context*/, const ListTypeVersionsRequest* request,
                                                        ListTypeVersionsResponse* response) {
-  auto result = registry_->ListTypeVersions(request->type_name());
+  auto result = registry_->ListTypeVersions(request->type_name(), request->read_context());
   if (!result.ok()) {
     return AbslToGrpcStatus(result.status());
   }
@@ -66,7 +67,7 @@ grpc::Status TypeRegistryServiceImpl::ListTypeVersions(grpc::ServerContext* /*co
 }
 
 grpc::Status TypeRegistryServiceImpl::GetIndexSchema(grpc::ServerContext* /*context*/, const GetIndexSchemaRequest* request, GetIndexSchemaResponse* response) {
-  auto result = registry_->GetIndexSchema(request->key_type());
+  auto result = registry_->GetIndexSchema(request->key_type(), request->read_context());
   if (!result.ok()) {
     if (absl::IsNotFound(result.status())) {
       return AbslToGrpcStatus(
