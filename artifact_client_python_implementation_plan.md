@@ -1,9 +1,9 @@
 # Artifact Client Python — Implementation Plan
 
 A Python client library that wraps the four artifact-layer gRPC services behind the same
-high-level API as the JavaScript client. Transactions auto-commit on success and
-auto-rollback on exception. Snapshot and transaction IDs are kept internal except where
-needed for server RPC composition.
+high-level API as the JavaScript client. Transactions require an explicit commit call,
+and context-manager exit rolls back any uncommitted transaction. Snapshot and
+transaction IDs are kept internal except where needed for server RPC composition.
 
 The implementation lives at `artifact-system/artifact-client-python/` and uses
 `grpcio` + `grpcio-tools` for gRPC, `pytest` for testing. The API mirrors the JavaScript
@@ -90,7 +90,7 @@ snapshot = await client.snapshot()
 a1 = await snapshot.get(artifact_id_1)
 ```
 
-### Transactions (context-manager auto-commit / auto-rollback)
+### Transactions (explicit commit + context-manager rollback)
 
 `Transaction` extends the read interface with write methods. It is only accessible
 inside a `with` block (sync) or `async with` block (async).
@@ -108,10 +108,11 @@ with client.transaction() as txn:
     # Snapshot from transaction state
     snap = txn.snapshot()
 
-# If the block exits normally: auto-commit
-# txn.result => TransactionResult(snapshot_id, committed=True)
+    # Explicit commit is required
+    transaction_result = txn.commit()
 
-# If the block raises: auto-rollback, exception re-raised
+# If the block exits without txn.commit(): rollback
+# If the block raises before txn.commit(): rollback, exception re-raised
 ```
 
 ```python
@@ -119,17 +120,21 @@ with client.transaction() as txn:
 async with client.transaction() as txn:
     existing = await txn.get(artifact_id)
     created = await txn.create(version_id, payload)
-# auto-commits on clean exit, auto-rollbacks on exception
+    transaction_result = await txn.commit()
+# If commit is not called, context exit rolls back
 ```
 
 The context manager handles the full lifecycle:
 1. `__enter__` / `__aenter__`: `CreateTransaction` → transaction_id, construct
    `Transaction`.
-2. `__exit__` / `__aexit__`: if no exception → `CommitTransaction`, store
-   `snapshot_id` in `txn.result`. If exception → `RollbackTransaction`, re-raise.
-3. If rollback itself fails, raise `TransactionRollbackError` with both the original
+2. `txn.commit()` / `await txn.commit()`: `CommitTransaction`, return
+   `TransactionResult(snapshot_id)`, and set `txn.result`.
+3. `__exit__` / `__aexit__`: if transaction is not committed, call
+   `RollbackTransaction` (for both clean exit and exceptional exit). If the block
+   raised an exception, re-raise it after rollback.
+4. If rollback itself fails, raise `TransactionRollbackError` with both the original
    exception and the rollback exception chained via `__cause__`.
-4. **Mark the `Transaction` as settled** — all subsequent method calls raise
+5. **Mark the `Transaction` as settled** — all subsequent method calls raise
    `TransactionSettledError`.
 
 **`txn` is dead after the `with` block exits.** If a caller leaks the `txn` reference
@@ -137,16 +142,18 @@ and later calls a method on it, the call raises `TransactionSettledError`. Enfor
 a `_settled` flag checked at the top of every method.
 
 **Return values from transactions**: Unlike the JS client's callback which returns a
-value, Python's `with` statement doesn't have a return channel. Instead:
+value, Python's `with` statement doesn't have a return channel. Commit is explicit, so
+the commit call is the return channel:
 - Write methods return their results directly (`txn.create()` returns a
   `CreateResult(artifact_id, snapshot_id)`).
-- After a successful commit, `txn.result` contains a `TransactionResult(snapshot_id)`
-  for read-after-write.
+- `commit()` returns `TransactionResult(snapshot_id)` and also stores it in
+  `txn.result` for later inspection.
 - Callers collect values from write calls within the block as needed.
 
 **Nested transactions**: `txn.transaction()` returns a context manager for a
-sub-transaction (parent_transaction_id = current txn). The sub-transaction commits
-into the parent on clean exit and rolls back on exception. The sub-transaction's
+sub-transaction (parent_transaction_id = current txn). The sub-transaction follows the
+same explicit-commit rule: it commits into the parent only when `sub_txn.commit()` is
+called; otherwise it rolls back on context exit. The sub-transaction's
 `txn` object follows the same settled-after-exit rule.
 
 ```python
@@ -154,7 +161,9 @@ with client.transaction() as txn:
     created = txn.create(version_id, payload)
     with txn.transaction() as sub_txn:
         sub_txn.update(created.artifact_id, version_id, updated_payload)
+        sub_txn.commit()
     # sub-transaction committed into parent
+    txn.commit()
 # parent committed to canonical branch
 ```
 
@@ -185,6 +194,7 @@ with client.transaction() as txn:
     )
     # Read-only type registry calls are also valid on txn
     txn.get_type_version(result.version_id)
+    txn.commit()
 ```
 
 ### Error classes
@@ -199,7 +209,7 @@ details are parsed and attached as structured attributes.
 | `ConflictError` | `CommitConflict` detail (conflict_type, retryable, attempts) | CommitTransaction |
 | `TransactionError` | `SnapshotTransactionError` detail (category) | Create/Commit/RollbackTransaction, CreateSnapshot |
 | `TransactionSettledError` | (no gRPC detail — client-side guard) | Any method on a settled txn |
-| `TransactionRollbackError` | (wraps original + rollback exceptions) | Transaction context exit |
+| `TransactionRollbackError` | (wraps original + rollback exceptions) | Transaction context exit rollback path |
 | `IndexFetchError` | `FetchIndexError` detail (category) | FetchIndex |
 | `TypeRegistrationError` | `RegisterTypeVersionError` detail (violations list) | RegisterTypeVersion |
 
@@ -295,10 +305,12 @@ Each error class exposes the parsed detail message as a `.detail` attribute.
       `update(artifact_id: int, version_id: int, payload: bytes) -> WriteResult`,
       `delete(artifact_id: int) -> WriteResult`,
       `register_type(type_name: str, proto_source: str, deny_create: bool = False, deny_update: bool = False, deny_delete: bool = False) -> RegisterResult`.
-   - `snapshot() -> Snapshot` — create from transaction state. The returned `Snapshot`
-     outlives the transaction.
-   - `transaction() -> Transaction` — nested sub-transaction context manager.
-   - Does **not** call commit/rollback itself — the context manager protocol handles it.
+    - `commit() -> TransactionResult` (and `async commit() -> TransactionResult`)
+      performs `CommitTransaction`, stores `result`, and settles the transaction.
+    - `snapshot() -> Snapshot` — create from transaction state. The returned `Snapshot`
+      outlives the transaction.
+    - `transaction() -> Transaction` — nested sub-transaction context manager.
+    - Context-manager exit rolls back if the transaction has not been committed.
 
 8. **`artifact_client/_client.py`** — `ArtifactClient` + `AsyncArtifactClient`:
    - `__slots__ = ('_grpc_client', '_retry_options', '_channel_credentials')`
@@ -331,9 +343,10 @@ Each error class exposes the parsed detail message as a `.detail` attribute.
     - `close()` tears down cleanly
 
 12. **`tests/test_transaction.py`** — transaction lifecycle tests:
-    - Auto-commit on clean `with` block exit
-    - Auto-rollback on exception
-    - `txn.result.snapshot_id` available after commit
+    - Explicit commit required (`txn.commit()` / `await txn.commit()`)
+    - Clean `with` block exit without commit triggers rollback
+    - Exception before commit triggers rollback
+    - `txn.commit().snapshot_id` and `txn.result.snapshot_id` available after commit
     - Reads within transaction (get, batch_get, fetch_index)
     - Writes within transaction (create, update, delete)
     - Type registry in transaction (`register_type`) and readable registry methods
@@ -464,7 +477,7 @@ that import machinery works regardless of whether extensions are present.
 - [ ] `__init__.py` — public exports
 - [ ] `tests/mock_server.py` — in-process gRPC server for all 4 services
 - [ ] `tests/test_client.py` — snapshot factory; no read/write/registry methods on client
-- [ ] `tests/test_transaction.py` — auto-commit, auto-rollback, settled guard, nested, conflict, rollback error chaining
+- [ ] `tests/test_transaction.py` — explicit commit, rollback-on-exit, settled guard, nested, conflict, rollback error chaining
 - [ ] `tests/test_snapshot.py` — creation, scoped reads, from transaction, long-lived
 - [ ] `tests/test_errors.py` — all error detail types + TransactionSettledError + TransactionRollbackError
 - [ ] Sync and async interfaces both tested
