@@ -59,8 +59,9 @@ client = AsyncArtifactClient(
 )
 ```
 
-The client exposes four methods: `snapshot()`, `transaction()`, `register_type()`, and
-the type introspection helpers. No reads, no writes.
+The client exposes two factory methods: `snapshot()` and `transaction()`.
+Reads, writes, and type-registry operations are only available on scoped
+`Snapshot`/`Transaction` objects.
 
 ### Snapshots (consistent point-in-time reads)
 
@@ -159,14 +160,31 @@ with client.transaction() as txn:
 
 ### Type registry
 
-```python
-result = client.register_type(type_name, proto_source,
-    deny_create=False, deny_update=False, deny_delete=False)
-# => RegisterResult(version_id)
+Type registry operations are scoped like artifact CRUD:
+- `register_type(...)` is write-like and only available on `Transaction`.
+- Read-only type-registry methods are available on readable scopes (`Snapshot`
+  and `Transaction`): `get_type_version(...)`, `list_type_versions(...)`,
+  `get_index_schema(...)`.
 
-version  = client.get_type_version(version_id)
-versions = client.list_type_versions(type_name)
-schema   = client.get_index_schema(key_type)
+Type-registry RPCs accept transaction or snapshot context the same way CRUD/read
+RPCs do, based on whether the operation is write-like or read-only.
+
+```python
+snapshot = client.snapshot()
+version = snapshot.get_type_version(version_id)
+versions = snapshot.list_type_versions(type_name)
+schema = snapshot.get_index_schema(key_type)
+
+with client.transaction() as txn:
+    result = txn.register_type(
+        type_name,
+        proto_source,
+        deny_create=False,
+        deny_update=False,
+        deny_delete=False,
+    )
+    # Read-only type registry calls are also valid on txn
+    txn.get_type_version(result.version_id)
 ```
 
 ### Error classes
@@ -250,9 +268,12 @@ Each error class exposes the parsed detail message as a `.detail` attribute.
     - `__slots__ = ('_grpc_client', '_snapshot_id')`
     - Constructor: `Snapshot(grpc_client: GrpcClient, snapshot_id: str)`.
     - No public `id` property; `snapshot_id` is internal-only.
-   - Methods: `get(artifact_id: int) -> ArtifactRecord`,
-     `batch_get(artifact_ids: list[int]) -> list[ArtifactRecord | None]`,
-     `fetch_index(key_type: str, key: bytes) -> IndexResult`.
+    - Methods: `get(artifact_id: int) -> ArtifactRecord`,
+      `batch_get(artifact_ids: list[int]) -> list[ArtifactRecord | None]`,
+      `fetch_index(key_type: str, key: bytes) -> IndexResult`,
+      `get_type_version(version_id: int) -> TypeVersion`,
+      `list_type_versions(type_name: str) -> list[int]`,
+      `get_index_schema(key_type: str) -> IndexSchema`.
    - All methods construct a `ReadContext(snapshot_id=...)` and delegate to grpc_client.
    - Long-lived — no settled state.
    - `AsyncSnapshot` mirrors the interface with `async` methods.
@@ -263,13 +284,17 @@ Each error class exposes the parsed detail message as a `.detail` attribute.
    - `_settled: bool` flag, checked by every public method via an inline guard
      (not a decorator — Cython compiles the `if` check to a single branch).
    - `result: TransactionResult | None` — `None` until commit succeeds.
-   - Read methods: `get(artifact_id: int) -> ArtifactRecord`,
-     `batch_get(artifact_ids: list[int]) -> list[ArtifactRecord | None]`,
-     `fetch_index(key_type: str, key: bytes) -> IndexResult` — scoped to
-     `ReadContext(transaction_id=...)`.
-   - Write methods: `create(version_id: int, payload: bytes) -> CreateResult`,
-     `update(artifact_id: int, version_id: int, payload: bytes) -> WriteResult`,
-     `delete(artifact_id: int) -> WriteResult`.
+    - Read methods: `get(artifact_id: int) -> ArtifactRecord`,
+      `batch_get(artifact_ids: list[int]) -> list[ArtifactRecord | None]`,
+      `fetch_index(key_type: str, key: bytes) -> IndexResult`,
+      `get_type_version(version_id: int) -> TypeVersion`,
+      `list_type_versions(type_name: str) -> list[int]`,
+      `get_index_schema(key_type: str) -> IndexSchema` — scoped to
+      `ReadContext(transaction_id=...)`.
+    - Write methods: `create(version_id: int, payload: bytes) -> CreateResult`,
+      `update(artifact_id: int, version_id: int, payload: bytes) -> WriteResult`,
+      `delete(artifact_id: int) -> WriteResult`,
+      `register_type(type_name: str, proto_source: str, deny_create: bool = False, deny_update: bool = False, deny_delete: bool = False) -> RegisterResult`.
    - `snapshot() -> Snapshot` — create from transaction state. The returned `Snapshot`
      outlives the transaction.
    - `transaction() -> Transaction` — nested sub-transaction context manager.
@@ -280,16 +305,12 @@ Each error class exposes the parsed detail message as a `.detail` attribute.
    - Constructor validates options with explicit parameters (no `**kwargs`), creates
      gRPC channel and stubs.
    - `close() -> None` — tear down channel.
-   - **No read methods, no write methods.**
+    - **No read methods, no write methods, no type-registry methods.**
    - `snapshot() -> Snapshot` — create from canonical branch head.
    - `transaction(parent_snapshot_id: str | None = None) -> Transaction` — returns
      context manager. Options are explicit keyword arguments, not `**kwargs`.
-   - `register_type(type_name: str, proto_source: str, deny_create: bool = False, deny_update: bool = False, deny_delete: bool = False) -> RegisterResult`
-   - `get_type_version(version_id: int) -> TypeVersion`
-   - `list_type_versions(type_name: str) -> list[int]`
-   - `get_index_schema(key_type: str) -> IndexSchema`
-   - `AsyncArtifactClient` mirrors with async methods; `snapshot()` and
-     `transaction()` return async variants.
+    - `AsyncArtifactClient` mirrors with async methods; `snapshot()` and
+      `transaction()` return async variants.
 
 9. **`artifact_client/_retry.py`** — retry utility:
    - `retry_with_backoff(fn, max_retries, base_delay_s, max_delay_s)` — same algorithm
@@ -304,8 +325,9 @@ Each error class exposes the parsed detail message as a `.detail` attribute.
 
 11. **`tests/test_client.py`** — ArtifactClient tests:
     - `client.snapshot()` returns a working `Snapshot`
-    - Type registry operations
-    - Verify client has no `get`, `batch_get`, `create`, `update`, `delete` methods
+    - Verify client has no `get`, `batch_get`, `create`, `update`, `delete`,
+      `register_type`, `get_type_version`, `list_type_versions`, `get_index_schema`
+      methods
     - `close()` tears down cleanly
 
 12. **`tests/test_transaction.py`** — transaction lifecycle tests:
@@ -314,6 +336,8 @@ Each error class exposes the parsed detail message as a `.detail` attribute.
     - `txn.result.snapshot_id` available after commit
     - Reads within transaction (get, batch_get, fetch_index)
     - Writes within transaction (create, update, delete)
+    - Type registry in transaction (`register_type`) and readable registry methods
+      on `txn`
     - Nested transactions (`with txn.transaction() as sub_txn`)
     - `ConflictError` on commit conflicts
     - `TransactionRollbackError` when rollback fails (chained exceptions)
@@ -325,6 +349,8 @@ Each error class exposes the parsed detail message as a `.detail` attribute.
     - Snapshot from canonical branch
     - Snapshot from transaction
     - All read methods: get, batch_get, fetch_index
+    - Read-only type registry methods: get_type_version, list_type_versions,
+      get_index_schema
     - Snapshot does not expose `snapshot_id` via a public `id` field
     - Snapshot remains usable indefinitely
     - `ArtifactNotFoundError` for missing artifacts
@@ -434,10 +460,10 @@ that import machinery works regardless of whether extensions are present.
 - [ ] `_grpc_client.py` — proto stub wrappers, sync + async channels
 - [ ] `_snapshot.py` — Snapshot + AsyncSnapshot (primary read interface, long-lived)
 - [ ] `_transaction.py` — Transaction + AsyncTransaction (context managers, settled guard)
-- [ ] `_client.py` — ArtifactClient + AsyncArtifactClient (snapshot, transaction, registry only)
+- [ ] `_client.py` — ArtifactClient + AsyncArtifactClient (snapshot + transaction factories only)
 - [ ] `__init__.py` — public exports
 - [ ] `tests/mock_server.py` — in-process gRPC server for all 4 services
-- [ ] `tests/test_client.py` — snapshot factory, registry, no CRUD on client
+- [ ] `tests/test_client.py` — snapshot factory; no read/write/registry methods on client
 - [ ] `tests/test_transaction.py` — auto-commit, auto-rollback, settled guard, nested, conflict, rollback error chaining
 - [ ] `tests/test_snapshot.py` — creation, scoped reads, from transaction, long-lived
 - [ ] `tests/test_errors.py` — all error detail types + TransactionSettledError + TransactionRollbackError

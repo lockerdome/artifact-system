@@ -53,8 +53,9 @@ await client.initialize(); // connect gRPC channels
 client.close();            // tear down
 ```
 
-The client exposes four methods: `snapshot()`, `transaction()`, `register_type()`, and
-the type introspection helpers. No reads, no writes.
+The client exposes two factory methods: `snapshot()` and `transaction()`.
+Reads, writes, and type-registry operations are only available on scoped
+`Snapshot`/`Transaction` objects.
 
 ### Snapshots (consistent point-in-time reads)
 
@@ -133,19 +134,31 @@ await client.transaction(async (txn) => {
 
 ### Type registry
 
-Type registry methods live on the client because they are administrative operations
-that don't participate in the snapshot/transaction read model.
+Type registry operations are scoped like artifact CRUD:
+- `register_type(...)` is write-like and only available on `Transaction`.
+- Read-only type-registry methods are available on readable scopes (`Snapshot`
+  and `Transaction`): `get_type_version(...)`, `list_type_versions(...)`,
+  `get_index_schema(...)`.
+
+Type-registry RPCs accept transaction or snapshot context the same way CRUD/read
+RPCs do, based on whether the operation is write-like or read-only.
 
 ```javascript
-const { version_id } = await client.register_type(type_name, proto_source, {
-  deny_create: false,
-  deny_update: false,
-  deny_delete: false,
-});
+const snapshot = await client.snapshot();
+const version = await snapshot.get_type_version(version_id);
+const versions = await snapshot.list_type_versions(type_name);
+const schema = await snapshot.get_index_schema(key_type);
 
-const version  = await client.get_type_version(version_id);
-const versions = await client.list_type_versions(type_name);
-const schema   = await client.get_index_schema(key_type);
+await client.transaction(async (txn) => {
+  await txn.register_type(type_name, proto_source, {
+    deny_create: false,
+    deny_update: false,
+    deny_delete: false,
+  });
+
+  // Read-only type registry calls are also valid on txn
+  await txn.get_type_version(version_id);
+});
 ```
 
 ### Error classes
@@ -212,8 +225,9 @@ can inspect conflict types, violation categories, etc.
 4. **`lib/snapshot.js`** — `Snapshot` class (primary read interface):
     - Constructor: `new Snapshot(grpc_client, snapshot_id)`.
     - Internal state: `_snapshot_id` only (no public `id` accessor).
-   - Methods: `get(artifact_id)`, `batch_get(artifact_ids)`,
-     `fetch_index(key_type, key)`.
+    - Methods: `get(artifact_id)`, `batch_get(artifact_ids)`,
+      `fetch_index(key_type, key)`, `get_type_version(version_id)`,
+      `list_type_versions(type_name)`, `get_index_schema(key_type)`.
    - All methods construct a `ReadContext { snapshot_id }` and delegate to grpc_client.
    - Long-lived — no settled state, can be used freely after creation.
 
@@ -224,10 +238,13 @@ can inspect conflict types, violation categories, etc.
    - **Settled guard**: every public method checks `_settled` first and throws
      `TransactionSettledError` if true. `_settle()` is called by the
      `client.transaction()` wrapper after the callback resolves or rejects.
-   - Read methods: `get(artifact_id)`, `batch_get(artifact_ids)`,
-     `fetch_index(key_type, key)` — scoped to `ReadContext { transaction_id }`.
-   - Write methods: `create(version_id, payload)`, `update(artifact_id, version_id, payload)`,
-     `delete(artifact_id)` — pass transaction_id to the write RPC.
+    - Read methods: `get(artifact_id)`, `batch_get(artifact_ids)`,
+      `fetch_index(key_type, key)`, `get_type_version(version_id)`,
+      `list_type_versions(type_name)`, `get_index_schema(key_type)` — scoped to
+      `ReadContext { transaction_id }`.
+    - Write methods: `create(version_id, payload)`, `update(artifact_id, version_id, payload)`,
+      `delete(artifact_id)`, `register_type(type_name, proto_source, options)` —
+      pass transaction_id to the write RPC.
     - `snapshot()` — create a snapshot from the transaction's current state
       (parent_transaction_id = this._transaction_id). Returns a `Snapshot` that remains usable
       after the transaction settles.
@@ -240,8 +257,10 @@ can inspect conflict types, violation categories, etc.
 6. **`lib/client.js`** — `ArtifactClient` class:
    - Constructor validates options, creates `ArtifactGrpcClient`.
    - `initialize()` / `close()` — connection lifecycle.
-   - **No read methods** — reads go through `Snapshot` or `Transaction`.
-   - **No write methods** — writes go through `Transaction`.
+    - **No read methods** — reads go through `Snapshot` or `Transaction`.
+    - **No write methods** — writes go through `Transaction`.
+    - **No type-registry methods** — registry calls are scoped through
+      `Snapshot`/`Transaction`.
    - **Snapshot factory**: `snapshot()` — calls `CreateSnapshot` (canonical branch head),
      returns `Snapshot` instance.
    - **Transaction wrapper**: `transaction(callback, options?)`:
@@ -251,8 +270,6 @@ can inspect conflict types, violation categories, etc.
         `{ snapshot_id, value }`
      4. `catch (err)` → `RollbackTransaction` → re-throw
      5. `finally` → `txn._settle()` — mark txn as inert
-   - **Type registry**: `register_type()`, `get_type_version()`, `list_type_versions()`,
-     `get_index_schema()`.
 
 7. **`tests/mock_server.js`** — in-process gRPC test server:
    - Implements all 4 services with in-memory state.
@@ -260,10 +277,11 @@ can inspect conflict types, violation categories, etc.
    - Tracks call history for assertions.
 
 8. **`tests/client_test.js`** — ArtifactClient tests:
-   - `client.snapshot()` returns a working `Snapshot`
-   - Type registry operations (register, get_type_version, list, get_index_schema)
-   - Error handling (type registration errors, etc.)
-   - Verify client has no `get`, `batch_get`, `create`, `update`, `delete` methods
+    - `client.snapshot()` returns a working `Snapshot`
+    - Error handling (type registration errors, etc.)
+    - Verify client has no `get`, `batch_get`, `create`, `update`, `delete`,
+      `register_type`, `get_type_version`, `list_type_versions`, `get_index_schema`
+      methods
 
 9. **`tests/transaction_test.js`** — transaction lifecycle tests:
    - Auto-commit on callback success
@@ -271,7 +289,9 @@ can inspect conflict types, violation categories, etc.
    - Return value passthrough via `result.value`
    - `result.snapshot_id` available for read-after-write
    - Reads within transaction (get, batch_get, fetch_index)
-   - Writes within transaction (create, update, delete)
+    - Writes within transaction (create, update, delete)
+    - Type registry in transaction (`register_type`) and readable registry methods
+      on `txn`
    - Nested transactions (`txn.transaction(async (subtxn) => { ... })`)
    - `ConflictError` on commit conflicts
    - Rollback failure handling (AggregateError)
@@ -283,6 +303,8 @@ can inspect conflict types, violation categories, etc.
     - Snapshot from canonical branch (`client.snapshot()`)
     - Snapshot from transaction (`txn.snapshot()` inside callback)
     - All read methods: get, batch_get, fetch_index
+    - Read-only type registry methods: get_type_version, list_type_versions,
+      get_index_schema
     - Snapshot does not expose `snapshot_id` via a public `id` field
     - Snapshot remains usable indefinitely after creation
     - `ArtifactNotFoundError` for missing artifacts
@@ -309,10 +331,10 @@ clients handle uint64 and avoids silent precision loss.
 - [ ] `lib/grpc_client.js` — proto loading, 4 service stubs, promisified RPCs
 - [ ] `lib/snapshot.js` — Snapshot class (primary read interface, long-lived)
 - [ ] `lib/transaction.js` — Transaction class (reads + writes, settled guard after callback)
-- [ ] `lib/client.js` — ArtifactClient with snapshot(), transaction(), registry only (no CRUD)
+- [ ] `lib/client.js` — ArtifactClient with snapshot() + transaction() factories only
 - [ ] `lib/index.js` — public exports
 - [ ] `tests/mock_server.js` — in-process gRPC server for all 4 services
-- [ ] `tests/client_test.js` — snapshot factory, registry, no CRUD on client
+- [ ] `tests/client_test.js` — snapshot factory; no read/write/registry methods on client
 - [ ] `tests/transaction_test.js` — auto-commit, auto-rollback, settled guard, nested, conflict
 - [ ] `tests/snapshot_test.js` — creation, scoped reads, from transaction, long-lived
 - [ ] `tests/errors_test.js` — all error detail types + TransactionSettledError
