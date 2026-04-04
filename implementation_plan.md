@@ -37,7 +37,7 @@ otherwise noted.
 | P10 | ID Allocator Production Integration | :white_check_mark: Complete |
 | P11 | Transaction Commit Records | :white_check_mark: Complete |
 | P12 | Comprehensive Audit & Statelessness | :white_check_mark: Complete |
-| P13 | Type Registry Context-Aware APIs | :construction: In progress |
+| P13 | Type Registry Context-Aware APIs | :white_check_mark: Complete |
 
 **Status legend**: :white_large_square: Not started | :construction: In progress | :white_check_mark: Complete
 
@@ -1039,16 +1039,16 @@ explicit transaction branch and read endpoints can resolve data using `ReadConte
    - Invalid snapshot/transaction IDs return expected `SnapshotTransactionError` mapping
 
 ### Checklist
-- [ ] `RegisterTypeVersionRequest` includes optional `transaction_id`
-- [ ] `GetTypeVersionRequest` includes `ReadContext`
-- [ ] `ListTypeVersionsRequest` includes `ReadContext`
-- [ ] `GetIndexSchemaRequest` includes `ReadContext`
-- [ ] `TypeRegistry::RegisterTypeVersion` supports optional transaction-scoped writes
-- [ ] `TypeRegistry` read APIs support `ReadContext`
-- [ ] TypeRegistry service implementation forwards context fields end-to-end
-- [ ] Unit tests cover transaction-scoped writes and context-scoped reads
-- [ ] Service/integration tests verify gRPC behavior and error mapping
-- [ ] Mark phase complete
+- [x] `RegisterTypeVersionRequest` includes optional `transaction_id`
+- [x] `GetTypeVersionRequest` includes `ReadContext`
+- [x] `ListTypeVersionsRequest` includes `ReadContext`
+- [x] `GetIndexSchemaRequest` includes `ReadContext`
+- [x] `TypeRegistry::RegisterTypeVersion` supports optional transaction-scoped writes
+- [x] `TypeRegistry` read APIs support `ReadContext`
+- [x] TypeRegistry service implementation forwards context fields end-to-end
+- [x] Unit tests cover transaction-scoped writes and context-scoped reads
+- [x] Service/integration tests verify gRPC behavior and error mapping
+- [x] Mark phase complete
 
 ---
 
