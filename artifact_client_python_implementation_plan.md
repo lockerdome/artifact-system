@@ -2,8 +2,8 @@
 
 A Python client library that wraps the four artifact-layer gRPC services behind the same
 high-level API as the JavaScript client. Transactions auto-commit on success and
-auto-rollback on exception. Snapshot and transaction IDs are surfaced where needed for
-consistent reads.
+auto-rollback on exception. Snapshot and transaction IDs are kept internal except where
+needed for server RPC composition.
 
 The implementation lives at `artifact-system/artifact-client-python/` and uses
 `grpcio` + `grpcio-tools` for gRPC, `pytest` for testing. The API mirrors the JavaScript
@@ -79,8 +79,6 @@ artifacts = snapshot.batch_get([id1, id2, id3])
 
 index = snapshot.fetch_index(key_type, key_bytes)
 # => IndexResult(index_payload, index_message_name)
-
-snapshot.id  # the opaque snapshot_id string (commit hash)
 ```
 
 Snapshots are long-lived and can be used freely after creation.
@@ -249,9 +247,9 @@ Each error class exposes the parsed detail message as a `.detail` attribute.
    - uint64 values are Python `int` (arbitrary precision, no loss).
 
 6. **`artifact_client/_snapshot.py`** — `Snapshot` + `AsyncSnapshot`:
-   - `__slots__ = ('_grpc_client', '_snapshot_id')`
-   - Constructor: `Snapshot(grpc_client: GrpcClient, snapshot_id: str)`.
-   - Properties: `id -> str` — the opaque snapshot_id string.
+    - `__slots__ = ('_grpc_client', '_snapshot_id')`
+    - Constructor: `Snapshot(grpc_client: GrpcClient, snapshot_id: str)`.
+    - No public `id` property; `snapshot_id` is internal-only.
    - Methods: `get(artifact_id: int) -> ArtifactRecord`,
      `batch_get(artifact_ids: list[int]) -> list[ArtifactRecord | None]`,
      `fetch_index(key_type: str, key: bytes) -> IndexResult`.
@@ -327,7 +325,7 @@ Each error class exposes the parsed detail message as a `.detail` attribute.
     - Snapshot from canonical branch
     - Snapshot from transaction
     - All read methods: get, batch_get, fetch_index
-    - `snapshot.id` is the opaque commit hash
+    - Snapshot does not expose `snapshot_id` via a public `id` field
     - Snapshot remains usable indefinitely
     - `ArtifactNotFoundError` for missing artifacts
     - `IndexFetchError` for bad index queries
