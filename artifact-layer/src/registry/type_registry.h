@@ -70,16 +70,16 @@ public:
   // RegisterTypeVersionError payload containing all violations.
   absl::StatusOr<RegisterResult> RegisterTypeVersion(const std::string& type_name, const std::string& proto_source,
                                                      std::optional<bool> deny_create = std::nullopt, std::optional<bool> deny_update = std::nullopt,
-                                                     std::optional<bool> deny_delete = std::nullopt);
+                                                     std::optional<bool> deny_delete = std::nullopt, std::optional<std::string> transaction_id = std::nullopt);
 
   // GetTypeVersion: return details about a specific TypeVersionDefinition.
-  absl::StatusOr<TypeVersionInfo> GetTypeVersion(uint64_t version_id);
+  absl::StatusOr<TypeVersionInfo> GetTypeVersion(uint64_t version_id, const ReadContext& read_context);
 
   // ListTypeVersions: return version IDs for a type in creation order.
-  absl::StatusOr<std::vector<uint64_t>> ListTypeVersions(const std::string& type_name);
+  absl::StatusOr<std::vector<uint64_t>> ListTypeVersions(const std::string& type_name, const ReadContext& read_context);
 
   // GetIndexSchema: return index definition and generated proto schema.
-  absl::StatusOr<IndexSchemaInfo> GetIndexSchema(const std::string& key_type);
+  absl::StatusOr<IndexSchemaInfo> GetIndexSchema(const std::string& key_type, const ReadContext& read_context);
 
   // Read-only access to the current index_def_ids_by_key_type map.
   const std::unordered_map<std::string, uint64_t>& index_def_ids_by_key_type() const {

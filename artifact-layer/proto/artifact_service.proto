@@ -302,6 +302,7 @@ message RegisterTypeVersionRequest {
   optional bool deny_create = 3;     // tighten-only; omit to preserve existing value
   optional bool deny_update = 4;     // tighten-only; omit to preserve existing value
   optional bool deny_delete = 5;     // tighten-only; omit to preserve existing value
+  optional string transaction_id = 6; // optional explicit transaction branch
 }
 
 message RegisterTypeVersionResponse {
@@ -310,6 +311,7 @@ message RegisterTypeVersionResponse {
 
 message GetTypeVersionRequest {
   uint64 version_id = 1;             // TypeVersionDefinition artifact_id
+  ReadContext read_context = 2;
 }
 
 message GetTypeVersionResponse {
@@ -323,6 +325,7 @@ message GetTypeVersionResponse {
 
 message ListTypeVersionsRequest {
   string type_name = 1;              // fully-qualified proto message name
+  ReadContext read_context = 2;
 }
 
 message ListTypeVersionsResponse {
@@ -333,6 +336,7 @@ message ListTypeVersionsResponse {
 
 message GetIndexSchemaRequest {
   string key_type = 1;               // identifies which index definition to query
+  ReadContext read_context = 2;
 }
 
 message GetIndexSchemaResponse {

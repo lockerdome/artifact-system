@@ -37,6 +37,7 @@ otherwise noted.
 | P10 | ID Allocator Production Integration | :white_check_mark: Complete |
 | P11 | Transaction Commit Records | :white_check_mark: Complete |
 | P12 | Comprehensive Audit & Statelessness | :white_check_mark: Complete |
+| P13 | Type Registry Context-Aware APIs | :white_check_mark: Complete |
 
 **Status legend**: :white_large_square: Not started | :construction: In progress | :white_check_mark: Complete
 
@@ -1003,6 +1004,54 @@ Systematically verify each PRD requirement against the implementation:
 
 ---
 
+## Phase 13 — Type Registry Context-Aware APIs
+
+**Goal**: Update Type Registry APIs and orchestration so writable endpoints can run against an
+explicit transaction branch and read endpoints can resolve data using `ReadContext`
+(snapshot/transaction/canonical).
+
+### Deliverables
+
+1. **Proto updates** (`proto/artifact_service.proto`):
+   - Add `optional string transaction_id` to `RegisterTypeVersionRequest`
+   - Add `ReadContext read_context` to `GetTypeVersionRequest`
+   - Add `ReadContext read_context` to `ListTypeVersionsRequest`
+   - Add `ReadContext read_context` to `GetIndexSchemaRequest`
+   - No backward-compatibility requirement: update all call sites/tests to use the new request fields explicitly
+
+2. **TypeRegistry interface and implementation** (`src/registry/type_registry.h/.cpp`):
+   - `RegisterTypeVersion(...)` accepts optional transaction_id and executes all internal
+     writes on the resolved write branch instead of always canonical
+   - `GetTypeVersion(version_id, read_context)` resolves reads via snapshot/transaction/canonical
+   - `ListTypeVersions(type_name, read_context)` resolves reads via snapshot/transaction/canonical
+   - `GetIndexSchema(key_type, read_context)` resolves reads via snapshot/transaction/canonical
+   - Reuse existing branch resolution logic from ArtifactStore/transaction helpers where possible
+
+3. **Service layer wiring** (`src/service/type_registry_service_impl.h/.cpp`):
+   - Forward request `transaction_id` for `RegisterTypeVersion`
+   - Forward request `read_context` for `GetTypeVersion`, `ListTypeVersions`, `GetIndexSchema`
+   - Keep error mapping behavior consistent with existing registry/service contracts
+
+4. **Tests** (`tests/type_registry_test.cpp`, `tests/service_integration_test.cpp`):
+   - RegisterTypeVersion inside explicit transaction, verify visibility before and after commit
+   - Read APIs with snapshot context, transaction context, and canonical default
+   - Read-your-writes behavior for uncommitted registry changes in a transaction
+   - Invalid snapshot/transaction IDs return expected `SnapshotTransactionError` mapping
+
+### Checklist
+- [x] `RegisterTypeVersionRequest` includes optional `transaction_id`
+- [x] `GetTypeVersionRequest` includes `ReadContext`
+- [x] `ListTypeVersionsRequest` includes `ReadContext`
+- [x] `GetIndexSchemaRequest` includes `ReadContext`
+- [x] `TypeRegistry::RegisterTypeVersion` supports optional transaction-scoped writes
+- [x] `TypeRegistry` read APIs support `ReadContext`
+- [x] TypeRegistry service implementation forwards context fields end-to-end
+- [x] Unit tests cover transaction-scoped writes and context-scoped reads
+- [x] Service/integration tests verify gRPC behavior and error mapping
+- [x] Mark phase complete
+
+---
+
 ## Dependency Graph
 
 ```
@@ -1036,6 +1085,8 @@ P1 (Protos + StoredArtifact envelope)
  |                                 P11 (Transaction Commit Records)
  |                                      |
  |                                 P12 (Comprehensive Audit & Statelessness)
+ |                                      |
+ |                                 P13 (Type Registry Context-Aware APIs)
 ```
 
 ### Explicit dependencies per phase
@@ -1057,6 +1108,7 @@ P1 (Protos + StoredArtifact envelope)
 | P10 | P6 |
 | P11 | P8 + P5 (genesis for built-in type bootstrapping, transaction manager for CommitTransaction) |
 | P12 | P11 (all prior phases — full codebase audit) |
+| P13 | P12 + P9 (extends TypeRegistry APIs and gRPC surface) |
 
 ### Parallel tracks after P1
 

@@ -349,6 +349,7 @@ TEST(ProtoCompilationTest, RegisterTypeVersionMessages) {
   req.set_type_name("MyType");
   req.set_proto_source("syntax = \"proto3\";\nmessage MyType {}");
   req.set_deny_create(true);
+  req.set_transaction_id("txn-1");
   EXPECT_TRUE(req.has_deny_create());
   EXPECT_FALSE(req.has_deny_update());
   EXPECT_FALSE(req.has_deny_delete());
@@ -360,6 +361,7 @@ TEST(ProtoCompilationTest, RegisterTypeVersionMessages) {
 TEST(ProtoCompilationTest, GetTypeVersionMessages) {
   GetTypeVersionRequest req;
   req.set_version_id(1);
+  req.mutable_read_context()->set_snapshot_id("snapshot-1");
 
   GetTypeVersionResponse resp;
   resp.set_version_id(1);
@@ -374,6 +376,7 @@ TEST(ProtoCompilationTest, GetTypeVersionMessages) {
 TEST(ProtoCompilationTest, ListTypeVersionsMessages) {
   ListTypeVersionsRequest req;
   req.set_type_name("MyType");
+  req.mutable_read_context()->set_transaction_id("txn-2");
 
   ListTypeVersionsResponse resp;
   resp.add_version_ids(1);
@@ -384,6 +387,7 @@ TEST(ProtoCompilationTest, ListTypeVersionsMessages) {
 TEST(ProtoCompilationTest, GetIndexSchemaMessages) {
   GetIndexSchemaRequest req;
   req.set_key_type("by_owner");
+  req.mutable_read_context()->set_snapshot_id("snapshot-2");
 
   GetIndexSchemaResponse resp;
   resp.set_index_definition_id(10);

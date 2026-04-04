@@ -25,6 +25,7 @@
 #include "index/index_object.h"
 #include "index/index_schema_generator.h"
 #include "index/index_utils.h"
+#include "transaction/context_ref_resolver.h"
 
 namespace artifact_system::artifact {
 namespace {
@@ -52,30 +53,6 @@ absl::Status MakeNotFoundError(uint64_t artifact_id, bool tombstoned) {
   std::string serialized;
   error.SerializeToString(&serialized);
   status.SetPayload("type.googleapis.com/artifact_system.ArtifactNotFoundError", absl::Cord(serialized));
-  return status;
-}
-
-absl::Status MakeSnapshotTransactionNotFoundStatus(SnapshotTransactionError::Category category, const std::string& id) {
-  SnapshotTransactionError detail;
-  detail.set_category(category);
-  if (category == SnapshotTransactionError::SNAPSHOT_NOT_FOUND) {
-    detail.set_description(absl::StrCat("snapshot not found: ", id));
-  } else {
-    detail.set_description(absl::StrCat("transaction not found: ", id));
-  }
-  detail.set_id(id);
-
-  absl::Status status = absl::NotFoundError(detail.description());
-  std::string serialized;
-  detail.SerializeToString(&serialized);
-  status.SetPayload("type.googleapis.com/artifact_system.SnapshotTransactionError", absl::Cord(serialized));
-  return status;
-}
-
-absl::Status RewriteSnapshotTransactionNotFound(const absl::Status& status, SnapshotTransactionError::Category category, const std::string& id) {
-  if (absl::IsNotFound(status)) {
-    return MakeSnapshotTransactionNotFoundStatus(category, id);
-  }
   return status;
 }
 
@@ -151,24 +128,7 @@ absl::Status ArtifactStore::ResolveMissingIndexDefIds(std::vector<index::Derived
 // ── Read operations ────────────��────────────────────────────────────────────
 
 absl::StatusOr<std::string> ArtifactStore::ResolveReadRef(const ReadContext& context) {
-  if (context.has_snapshot_id()) {
-    // The snapshot_id IS the commit hash — validate it's known, then return directly.
-    auto meta_or = transaction_manager_->GetSnapshotMetadata(context.snapshot_id());
-    if (!meta_or.ok()) {
-      return RewriteSnapshotTransactionNotFound(meta_or.status(), SnapshotTransactionError::SNAPSHOT_NOT_FOUND, context.snapshot_id());
-    }
-    return context.snapshot_id();
-  }
-  if (context.has_transaction_id()) {
-    // The transaction_id IS the branch name — validate it's known, then return directly.
-    auto meta_or = transaction_manager_->GetTransactionMetadata(context.transaction_id());
-    if (!meta_or.ok()) {
-      return RewriteSnapshotTransactionNotFound(meta_or.status(), SnapshotTransactionError::TRANSACTION_NOT_FOUND, context.transaction_id());
-    }
-    return context.transaction_id();
-  }
-  // No context: read from canonical branch head.
-  return std::string(storage_->GetCanonicalBranch());
+  return transaction::ResolveReadRef(storage_, transaction_manager_, context);
 }
 
 absl::StatusOr<GetResult> ArtifactStore::GetArtifact(uint64_t artifact_id, const ReadContext& context) {
@@ -239,15 +199,7 @@ absl::StatusOr<std::vector<BatchGetEntry>> ArtifactStore::BatchGetArtifacts(cons
 // ── Write infrastructure ────────────────────────────────────────────────────
 
 absl::StatusOr<std::string> ArtifactStore::ResolveWriteBranch(const std::optional<std::string>& transaction_id) {
-  if (transaction_id.has_value()) {
-    // The transaction_id IS the branch name — validate it's known, then return directly.
-    auto meta_or = transaction_manager_->GetTransactionMetadata(*transaction_id);
-    if (!meta_or.ok()) {
-      return RewriteSnapshotTransactionNotFound(meta_or.status(), SnapshotTransactionError::TRANSACTION_NOT_FOUND, *transaction_id);
-    }
-    return *transaction_id;
-  }
-  return std::string(storage_->GetCanonicalBranch());
+  return transaction::ResolveWriteRef(storage_, transaction_manager_, transaction_id);
 }
 
 absl::StatusOr<std::string> ArtifactStore::ExecuteWrite(const std::optional<std::string>& transaction_id, const WriteFn& write_fn) {
