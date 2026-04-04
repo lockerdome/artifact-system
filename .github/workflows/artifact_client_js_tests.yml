@@ -1,0 +1,22 @@
+name: Artifact Client JS Tests
+on:
+  pull_request:
+    paths:
+      - 'artifact-system/artifact-client-js/**'
+      - 'artifact-system/artifact-layer/proto/**'
+      - '.github/workflows/artifact_client_js_tests.yml'
+
+jobs:
+  run-artifact-client-js-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Install node modules
+        working-directory: artifact-system/artifact-client-js
+        run: npm install
+      - name: Run tests
+        working-directory: artifact-system/artifact-client-js
+        run: npm test
