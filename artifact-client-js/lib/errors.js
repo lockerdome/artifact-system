@@ -1,5 +1,7 @@
 "use strict";
 
+const fs = require('fs');
+const path = require('path');
 const protobuf = require('protobufjs');
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -31,98 +33,15 @@ class TransactionSettledError extends Error {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Error detail protobuf types (defined programmatically to avoid loading
-// artifact_options.proto which uses syntax protobufjs cannot parse)
+// Error detail protobuf types — loaded from pre-compiled FileDescriptorSet
 // ─────────────────────────────────────────────────────────────────────────────
 
-const _error_proto_json = {
-  nested: {
-    artifact_system: {
-      nested: {
-        ArtifactNotFoundError: {
-          fields: {
-            artifact_id: { type: 'uint64', id: 1 },
-            tombstoned: { type: 'bool', id: 2 },
-          },
-        },
-        ArtifactWriteError: {
-          fields: {
-            violations: { rule: 'repeated', type: 'ArtifactWriteViolation', id: 1 },
-          },
-        },
-        ArtifactWriteViolation: {
-          fields: {
-            category: { type: 'string', id: 1 },
-            description: { type: 'string', id: 2 },
-            subject: { type: 'string', id: 3 },
-          },
-        },
-        CommitConflict: {
-          fields: {
-            conflict_type: { type: 'string', id: 1 },
-            retryable: { type: 'bool', id: 2 },
-            attempts: { type: 'uint32', id: 3 },
-            payload_detail: { type: 'PayloadConflictDetail', id: 4 },
-            index_detail: { type: 'IndexConflictDetail', id: 5 },
-            referential_integrity_detail: { type: 'ReferentialIntegrityConflictDetail', id: 6 },
-            base_commit_id: { type: 'string', id: 7 },
-            ours_commit_id: { type: 'string', id: 8 },
-            theirs_commit_id: { type: 'string', id: 9 },
-          },
-          oneofs: {
-            detail: { oneof: ['payload_detail', 'index_detail', 'referential_integrity_detail'] },
-          },
-        },
-        PayloadConflictDetail: {
-          fields: {
-            artifact_id: { type: 'uint64', id: 1 },
-          },
-        },
-        IndexConflictDetail: {
-          fields: {
-            key_type: { type: 'string', id: 1 },
-            encoded_key: { type: 'bytes', id: 2 },
-          },
-        },
-        ReferentialIntegrityConflictDetail: {
-          fields: {
-            target_artifact_id: { type: 'uint64', id: 1 },
-            reference_key_type: { type: 'string', id: 2 },
-            referencing_artifact_ids: { rule: 'repeated', type: 'uint64', id: 3 },
-          },
-        },
-        SnapshotTransactionError: {
-          fields: {
-            category: { type: 'string', id: 1 },
-            description: { type: 'string', id: 2 },
-            id: { type: 'string', id: 3 },
-          },
-        },
-        FetchIndexError: {
-          fields: {
-            category: { type: 'string', id: 1 },
-            description: { type: 'string', id: 2 },
-            key_type: { type: 'string', id: 3 },
-          },
-        },
-        RegisterTypeVersionError: {
-          fields: {
-            violations: { rule: 'repeated', type: 'TypeRegistrationViolation', id: 1 },
-          },
-        },
-        TypeRegistrationViolation: {
-          fields: {
-            category: { type: 'string', id: 1 },
-            description: { type: 'string', id: 2 },
-            subject: { type: 'string', id: 3 },
-          },
-        },
-      },
-    },
-  },
-};
+const DESCRIPTOR_PATH = path.resolve(__dirname, '../proto/artifact_service.desc');
+const descriptor = require('protobufjs/ext/descriptor');
 
-const _error_root = protobuf.Root.fromJSON(_error_proto_json);
+const _descriptor_bytes = fs.readFileSync(DESCRIPTOR_PATH);
+const _decoded_descriptor = descriptor.FileDescriptorSet.decode(_descriptor_bytes);
+const _error_root = protobuf.Root.fromDescriptor(_decoded_descriptor);
 
 // Maps type_url suffix → { MessageType, ErrorClass }
 const DETAIL_TYPE_MAP = {
