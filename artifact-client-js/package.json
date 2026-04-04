@@ -1,0 +1,19 @@
+{
+  "name": "artifact-client-js",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Node.js client library for the Artifact Layer gRPC services",
+  "main": "lib/index.js",
+  "scripts": {
+    "test": "node --test tests/*.js",
+    "generate-proto": "grpc_tools_node_protoc --include_imports --descriptor_set_out=proto/artifact_service.desc -I ../artifact-layer/proto ../artifact-layer/proto/artifact_service.proto"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.12.6",
+    "@grpc/proto-loader": "^0.7.13",
+    "google-auth-library": "^8.8.0"
+  },
+  "devDependencies": {
+    "grpc-tools": "^1.13.1"
+  }
+}
