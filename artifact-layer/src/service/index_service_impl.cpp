@@ -12,6 +12,7 @@
 #include "encoding/artifact_path.h"
 #include "encoding/index_key_encoder.h"
 #include "service/grpc_error_util.h"
+#include "transaction/context_ref_resolver.h"
 
 namespace artifact_system::service {
 
@@ -19,28 +20,10 @@ IndexServiceImpl::IndexServiceImpl(StorageInterface* storage, transaction::Trans
     : storage_(storage), txn_manager_(txn_manager), registry_(registry) {
 }
 
-absl::StatusOr<std::string> IndexServiceImpl::ResolveReadRef(const ReadContext& read_context) {
-  if (read_context.has_snapshot_id()) {
-    auto meta = txn_manager_->GetSnapshotMetadata(read_context.snapshot_id());
-    if (!meta.ok()) {
-      return MakeSnapshotTxnError(meta.status().message(), SnapshotTransactionError::SNAPSHOT_NOT_FOUND, read_context.snapshot_id());
-    }
-    return read_context.snapshot_id();
-  }
-  if (read_context.has_transaction_id()) {
-    auto meta = txn_manager_->GetTransactionMetadata(read_context.transaction_id());
-    if (!meta.ok()) {
-      return MakeSnapshotTxnError(meta.status().message(), SnapshotTransactionError::TRANSACTION_NOT_FOUND, read_context.transaction_id());
-    }
-    return read_context.transaction_id();
-  }
-  return std::string(storage_->GetCanonicalBranch());
-}
-
 grpc::Status IndexServiceImpl::FetchIndex(grpc::ServerContext* /*context*/, const FetchIndexRequest* request, FetchIndexResponse* response) {
   const std::string& key_type = request->key_type();
 
-  auto schema_info_or = registry_->GetIndexSchema(key_type);
+  auto schema_info_or = registry_->GetIndexSchema(key_type, request->context());
   if (!schema_info_or.ok()) {
     if (absl::IsNotFound(schema_info_or.status())) {
       return AbslToGrpcStatus(MakeFetchIndexError(absl::StatusCode::kNotFound, absl::StrCat("index not found for key_type: ", key_type),
@@ -50,7 +33,7 @@ grpc::Status IndexServiceImpl::FetchIndex(grpc::ServerContext* /*context*/, cons
   }
   const registry::IndexSchemaInfo& schema_info = *schema_info_or;
 
-  auto ref_or = ResolveReadRef(request->context());
+  auto ref_or = transaction::ResolveReadRef(storage_, txn_manager_, request->context());
   if (!ref_or.ok()) {
     return AbslToGrpcStatus(ref_or.status());
   }

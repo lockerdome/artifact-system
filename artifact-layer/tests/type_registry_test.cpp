@@ -94,6 +94,21 @@ std::optional<RegisterTypeVersionError> ExtractRegistrationError(const absl::Sta
   return error;
 }
 
+std::optional<SnapshotTransactionError> ExtractSnapshotTransactionError(const absl::Status& status) {
+  auto payload = status.GetPayload("type.googleapis.com/artifact_system.SnapshotTransactionError");
+  if (!payload.has_value())
+    return std::nullopt;
+  SnapshotTransactionError error;
+  if (!error.ParseFromString(std::string(payload->Flatten())))
+    return std::nullopt;
+  return error;
+}
+
+ReadContext CanonicalReadContext() {
+  ReadContext context;
+  return context;
+}
+
 absl::StatusOr<std::string> BuildPayload(const google::protobuf::FileDescriptorSet& descriptor_set, const std::string& type_name, const std::string& name,
                                          const std::string& value) {
   google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
@@ -402,13 +417,13 @@ TEST_F(TypeRegistryTest, RegisterNewVersion) {
   EXPECT_NE(v1, v2);
 
   // Verify doubly-linked list.
-  auto v1_info = registry_->GetTypeVersion(v1);
+  auto v1_info = registry_->GetTypeVersion(v1, CanonicalReadContext());
   ASSERT_TRUE(v1_info.ok()) << v1_info.status();
   EXPECT_FALSE(v1_info->previous_version_id.has_value());
   ASSERT_TRUE(v1_info->next_version_id.has_value());
   EXPECT_EQ(*v1_info->next_version_id, v2);
 
-  auto v2_info = registry_->GetTypeVersion(v2);
+  auto v2_info = registry_->GetTypeVersion(v2, CanonicalReadContext());
   ASSERT_TRUE(v2_info.ok()) << v2_info.status();
   ASSERT_TRUE(v2_info->previous_version_id.has_value());
   EXPECT_EQ(*v2_info->previous_version_id, v1);
@@ -419,7 +434,7 @@ TEST_F(TypeRegistryTest, GetTypeVersion) {
   auto reg_or = registry_->RegisterTypeVersion("test.SimpleArtifact", kSimpleProtoSource);
   ASSERT_TRUE(reg_or.ok()) << reg_or.status();
 
-  auto info = registry_->GetTypeVersion(reg_or->version_id);
+  auto info = registry_->GetTypeVersion(reg_or->version_id, CanonicalReadContext());
   ASSERT_TRUE(info.ok()) << info.status();
   EXPECT_EQ(info->version_id, reg_or->version_id);
   EXPECT_GT(info->type_id, 0U);
@@ -430,7 +445,7 @@ TEST_F(TypeRegistryTest, GetTypeVersion) {
 }
 
 TEST_F(TypeRegistryTest, GetTypeVersionNotFound) {
-  auto info = registry_->GetTypeVersion(99999);
+  auto info = registry_->GetTypeVersion(99999, CanonicalReadContext());
   ASSERT_FALSE(info.ok());
   EXPECT_EQ(info.status().code(), absl::StatusCode::kNotFound);
 }
@@ -442,7 +457,7 @@ TEST_F(TypeRegistryTest, ListTypeVersions) {
   auto v2_or = registry_->RegisterTypeVersion("test.SimpleArtifact", kSimpleProtoSourceV2);
   ASSERT_TRUE(v2_or.ok()) << v2_or.status();
 
-  auto versions_or = registry_->ListTypeVersions("test.SimpleArtifact");
+  auto versions_or = registry_->ListTypeVersions("test.SimpleArtifact", CanonicalReadContext());
   ASSERT_TRUE(versions_or.ok()) << versions_or.status();
   EXPECT_EQ(versions_or->size(), 2U);
   EXPECT_EQ((*versions_or)[0], v1_or->version_id);
@@ -450,7 +465,7 @@ TEST_F(TypeRegistryTest, ListTypeVersions) {
 }
 
 TEST_F(TypeRegistryTest, ListTypeVersionsNotFound) {
-  auto versions_or = registry_->ListTypeVersions("nonexistent.Type");
+  auto versions_or = registry_->ListTypeVersions("nonexistent.Type", CanonicalReadContext());
   ASSERT_FALSE(versions_or.ok());
   EXPECT_EQ(versions_or.status().code(), absl::StatusCode::kNotFound);
 }
@@ -459,7 +474,7 @@ TEST_F(TypeRegistryTest, GetIndexSchema) {
   auto reg_or = registry_->RegisterTypeVersion("test.SimpleArtifact", kSimpleProtoSource);
   ASSERT_TRUE(reg_or.ok()) << reg_or.status();
 
-  auto schema_or = registry_->GetIndexSchema("simple_by_name");
+  auto schema_or = registry_->GetIndexSchema("simple_by_name", CanonicalReadContext());
   ASSERT_TRUE(schema_or.ok()) << schema_or.status();
   EXPECT_EQ(schema_or->key_type, "simple_by_name");
   EXPECT_GT(schema_or->index_definition_id, 0U);
@@ -473,7 +488,7 @@ TEST_F(TypeRegistryTest, GetIndexSchema) {
 
 TEST_F(TypeRegistryTest, GetIndexSchemaBuiltInType) {
   // type_name_unique is a built-in index on TypeDefinition.
-  auto schema_or = registry_->GetIndexSchema("type_name_unique");
+  auto schema_or = registry_->GetIndexSchema("type_name_unique", CanonicalReadContext());
   ASSERT_TRUE(schema_or.ok()) << schema_or.status();
   EXPECT_EQ(schema_or->key_type, "type_name_unique");
   EXPECT_EQ(schema_or->index_definition_id, kTypeNameUniqueId);
@@ -481,9 +496,87 @@ TEST_F(TypeRegistryTest, GetIndexSchemaBuiltInType) {
 }
 
 TEST_F(TypeRegistryTest, GetIndexSchemaNotFound) {
-  auto schema_or = registry_->GetIndexSchema("nonexistent_index");
+  auto schema_or = registry_->GetIndexSchema("nonexistent_index", CanonicalReadContext());
   ASSERT_FALSE(schema_or.ok());
   EXPECT_EQ(schema_or.status().code(), absl::StatusCode::kNotFound);
+}
+
+TEST_F(TypeRegistryTest, RegisterTypeVersionInTransactionReadYourWritesAndCommitVisibility) {
+  auto txn_or = transaction_manager_->CreateTransaction();
+  ASSERT_TRUE(txn_or.ok()) << txn_or.status();
+  const std::string& transaction_id = *txn_or;
+
+  auto reg_or = registry_->RegisterTypeVersion("test.SimpleArtifact", kSimpleProtoSource, std::nullopt, std::nullopt, std::nullopt, transaction_id);
+  ASSERT_TRUE(reg_or.ok()) << reg_or.status();
+
+  ReadContext canonical_context;
+  auto canonical_or = registry_->GetTypeVersion(reg_or->version_id, canonical_context);
+  ASSERT_FALSE(canonical_or.ok());
+  EXPECT_EQ(canonical_or.status().code(), absl::StatusCode::kNotFound);
+
+  ReadContext transaction_context;
+  transaction_context.set_transaction_id(transaction_id);
+  auto transaction_read_or = registry_->GetTypeVersion(reg_or->version_id, transaction_context);
+  ASSERT_TRUE(transaction_read_or.ok()) << transaction_read_or.status();
+
+  auto commit_or = transaction_manager_->CommitTransaction(transaction_id);
+  ASSERT_TRUE(commit_or.ok()) << commit_or.status();
+  ASSERT_TRUE(std::holds_alternative<TransactionManager::CommitSuccess>(*commit_or));
+
+  auto committed_or = registry_->GetTypeVersion(reg_or->version_id, canonical_context);
+  ASSERT_TRUE(committed_or.ok()) << committed_or.status();
+}
+
+TEST_F(TypeRegistryTest, ReadApisSupportSnapshotAndTransactionContexts) {
+  auto v1_or = registry_->RegisterTypeVersion("test.SimpleArtifact", kSimpleProtoSource);
+  ASSERT_TRUE(v1_or.ok()) << v1_or.status();
+
+  auto txn_or = transaction_manager_->CreateTransaction();
+  ASSERT_TRUE(txn_or.ok()) << txn_or.status();
+  const std::string& transaction_id = *txn_or;
+
+  auto v2_or = registry_->RegisterTypeVersion("test.SimpleArtifact", kSimpleProtoSourceV2, std::nullopt, std::nullopt, std::nullopt, transaction_id);
+  ASSERT_TRUE(v2_or.ok()) << v2_or.status();
+
+  auto snapshot_or = transaction_manager_->CreateSnapshot(transaction_id);
+  ASSERT_TRUE(snapshot_or.ok()) << snapshot_or.status();
+
+  ReadContext canonical_context;
+  auto canonical_versions_or = registry_->ListTypeVersions("test.SimpleArtifact", canonical_context);
+  ASSERT_TRUE(canonical_versions_or.ok()) << canonical_versions_or.status();
+  ASSERT_EQ(canonical_versions_or->size(), 1U);
+  EXPECT_EQ((*canonical_versions_or)[0], v1_or->version_id);
+
+  ReadContext transaction_context;
+  transaction_context.set_transaction_id(transaction_id);
+  auto transaction_versions_or = registry_->ListTypeVersions("test.SimpleArtifact", transaction_context);
+  ASSERT_TRUE(transaction_versions_or.ok()) << transaction_versions_or.status();
+  ASSERT_EQ(transaction_versions_or->size(), 2U);
+
+  ReadContext snapshot_context;
+  snapshot_context.set_snapshot_id(*snapshot_or);
+  auto snapshot_v2_or = registry_->GetTypeVersion(v2_or->version_id, snapshot_context);
+  ASSERT_TRUE(snapshot_v2_or.ok()) << snapshot_v2_or.status();
+}
+
+TEST_F(TypeRegistryTest, InvalidReadContextReturnsSnapshotTransactionErrorPayload) {
+  ReadContext invalid_snapshot_context;
+  invalid_snapshot_context.set_snapshot_id("snapshot-does-not-exist");
+  auto snapshot_or = registry_->GetTypeVersion(12345, invalid_snapshot_context);
+  ASSERT_FALSE(snapshot_or.ok());
+  EXPECT_EQ(snapshot_or.status().code(), absl::StatusCode::kNotFound);
+  auto snapshot_error = ExtractSnapshotTransactionError(snapshot_or.status());
+  ASSERT_TRUE(snapshot_error.has_value());
+  EXPECT_EQ(snapshot_error->category(), SnapshotTransactionError::SNAPSHOT_NOT_FOUND);
+
+  ReadContext invalid_transaction_context;
+  invalid_transaction_context.set_transaction_id("transaction-does-not-exist");
+  auto transaction_or = registry_->ListTypeVersions("test.SimpleArtifact", invalid_transaction_context);
+  ASSERT_FALSE(transaction_or.ok());
+  EXPECT_EQ(transaction_or.status().code(), absl::StatusCode::kNotFound);
+  auto transaction_error = ExtractSnapshotTransactionError(transaction_or.status());
+  ASSERT_TRUE(transaction_error.has_value());
+  EXPECT_EQ(transaction_error->category(), SnapshotTransactionError::TRANSACTION_NOT_FOUND);
 }
 
 // ---------------------------------------------------------------------------
@@ -857,7 +950,7 @@ TEST_F(TypeRegistryTest, ArtifactStoreResolvesStaleIndexDefMapOnCreate) {
   auto reg_or = registry2->RegisterTypeVersion("test.SimpleArtifact", kSimpleProtoSource);
   ASSERT_TRUE(reg_or.ok()) << reg_or.status();
 
-  auto type_info_or = registry2->GetTypeVersion(reg_or->version_id);
+  auto type_info_or = registry2->GetTypeVersion(reg_or->version_id, CanonicalReadContext());
   ASSERT_TRUE(type_info_or.ok()) << type_info_or.status();
 
   auto payload_or = BuildPayload(type_info_or->descriptor_set, "test.SimpleArtifact", "stale-map-name", "payload-value");
@@ -870,7 +963,7 @@ TEST_F(TypeRegistryTest, ArtifactStoreResolvesStaleIndexDefMapOnCreate) {
   auto create_or = store.CreateArtifact(reg_or->version_id, *payload_or);
   ASSERT_TRUE(create_or.ok()) << create_or.status();
 
-  auto index_schema_or = registry_->GetIndexSchema("simple_by_name");
+  auto index_schema_or = registry_->GetIndexSchema("simple_by_name", CanonicalReadContext());
   ASSERT_TRUE(index_schema_or.ok()) << index_schema_or.status();
 
   google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());

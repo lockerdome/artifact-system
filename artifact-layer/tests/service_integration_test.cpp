@@ -152,11 +152,14 @@ protected:
   // ---- Convenience helpers ------------------------------------------------
 
   // Register the default test type and return its version_id.
-  uint64_t RegisterTestType() {
+  uint64_t RegisterTestType(std::optional<std::string> transaction_id = std::nullopt) {
     grpc::ClientContext ctx;
     RegisterTypeVersionRequest req;
     req.set_type_name("TestArtifact");
     req.set_proto_source(kTestProtoSource);
+    if (transaction_id.has_value()) {
+      req.set_transaction_id(*transaction_id);
+    }
     RegisterTypeVersionResponse resp;
     auto status = type_registry_stub_->RegisterTypeVersion(&ctx, req, &resp);
     EXPECT_TRUE(status.ok()) << status.error_message();
@@ -197,13 +200,13 @@ protected:
       grpc::ClientContext ctx;
       GetIndexSchemaRequest req;
       req.set_key_type(key_type);
+      req.mutable_read_context();
       auto status = type_registry_stub_->GetIndexSchema(&ctx, req, &schema);
       EXPECT_TRUE(status.ok()) << status.error_message();
     }
 
     google::protobuf::DescriptorPool pool;
-    const google::protobuf::Descriptor* key_desc =
-        artifact::BuildPoolAndFindMessage(schema.index_descriptor_set(), schema.key_message_name(), &pool);
+    const google::protobuf::Descriptor* key_desc = artifact::BuildPoolAndFindMessage(schema.index_descriptor_set(), schema.key_message_name(), &pool);
     EXPECT_NE(key_desc, nullptr);
 
     google::protobuf::DynamicMessageFactory factory;
@@ -251,6 +254,7 @@ TEST_F(ServiceIntegrationTest, GetTypeVersion_Success) {
   grpc::ClientContext ctx;
   GetTypeVersionRequest req;
   req.set_version_id(version_id);
+  req.mutable_read_context();
   GetTypeVersionResponse resp;
   auto status = type_registry_stub_->GetTypeVersion(&ctx, req, &resp);
   ASSERT_TRUE(status.ok()) << status.error_message();
@@ -265,6 +269,7 @@ TEST_F(ServiceIntegrationTest, GetTypeVersion_NotFound) {
   grpc::ClientContext ctx;
   GetTypeVersionRequest req;
   req.set_version_id(999999);
+  req.mutable_read_context();
   GetTypeVersionResponse resp;
   auto status = type_registry_stub_->GetTypeVersion(&ctx, req, &resp);
   EXPECT_EQ(status.error_code(), grpc::NOT_FOUND);
@@ -288,6 +293,7 @@ TEST_F(ServiceIntegrationTest, ListTypeVersions_Success) {
   grpc::ClientContext ctx3;
   ListTypeVersionsRequest list_req;
   list_req.set_type_name("TestArtifact");
+  list_req.mutable_read_context();
   ListTypeVersionsResponse list_resp;
   auto s3 = type_registry_stub_->ListTypeVersions(&ctx3, list_req, &list_resp);
   ASSERT_TRUE(s3.ok()) << s3.error_message();
@@ -303,6 +309,7 @@ TEST_F(ServiceIntegrationTest, ListTypeVersions_NotFound) {
   grpc::ClientContext ctx;
   ListTypeVersionsRequest req;
   req.set_type_name("NonExistentType");
+  req.mutable_read_context();
   ListTypeVersionsResponse resp;
   auto status = type_registry_stub_->ListTypeVersions(&ctx, req, &resp);
   EXPECT_EQ(status.error_code(), grpc::NOT_FOUND);
@@ -314,6 +321,7 @@ TEST_F(ServiceIntegrationTest, GetIndexSchema_Success) {
   grpc::ClientContext ctx;
   GetIndexSchemaRequest req;
   req.set_key_type("TestArtifact_by_name");
+  req.mutable_read_context();
   GetIndexSchemaResponse resp;
   auto status = type_registry_stub_->GetIndexSchema(&ctx, req, &resp);
   ASSERT_TRUE(status.ok()) << status.error_message();
@@ -331,9 +339,124 @@ TEST_F(ServiceIntegrationTest, GetIndexSchema_NotFound) {
   grpc::ClientContext ctx;
   GetIndexSchemaRequest req;
   req.set_key_type("NonExistentIndex");
+  req.mutable_read_context();
   GetIndexSchemaResponse resp;
   auto status = type_registry_stub_->GetIndexSchema(&ctx, req, &resp);
   EXPECT_EQ(status.error_code(), grpc::NOT_FOUND);
+}
+
+TEST_F(ServiceIntegrationTest, RegisterTypeVersion_ExplicitTransactionVisibility) {
+  std::string transaction_id = CreateTransaction();
+  uint64_t version_id = RegisterTestType(transaction_id);
+
+  {
+    grpc::ClientContext ctx;
+    GetTypeVersionRequest req;
+    req.set_version_id(version_id);
+    req.mutable_read_context();
+    GetTypeVersionResponse resp;
+    auto status = type_registry_stub_->GetTypeVersion(&ctx, req, &resp);
+    EXPECT_EQ(status.error_code(), grpc::NOT_FOUND);
+  }
+
+  {
+    grpc::ClientContext ctx;
+    GetTypeVersionRequest req;
+    req.set_version_id(version_id);
+    req.mutable_read_context()->set_transaction_id(transaction_id);
+    GetTypeVersionResponse resp;
+    auto status = type_registry_stub_->GetTypeVersion(&ctx, req, &resp);
+    ASSERT_TRUE(status.ok()) << status.error_message();
+    EXPECT_EQ(resp.version_id(), version_id);
+  }
+
+  std::string snapshot_id;
+  {
+    grpc::ClientContext ctx;
+    CreateSnapshotRequest req;
+    req.set_parent_transaction_id(transaction_id);
+    CreateSnapshotResponse resp;
+    auto status = snapshot_txn_stub_->CreateSnapshot(&ctx, req, &resp);
+    ASSERT_TRUE(status.ok()) << status.error_message();
+    snapshot_id = resp.snapshot_id();
+  }
+
+  {
+    grpc::ClientContext ctx;
+    GetTypeVersionRequest req;
+    req.set_version_id(version_id);
+    req.mutable_read_context()->set_snapshot_id(snapshot_id);
+    GetTypeVersionResponse resp;
+    auto status = type_registry_stub_->GetTypeVersion(&ctx, req, &resp);
+    ASSERT_TRUE(status.ok()) << status.error_message();
+    EXPECT_EQ(resp.version_id(), version_id);
+  }
+
+  {
+    grpc::ClientContext ctx;
+    CommitTransactionRequest req;
+    req.set_transaction_id(transaction_id);
+    CommitTransactionResponse resp;
+    auto status = snapshot_txn_stub_->CommitTransaction(&ctx, req, &resp);
+    ASSERT_TRUE(status.ok()) << status.error_message();
+  }
+
+  {
+    grpc::ClientContext ctx;
+    GetTypeVersionRequest req;
+    req.set_version_id(version_id);
+    req.mutable_read_context();
+    GetTypeVersionResponse resp;
+    auto status = type_registry_stub_->GetTypeVersion(&ctx, req, &resp);
+    ASSERT_TRUE(status.ok()) << status.error_message();
+    EXPECT_EQ(resp.version_id(), version_id);
+  }
+}
+
+TEST_F(ServiceIntegrationTest, TypeRegistryReadApis_InvalidReadContextErrorMapping) {
+  uint64_t version_id = RegisterTestType();
+
+  {
+    grpc::ClientContext ctx;
+    GetTypeVersionRequest req;
+    req.set_version_id(version_id);
+    req.mutable_read_context()->set_snapshot_id("invalid_snapshot_id");
+    GetTypeVersionResponse resp;
+    auto status = type_registry_stub_->GetTypeVersion(&ctx, req, &resp);
+    EXPECT_EQ(status.error_code(), grpc::NOT_FOUND);
+
+    SnapshotTransactionError detail;
+    EXPECT_TRUE(ExtractErrorDetail(status, &detail));
+    EXPECT_EQ(detail.category(), SnapshotTransactionError::SNAPSHOT_NOT_FOUND);
+  }
+
+  {
+    grpc::ClientContext ctx;
+    ListTypeVersionsRequest req;
+    req.set_type_name("TestArtifact");
+    req.mutable_read_context()->set_transaction_id("invalid_transaction_id");
+    ListTypeVersionsResponse resp;
+    auto status = type_registry_stub_->ListTypeVersions(&ctx, req, &resp);
+    EXPECT_EQ(status.error_code(), grpc::NOT_FOUND);
+
+    SnapshotTransactionError detail;
+    EXPECT_TRUE(ExtractErrorDetail(status, &detail));
+    EXPECT_EQ(detail.category(), SnapshotTransactionError::TRANSACTION_NOT_FOUND);
+  }
+
+  {
+    grpc::ClientContext ctx;
+    GetIndexSchemaRequest req;
+    req.set_key_type("TestArtifact_by_name");
+    req.mutable_read_context()->set_transaction_id("invalid_transaction_id");
+    GetIndexSchemaResponse resp;
+    auto status = type_registry_stub_->GetIndexSchema(&ctx, req, &resp);
+    EXPECT_EQ(status.error_code(), grpc::NOT_FOUND);
+
+    SnapshotTransactionError detail;
+    EXPECT_TRUE(ExtractErrorDetail(status, &detail));
+    EXPECT_EQ(detail.category(), SnapshotTransactionError::TRANSACTION_NOT_FOUND);
+  }
 }
 
 // ===========================================================================
