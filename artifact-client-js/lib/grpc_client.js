@@ -7,6 +7,8 @@ const protoLoader = require('@grpc/proto-loader');
 const { retry_with_backoff, is_retryable, DEFAULT_RETRY_OPTIONS } = require('./retry');
 const { parse_grpc_error, _error_root } = require('./errors');
 
+const DEFAULT_CALL_TIMEOUT_MS = 30000;
+
 const DESCRIPTOR_PATH = path.resolve(__dirname, '../proto/artifact_service.desc');
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -53,6 +55,7 @@ class ArtifactGrpcClient {
    * @param {string} options.service_address - gRPC endpoint (host:port).
    * @param {object} [options.retry] - Retry options for transient errors.
    * @param {object} [options.channel_credentials] - gRPC channel credentials.
+   * @param {number} [options.call_timeout_ms] - Per-call gRPC deadline in milliseconds (default: 30000).
    */
   constructor (options) {
     if (!options || !options.service_address) {
@@ -62,6 +65,7 @@ class ArtifactGrpcClient {
     this.service_address = options.service_address;
     this.retry_options = { ...DEFAULT_RETRY_OPTIONS, ...options.retry };
     this.channel_credentials = options.channel_credentials ?? grpc.credentials.createInsecure();
+    this.call_timeout_ms = options.call_timeout_ms ?? DEFAULT_CALL_TIMEOUT_MS;
 
     this._snapshot_transaction_client = null;
     this._artifact_client = null;
@@ -84,17 +88,27 @@ class ArtifactGrpcClient {
     const proto = grpc.loadPackageDefinition(package_definition);
     const pkg = proto.artifact_system;
 
+    // Create the first client normally — it owns the underlying gRPC channel.
+    // All remaining clients reuse that channel via channelOverride so that the
+    // four service stubs share a single HTTP/2 connection instead of each
+    // opening its own TCP connection.
     this._snapshot_transaction_client = new pkg.SnapshotTransactionService(
       this.service_address, this.channel_credentials,
     );
+
+    const shared_channel = this._snapshot_transaction_client.getChannel();
+
     this._artifact_client = new pkg.ArtifactService(
       this.service_address, this.channel_credentials,
+      { channelOverride: shared_channel },
     );
     this._index_client = new pkg.IndexService(
       this.service_address, this.channel_credentials,
+      { channelOverride: shared_channel },
     );
     this._type_registry_client = new pkg.TypeRegistryService(
       this.service_address, this.channel_credentials,
+      { channelOverride: shared_channel },
     );
 
     this._connected = true;
@@ -211,12 +225,14 @@ class ArtifactGrpcClient {
     }
 
     return retry_with_backoff(() => {
+      const deadline = new Date(Date.now() + this.call_timeout_ms);
       return new Promise((resolve, reject) => {
         client.makeUnaryRequest(
           method_path,
           _protobuf_serialize(RequestType),
           _protobuf_deserialize(ResponseType),
           request,
+          { deadline },
           (err, response) => {
             if (err) {
               if (is_retryable(err)) {
@@ -245,8 +261,9 @@ class ArtifactGrpcClient {
     }
 
     return retry_with_backoff(() => {
+      const deadline = new Date(Date.now() + this.call_timeout_ms);
       return new Promise((resolve, reject) => {
-        client[method](request, (err, response) => {
+        client[method](request, { deadline }, (err, response) => {
           if (err) {
             if (is_retryable(err)) {
               return reject(err);
