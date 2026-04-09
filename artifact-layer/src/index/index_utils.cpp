@@ -143,6 +143,10 @@ absl::Status AddIndexRow(StorageInterface* storage, const std::string& branch, c
     }
   }
 
+  if (index_def.unique() && !index_obj.rows.empty()) {
+    return absl::AbortedError("unique index conflict");
+  }
+
   IndexRow row;
   row.artifact_id = artifact_id;
   row.order_values = entry.order_values;
