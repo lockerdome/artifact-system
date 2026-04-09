@@ -32,6 +32,18 @@ class TransactionSettledError extends Error {
   }
 }
 
+/**
+ * Thrown when the client cannot resolve or apply a protobuf type while
+ * decoding/encoding an artifact payload or index payload (e.g., the named
+ * message is missing from the descriptor set returned by the server).
+ */
+class TypeDecodeError extends Error {
+  constructor (message) {
+    super(message);
+    this.name = 'TypeDecodeError';
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Error detail protobuf types — loaded from pre-compiled FileDescriptorSet
 // ─────────────────────────────────────────────────────────────────────────────
@@ -205,6 +217,7 @@ module.exports = {
   ConflictError,
   TransactionError,
   TransactionSettledError,
+  TypeDecodeError,
   IndexFetchError,
   TypeRegistrationError,
   parse_grpc_error,

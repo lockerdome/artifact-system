@@ -8,6 +8,7 @@ const {
   ConflictError,
   TransactionError,
   TransactionSettledError,
+  TypeDecodeError,
   IndexFetchError,
   TypeRegistrationError,
 } = require('./errors');
@@ -20,6 +21,7 @@ module.exports = {
   ConflictError,
   TransactionError,
   TransactionSettledError,
+  TypeDecodeError,
   IndexFetchError,
   TypeRegistrationError,
 };
