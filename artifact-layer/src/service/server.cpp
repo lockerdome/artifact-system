@@ -94,6 +94,7 @@ void ArtifactLayerServer::Start() {
     return;
   }
   std::println("LISTENING_PORT={}", impl_->selected_port);
+  std::fflush(stdout);
   std::println("Artifact layer server listening on {} (port {})", impl_->config.listen_address, impl_->selected_port);
   impl_->server->Wait();
 }
