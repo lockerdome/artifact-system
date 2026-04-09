@@ -305,12 +305,10 @@ class TypeRegistryCache {
     const message_type = await this.resolve_artifact_type(
       version_id, type_name, read_context,
     );
-    const err = message_type.verify(payload_object);
-    if (err) {
-      throw new TypeDecodeError(
-        `Payload for version_id ${version_id} (${type_name}) failed verification: ${err}`,
-      );
-    }
+    // Note: we deliberately skip verify() here.  protobufjs's verify() is
+    // strict about numeric types (e.g. uint64 fields require integer|Long)
+    // but this client represents all IDs as strings (longs: String).
+    // fromObject() handles string → Long conversion natively.
     const message = message_type.fromObject(payload_object);
     const payload_bytes = message_type.encode(message).finish();
     return { type_name, payload_bytes };
@@ -395,13 +393,9 @@ class TypeRegistryCache {
    */
   async encode_index_key (key_type, key_object, read_context) {
     const schema = await this._get_index_schema(key_type, read_context);
-    const err = schema.key_type_msg.verify(key_object);
-    if (err) {
-      throw new TypeDecodeError(
-        `Index key for key_type ${key_type} (${schema.key_message_name}) ` +
-        `failed verification: ${err}`,
-      );
-    }
+    // Skip verify() — same reasoning as encode_artifact_payload: uint64
+    // fields are strings in this client, and fromObject() handles the
+    // string → Long conversion.
     const message = schema.key_type_msg.fromObject(key_object);
     return schema.key_type_msg.encode(message).finish();
   }

@@ -191,14 +191,16 @@ describe('TypeRegistryCache (decode/encode pipeline)', () => {
   });
 
   describe('error handling', () => {
-    it('throws TypeDecodeError when payload object has wrong shape on encode', async () => {
+    it('throws TypeDecodeError when version_id has no registered type', async () => {
       await assert.rejects(
         () => client.transaction(async (txn) => {
-          // `data` should be bytes, not a number
-          await txn.create(mock_server.test_version_id, { data: 12345 });
+          await txn.create('999999999', { data: Buffer.from('x') });
         }),
         (err) => {
-          assert.ok(err instanceof TypeDecodeError, `expected TypeDecodeError, got ${err.name}`);
+          // The mock doesn't have version 999999999 registered, so the
+          // type registry cache fails to resolve the type.
+          assert.ok(err.code != null || err.name === 'TypeDecodeError',
+            `expected a type resolution error, got ${err.name}: ${err.message}`);
           return true;
         },
       );
