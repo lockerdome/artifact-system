@@ -6,12 +6,13 @@
   "main": "lib/index.js",
   "scripts": {
     "test": "node --test tests/*.js",
-    "generate-proto": "grpc_tools_node_protoc --include_imports --descriptor_set_out=proto/artifact_service.desc -I ../artifact-layer/proto ../artifact-layer/proto/artifact_service.proto"
+    "generate-proto": "grpc_tools_node_protoc --include_imports --descriptor_set_out=proto/artifact_service.desc -I ../artifact-layer/proto ../artifact-layer/proto/artifact_service.proto ../artifact-layer/proto/artifact_types.proto"
   },
   "dependencies": {
     "@grpc/grpc-js": "^1.12.6",
     "@grpc/proto-loader": "^0.7.13",
-    "google-auth-library": "^8.8.0"
+    "google-auth-library": "^8.8.0",
+    "protobufjs": "^7.4.0"
   },
   "devDependencies": {
     "grpc-tools": "^1.13.1"
