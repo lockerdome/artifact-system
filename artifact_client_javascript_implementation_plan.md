@@ -66,14 +66,20 @@ const snapshot = await client.snapshot();
 
 const a1 = await snapshot.get(artifact_id_1);
 // => { artifact_id, type_name, version_id, payload }
+// `payload` is a decoded JS object whose field names match the artifact
+// type's `.proto` source — NOT raw bytes.  See "Payload decoding and
+// encoding" below.
 
 const a2 = await snapshot.get(artifact_id_2); // guaranteed consistent with a1
 
 const artifacts = await snapshot.batch_get([id_1, id_2, id_3]);
-// => [{ artifact_id, ... }, null, { artifact_id, ... }]  (null = not found)
+// => [{ artifact_id, ..., payload: <decoded object> }, null, ...]
 
-const index = await snapshot.fetch_index(key_type, key_bytes);
+const index = await snapshot.fetch_index(key_type, key_object);
+// `key_object` is a JS object matching the index's key message; the
+// client encodes it to bytes via the index schema.
 // => { index_payload, index_message_name }
+// `index_payload` is the decoded index message as a JS object.
 ```
 
 Snapshots are long-lived and can be used freely after creation. They represent a frozen
@@ -86,12 +92,16 @@ inside the async callback passed to `client.transaction()`.
 
 ```javascript
 const result = await client.transaction(async (txn) => {
-  // Reads within the transaction see snapshot isolation + own writes
+  // Reads within the transaction see snapshot isolation + own writes.
+  // `existing.payload` is a decoded JS object.
   const existing = await txn.get(artifact_id);
 
-  // Write operations — only available on txn, not on snapshot or client
-  const created = await txn.create(version_id, payload);
-  await txn.update(artifact_id, version_id, new_payload);
+  // Write operations — only available on txn, not on snapshot or client.
+  // `payload_object` and `new_payload_object` are JS objects matching the
+  // artifact type's `.proto`; the client encodes them to bytes via the
+  // shared TypeRegistryCache before sending.
+  const created = await txn.create(version_id, payload_object);
+  await txn.update(artifact_id, version_id, new_payload_object);
   await txn.delete(artifact_id);
 
   // Snapshot from transaction state (for handing to other code that only needs reads)
@@ -185,19 +195,30 @@ can inspect conflict types, violation categories, etc.
    ```
    artifact-system/artifact-client-js/
      package.json
+     proto/
+       artifact_service.desc # protoc-compiled descriptor set, includes
+                             # artifact_service.proto AND artifact_types.proto
+                             # (the latter so the client can decode
+                             #  TypeDefinition for version_id → type_name)
      lib/
        index.js             # exports { ArtifactClient }
        client.js            # ArtifactClient class — public API + transaction() wrapper
        grpc_client.js       # raw gRPC transport (4 service stubs, proto loading)
-       snapshot.js          # Snapshot class (scoped reads)
-       transaction.js       # Transaction class (scoped reads + writes)
+       snapshot.js          # Snapshot class (scoped reads, decodes payloads)
+       transaction.js       # Transaction class (scoped reads + writes,
+                            #   encodes payloads on writes)
+       type_registry.js     # TypeRegistryCache: descriptor-set caching +
+                            #   payload encode/decode + index key encode
        errors.js            # custom error classes + gRPC detail parsing
        retry.js             # exponential backoff with jitter (same pattern as id-allocator)
      tests/
-       mock_server.js       # in-process gRPC server implementing all 4 services
+       mock_server.js       # in-process gRPC server implementing all 4 services,
+                            #   with auto-installed fixture artifact type and
+                            #   index schema (real descriptor sets)
        client_test.js       # ArtifactClient unit tests
        transaction_test.js  # transaction lifecycle, auto-commit, auto-rollback
        snapshot_test.js     # snapshot scoped reads
+       type_registry_test.js # decode/encode pipeline + cache behavior
        errors_test.js       # error parsing and detail extraction
    ```
 
@@ -221,75 +242,143 @@ can inspect conflict types, violation categories, etc.
      `RegisterTypeVersionError`), and throw the appropriate typed error.
    - Each error class: `message`, `code` (gRPC status code), `detail` (parsed proto
      detail), `grpc_error` (original).
+   - `TransactionSettledError` (no gRPC backing) — see `lib/transaction.js`.
+   - `TypeDecodeError` (no gRPC backing) — thrown by the type registry when a
+     payload cannot be decoded or encoded against its declared type.
 
-4. **`lib/snapshot.js`** — `Snapshot` class (primary read interface):
-    - Constructor: `new Snapshot(grpc_client, snapshot_id)`.
+4. **`lib/type_registry.js`** — `TypeRegistryCache` class:
+   - One instance per `ArtifactClient`, shared with every `Snapshot` and
+     `Transaction` (including snapshots/sub-transactions derived from a
+     transaction).
+   - Resolves a `version_id` to a `protobufjs.Root` by reading
+     `GetTypeVersion(version_id).descriptor_set` and rebuilding via
+     `protobuf.Root.fromDescriptor(...)`.  Resolves the message's
+     `type_name` by reading the parent `TypeDefinition` artifact at
+     `type_id` and decoding its payload with the bundled built-in
+     `TypeDefinition` Type.
+   - Resolves an index `key_type` to its key/value/index Types by reading
+     `GetIndexSchema(key_type).index_descriptor_set`.
+   - Caches: `version_id → Root`, `version_id → type_name`,
+     `type_id → type_name`, `key_type → { root, key/index/value Types,
+     key_message_name, index_message_name }`.  All caches are
+     process-lifetime; immutability of versions/types makes invalidation
+     unnecessary.  Index cache will need an eviction story when index
+     migrations land — TODO marker present.
+   - Public API used by Snapshot/Transaction:
+     - `decode_artifact_payload(version_id, type_name, bytes, read_context)`
+       → JS object
+     - `encode_artifact_payload(version_id, payload_object, read_context)`
+       → `{ type_name, payload_bytes }`
+     - `encode_index_key(key_type, key_object, read_context)` → bytes
+     - `decode_index_payload(key_type, index_message_name, bytes, read_context)`
+       → JS object
+   - Throws `TypeDecodeError` on missing-message-in-descriptor, malformed
+     descriptors, or payload objects that fail to encode against the
+     declared type.
+   - All cache-miss RPC calls propagate the caller's `read_context` so a
+     transaction that registers a type and immediately uses it within the
+     same callback can resolve the new version.
+   - See "Payload decoding and encoding" below for the rationale and the
+     proto-loader/protobufjs interop quirks the cache handles internally.
+
+5. **`lib/snapshot.js`** — `Snapshot` class (primary read interface):
+    - Constructor: `new Snapshot(grpc_client, type_registry, snapshot_id)`.
     - Internal state: `_snapshot_id` only (no public `id` accessor).
     - Methods: `get(artifact_id)`, `batch_get(artifact_ids)`,
-      `fetch_index(key_type, key)`, `get_type_version(version_id)`,
+      `fetch_index(key_type, key_object)`, `get_type_version(version_id)`,
       `list_type_versions(type_name)`, `get_index_schema(key_type)`.
    - All methods construct a `ReadContext { snapshot_id }` and delegate to grpc_client.
+   - **Decoding**: `get` / `batch_get` pass the response payload bytes through
+     `type_registry.decode_artifact_payload(...)` and return the resulting
+     JS object as the artifact's `payload` field.
+   - **Index decoding/encoding**: `fetch_index` accepts a JS key object,
+     encodes it via `type_registry.encode_index_key(...)`, and decodes the
+     response `index_payload` via `type_registry.decode_index_payload(...)`.
+   - `get_type_version` / `list_type_versions` / `get_index_schema`
+     propagate `read_context: { snapshot_id }` to the underlying RPC.
    - Long-lived — no settled state, can be used freely after creation.
 
-5. **`lib/transaction.js`** — `Transaction` class (reads + writes, scoped to callback):
-    - Constructor: `new Transaction(grpc_client, transaction_id)`.
+6. **`lib/transaction.js`** — `Transaction` class (reads + writes, scoped to callback):
+    - Constructor: `new Transaction(grpc_client, type_registry, transaction_id)`.
     - Internal state: `_transaction_id` only (no public `id` accessor).
    - Internal: `_settled` flag, initially `false`.
    - **Settled guard**: every public method checks `_settled` first and throws
      `TransactionSettledError` if true. `_settle()` is called by the
      `client.transaction()` wrapper after the callback resolves or rejects.
     - Read methods: `get(artifact_id)`, `batch_get(artifact_ids)`,
-      `fetch_index(key_type, key)`, `get_type_version(version_id)`,
+      `fetch_index(key_type, key_object)`, `get_type_version(version_id)`,
       `list_type_versions(type_name)`, `get_index_schema(key_type)` — scoped to
-      `ReadContext { transaction_id }`.
-    - Write methods: `create(version_id, payload)`, `update(artifact_id, version_id, payload)`,
-      `delete(artifact_id)`, `register_type(type_name, proto_source, options)` —
-      pass transaction_id to the write RPC.
+      `ReadContext { transaction_id }`.  Reads decode payloads / index
+      payloads through the shared `type_registry` (same flow as `Snapshot`).
+    - Write methods: `create(version_id, payload_object)`,
+      `update(artifact_id, version_id, payload_object)`,
+      `delete(artifact_id)`, `register_type(type_name, proto_source, options)`.
+      `create` / `update` encode the JS payload object via
+      `type_registry.encode_artifact_payload(...)` before sending; the
+      caller never sees raw bytes.  All write RPCs pass `transaction_id`,
+      including `register_type`.
     - `snapshot()` — create a snapshot from the transaction's current state
-      (parent_transaction_id = this._transaction_id). Returns a `Snapshot` that remains usable
-      after the transaction settles.
+      (parent_transaction_id = this._transaction_id). Returns a `Snapshot`
+      constructed with the same `type_registry` so it remains usable after
+      the transaction settles.
     - `transaction(callback)` — nested sub-transaction
       (parent_transaction_id = this._transaction_id).
-      Uses the same auto-commit/rollback/settle pattern as `client.transaction()`.
+      Uses the same auto-commit/rollback/settle pattern as `client.transaction()`,
+      and the sub-transaction shares the parent's `type_registry`.
    - The `Transaction` class does **not** call commit/rollback itself — that is the
      responsibility of the `client.transaction()` wrapper.
 
-6. **`lib/client.js`** — `ArtifactClient` class:
-   - Constructor validates options, creates `ArtifactGrpcClient`.
+7. **`lib/client.js`** — `ArtifactClient` class:
+   - Constructor validates options, creates `ArtifactGrpcClient`, and
+     creates **one** `TypeRegistryCache` that is shared with every
+     `Snapshot` and `Transaction` produced by this client.
    - `initialize()` / `close()` — connection lifecycle.
     - **No read methods** — reads go through `Snapshot` or `Transaction`.
     - **No write methods** — writes go through `Transaction`.
     - **No type-registry methods** — registry calls are scoped through
       `Snapshot`/`Transaction`.
-   - **Snapshot factory**: `snapshot()` — calls `CreateSnapshot` (canonical branch head),
-     returns `Snapshot` instance.
+   - **Snapshot factory**: `snapshot()` — calls `CreateSnapshot` (canonical
+     branch head), returns a `Snapshot` constructed with the shared
+     `type_registry`.
    - **Transaction wrapper**: `transaction(callback, options?)`:
      1. `CreateTransaction(options)` → transaction_id
-     2. Construct `Transaction` instance
+     2. Construct `Transaction` with the shared `type_registry`
      3. `try { value = await callback(txn); }` → `CommitTransaction` → return
         `{ snapshot_id, value }`
      4. `catch (err)` → `RollbackTransaction` → re-throw
      5. `finally` → `txn._settle()` — mark txn as inert
 
-7. **`tests/mock_server.js`** — in-process gRPC test server:
+8. **`tests/mock_server.js`** — in-process gRPC test server:
    - Implements all 4 services with in-memory state.
    - Configurable failure injection (specific RPCs can return errors).
    - Tracks call history for assertions.
+   - **Fixture types**: at construction, compiles a fixture artifact type
+     (`test.TestPayload`) and a fixture index schema
+     (`IndexKey_Test` / `IndexValue_Test` / `Index_Test`) into real
+     `FileDescriptorSet`s, auto-installs a `TypeDefinition` artifact at the
+     fixture's `type_id`, and serves them from `GetTypeVersion` /
+     `GetIndexSchema` / `GetArtifact` so the client can run its full
+     decode/encode pipeline against the mock.  Exposes `test_version_id`,
+     `test_type_name`, `test_index_key_type`, etc. for tests.
+   - `seed_artifact(id, payload)` and `seed_index(key, index_payload)`
+     accept JS objects (encoded via the fixture types) or raw bytes.
 
-8. **`tests/client_test.js`** — ArtifactClient tests:
+9. **`tests/client_test.js`** — ArtifactClient tests:
     - `client.snapshot()` returns a working `Snapshot`
     - Error handling (type registration errors, etc.)
     - Verify client has no `get`, `batch_get`, `create`, `update`, `delete`,
       `register_type`, `get_type_version`, `list_type_versions`, `get_index_schema`
       methods
 
-9. **`tests/transaction_test.js`** — transaction lifecycle tests:
+10. **`tests/transaction_test.js`** — transaction lifecycle tests:
    - Auto-commit on callback success
    - Auto-rollback on callback throw
    - Return value passthrough via `result.value`
    - `result.snapshot_id` available for read-after-write
-   - Reads within transaction (get, batch_get, fetch_index)
-    - Writes within transaction (create, update, delete)
+   - Reads within transaction (get, batch_get, fetch_index) — assert that
+     the returned `payload` is a decoded JS object matching the seeded data
+    - Writes within transaction (create, update, delete) — pass JS payload
+      objects, not bytes
     - Type registry in transaction (`register_type`) and readable registry methods
       on `txn`
    - Nested transactions (`txn.transaction(async (subtxn) => { ... })`)
@@ -299,10 +388,11 @@ can inspect conflict types, violation categories, etc.
      `TransactionSettledError`
    - Snapshot created from txn (`txn.snapshot()`) remains usable after txn settles
 
-10. **`tests/snapshot_test.js`** — snapshot tests:
+11. **`tests/snapshot_test.js`** — snapshot tests:
     - Snapshot from canonical branch (`client.snapshot()`)
     - Snapshot from transaction (`txn.snapshot()` inside callback)
-    - All read methods: get, batch_get, fetch_index
+    - All read methods: get, batch_get, fetch_index — assert decoded
+      payload fields, not just metadata
     - Read-only type registry methods: get_type_version, list_type_versions,
       get_index_schema
     - Snapshot does not expose `snapshot_id` via a public `id` field
@@ -310,7 +400,21 @@ can inspect conflict types, violation categories, etc.
     - `ArtifactNotFoundError` for missing artifacts
     - `IndexFetchError` for bad index queries
 
-11. **`tests/errors_test.js`** — error parsing tests:
+12. **`tests/type_registry_test.js`** — decode/encode pipeline + cache tests:
+    - Decoded payloads come back as JS objects matching the `.proto` field
+      names verbatim (no normalization in either direction)
+    - Round-trip through `txn.create` → `snapshot.get` returns the original
+      payload
+    - `batch_get` decodes every entry
+    - `version_id → Type` cache: `GetTypeVersion` is called exactly once
+      across multiple reads of the same version (and across `Snapshot` /
+      `Transaction` from the same client)
+    - `key_type → schema` cache behaves the same way for `GetIndexSchema`
+    - Index keys encode deterministically so seeded entries match lookups
+    - Encoding a malformed payload throws `TypeDecodeError`
+    - Uses a fresh `ArtifactClient` per test so cache state is assertable
+
+13. **`tests/errors_test.js`** — error parsing tests:
     - Each error detail type correctly parsed from gRPC metadata
     - `TransactionSettledError` thrown client-side (no gRPC detail)
     - Unknown detail types don't crash
@@ -385,18 +489,34 @@ clients handle uint64 and avoids silent precision loss.
 
 ## Checklist
 - [ ] Directory structure and `package.json` created
+- [ ] `proto/artifact_service.desc` includes `artifact_types.proto`
+      (so the client has the built-in `TypeDefinition` available for
+      `version_id → type_name` resolution)
 - [ ] `lib/retry.js` — exponential backoff with jitter
 - [ ] `lib/errors.js` — error classes + gRPC detail parsing (`grpc-status-details-bin`) + `TransactionSettledError` + `TypeDecodeError`
-- [ ] `lib/type_registry.js` — version/type/index schema cache + decode/encode helpers
+- [ ] `lib/type_registry.js` — `TypeRegistryCache`: version → Root,
+      version → type_name (via TypeDefinition), index schemas, and the
+      `decode_artifact_payload` / `encode_artifact_payload` /
+      `encode_index_key` / `decode_index_payload` helpers
 - [ ] `lib/grpc_client.js` — proto loading, 4 service stubs, promisified RPCs
-- [ ] `lib/snapshot.js` — Snapshot class (primary read interface, long-lived)
-- [ ] `lib/transaction.js` — Transaction class (reads + writes, settled guard after callback)
-- [ ] `lib/client.js` — ArtifactClient with snapshot() + transaction() factories only
-- [ ] `lib/index.js` — public exports
-- [ ] `tests/mock_server.js` — in-process gRPC server for all 4 services
+- [ ] `lib/snapshot.js` — Snapshot class; reads decode payloads through `type_registry`
+- [ ] `lib/transaction.js` — Transaction class; reads decode and writes
+      encode through `type_registry`; settled guard after callback;
+      `register_type` passes `transaction_id`
+- [ ] `lib/client.js` — ArtifactClient with snapshot() + transaction()
+      factories only; instantiates a single shared `TypeRegistryCache`
+- [ ] `lib/index.js` — public exports (including `TypeDecodeError`)
+- [ ] `tests/mock_server.js` — in-process gRPC server with auto-installed
+      fixture artifact type and index schema (real `FileDescriptorSet`s)
 - [ ] `tests/client_test.js` — snapshot factory; no read/write/registry methods on client
-- [ ] `tests/transaction_test.js` — auto-commit, auto-rollback, settled guard, nested, conflict
-- [ ] `tests/snapshot_test.js` — creation, scoped reads, from transaction, long-lived
+- [ ] `tests/transaction_test.js` — auto-commit, auto-rollback, settled guard, nested, conflict; payloads are JS objects
+- [ ] `tests/snapshot_test.js` — creation, scoped reads, from transaction, long-lived; payloads are JS objects
+- [ ] `tests/type_registry_test.js` — decode/encode round-trip, cache
+      behavior, `TypeDecodeError` on malformed payloads
 - [ ] `tests/errors_test.js` — all error detail types + TransactionSettledError
 - [ ] uint64 IDs handled as strings (no precision loss)
+- [ ] Artifact and index payloads exposed as JS objects at the API
+      boundary (callers never see raw bytes)
+- [ ] Field names preserved verbatim from `.proto` source — no casing
+      normalization at any layer
 - [ ] All tests pass (`node --test tests/*.js`)
