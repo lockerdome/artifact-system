@@ -316,6 +316,65 @@ can inspect conflict types, violation categories, etc.
     - Unknown detail types don't crash
     - Missing metadata falls back to generic error
 
+## Payload decoding and encoding
+
+Artifact and index payloads are protobuf-encoded bytes on the wire, but the
+client API exposes them as JS objects. A `TypeRegistryCache` (instantiated
+once per `ArtifactClient` and shared with every `Snapshot` / `Transaction`)
+resolves message types from descriptor sets returned by the server and
+performs decode/encode transparently.
+
+**Sources of truth (no client-side `protoc`):**
+- Artifact types: `GetTypeVersionResponse.descriptor_set`
+  (`google.protobuf.FileDescriptorSet`).
+- Index types: `GetIndexSchemaResponse.index_descriptor_set` plus
+  `key_message_name` and `index_message_name`.
+
+The client never parses `.proto` text — it consumes binary `FileDescriptorSet`s
+that the server has already compiled with `protoc`. This sidesteps protobufjs's
+historical issues with parsing custom options in `.proto` source. Custom
+options are not part of the payload wire format, so resolving message types via
+`protobuf.Root.fromDescriptor(...)` is sufficient for encode/decode.
+
+**version_id → type_name resolution.** `GetTypeVersionResponse` does not
+currently carry `type_name`. The client resolves it by reading the parent
+`TypeDefinition` artifact (whose `artifact_id == type_id`) using the built-in
+`TypeDefinition` message definition. The built-in definition is bundled into
+`proto/artifact_service.desc` by adding `artifact_types.proto` to the
+`generate-proto` script. Both `version_id → type_name` and
+`type_id → type_name` are cached. If a future server change adds `type_name`
+directly to `GetTypeVersionResponse`, the extra round trip can be removed.
+
+**Caches** (all process-lifetime, never invalidated):
+- `version_id → protobufjs.Root` (versions are immutable)
+- `version_id → type_name` (derived once, then memoized)
+- `type_id → type_name`
+- `key_type → { root, key_type_msg, index_type_msg, key_message_name, index_message_name }`
+  — TODO: revisit when index migrations are introduced.
+
+**Encoding direction.** Writes (`txn.create`, `txn.update`) accept JS objects
+and encode via the cache. `fetch_index` accepts a JS key object and encodes it
+using `key_message_name` from the index schema.
+
+**Field names preserve `.proto` source casing.** No layer in the pipeline
+normalizes or converts field names. The client reuses the
+`google.protobuf.FileDescriptorSet` Type from `_error_root` (which was built
+via `protobuf.Root.fromDescriptor` and therefore takes its field names
+verbatim from the binary `FieldDescriptorProto.name` strings — i.e. exactly
+as they appear in the `.proto` source). The cache re-encodes the
+`descriptor_set` JS object to bytes via that Type and feeds the bytes back
+into `protobuf.Root.fromDescriptor(buffer)`. The resulting user-message
+Types take their field names from the same source, so decoded payloads
+(`toObject(...)`) come back with whatever case the artifact's `.proto`
+declared — typically snake_case in this codebase, but the mechanism doesn't
+care. `@grpc/proto-loader` is also configured with `keepCase: true`, so
+descriptor metadata (`message_type`, `enum_type`, ...) is consistent
+across the proto-loader and protobufjs sides without a converter.
+
+**`TypeDecodeError`** is thrown when a referenced message name is not found
+in the descriptor set, when verification of an outgoing payload fails, or
+when descriptor data is missing/malformed.
+
 ## uint64 handling
 
 JavaScript `Number` cannot safely represent uint64 values (max safe integer is 2^53 - 1).
@@ -327,7 +386,8 @@ clients handle uint64 and avoids silent precision loss.
 ## Checklist
 - [ ] Directory structure and `package.json` created
 - [ ] `lib/retry.js` — exponential backoff with jitter
-- [ ] `lib/errors.js` — error classes + gRPC detail parsing (`grpc-status-details-bin`) + `TransactionSettledError`
+- [ ] `lib/errors.js` — error classes + gRPC detail parsing (`grpc-status-details-bin`) + `TransactionSettledError` + `TypeDecodeError`
+- [ ] `lib/type_registry.js` — version/type/index schema cache + decode/encode helpers
 - [ ] `lib/grpc_client.js` — proto loading, 4 service stubs, promisified RPCs
 - [ ] `lib/snapshot.js` — Snapshot class (primary read interface, long-lived)
 - [ ] `lib/transaction.js` — Transaction class (reads + writes, settled guard after callback)
