@@ -210,10 +210,9 @@ describe('Integration: Todo App', () => {
   // ─── 7. Unique index enforcement ───────────────────────────────────────
 
   it('rejects concurrent duplicate list names (unique index)', async () => {
-    // Unique index enforcement fires during commit-time 3-way merge.
-    // To trigger it, two transactions must both create the same key
-    // concurrently — i.e. they fork from the same base, each writes the
-    // same unique-key value, and the second commit detects the conflict.
+    // Two transactions fork from the same base and both create the same
+    // unique-key value.  The first commit succeeds; the second is
+    // rejected as a non-retryable conflict during the 3-way merge.
     //
     // We use the raw gRPC client to open two transactions explicitly
     // (the high-level client.transaction() auto-commits, which makes

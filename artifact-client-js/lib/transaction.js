@@ -1,6 +1,8 @@
 "use strict";
 
 const { TransactionSettledError } = require('./errors');
+
+const TO_OBJECT_OPTIONS = { longs: String, enums: String, defaults: true };
 const { Snapshot } = require('./snapshot');
 
 /**
@@ -119,10 +121,11 @@ class Transaction {
 
   async get_type_version (version_id) {
     this._assert_active();
-    return await this._grpc_client.get_type_version({
+    const response = await this._grpc_client.get_type_version({
       version_id,
       read_context: this._read_context(),
     });
+    return response.constructor.toObject(response, TO_OBJECT_OPTIONS);
   }
 
   async list_type_versions (type_name) {
@@ -136,10 +139,11 @@ class Transaction {
 
   async get_index_schema (key_type) {
     this._assert_active();
-    return await this._grpc_client.get_index_schema({
+    const response = await this._grpc_client.get_index_schema({
       key_type,
       read_context: this._read_context(),
     });
+    return response.constructor.toObject(response, TO_OBJECT_OPTIONS);
   }
 
   // ─────────────────────────────────────────────────────────────────────────
