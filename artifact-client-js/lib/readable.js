@@ -21,6 +21,12 @@ class Readable {
   }
 
   /**
+   * Lifecycle hook called at the start of every read method.  No-op by
+   * default; Transaction overrides this to throw TransactionSettledError.
+   */
+  _assert_active () {}
+
+  /**
    * Return the gRPC ReadContext for this reader.  Must be overridden by
    * subclasses.
    * @returns {{ snapshot_id?: string, transaction_id?: string }}
@@ -40,6 +46,7 @@ class Readable {
    * @throws {import('./errors').ArtifactNotFoundError} If the artifact does not exist.
    */
   async get (artifact_id) {
+    this._assert_active();
     const response = await this._grpc_client.get_artifact({
       artifact_id,
       context: this._read_context(),
@@ -66,6 +73,7 @@ class Readable {
    * @throws {TypeDecodeError} If an artifact has no payload.
    */
   async batch_get (artifact_ids) {
+    this._assert_active();
     const response = await this._grpc_client.batch_get_artifacts({
       artifact_ids,
       context: this._read_context(),
@@ -104,6 +112,7 @@ class Readable {
    * @throws {import('./errors').IndexFetchError} If the index entry does not exist.
    */
   async fetch_index (key_type, key) {
+    this._assert_active();
     const key_bytes = await this._type_registry.encode_index_key(
       key_type, key, this._read_context(),
     );
@@ -134,6 +143,7 @@ class Readable {
    * @returns {Promise<object>} Plain JS object with version metadata.
    */
   async get_type_version (version_id) {
+    this._assert_active();
     const response = await this._grpc_client.get_type_version({
       version_id,
       read_context: this._read_context(),
@@ -147,6 +157,7 @@ class Readable {
    * @returns {Promise<string[]>}
    */
   async list_type_versions (type_name) {
+    this._assert_active();
     const response = await this._grpc_client.list_type_versions({
       type_name,
       read_context: this._read_context(),
@@ -160,6 +171,7 @@ class Readable {
    * @returns {Promise<object>} Plain JS object with index schema.
    */
   async get_index_schema (key_type) {
+    this._assert_active();
     const response = await this._grpc_client.get_index_schema({
       key_type,
       read_context: this._read_context(),
