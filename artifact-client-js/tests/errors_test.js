@@ -16,32 +16,8 @@ const {
   parse_grpc_error,
   decode_rpc_status,
   extract_type_name,
-  _error_root,
 } = require('../lib/errors');
-
-/**
- * Encode a google.rpc.Status containing a single Any-wrapped detail message.
- */
-function encode_status_with_detail (grpc_code, message, type_name, detail_obj) {
-  const MessageType = _error_root.lookupType(type_name);
-  const detail_bytes = MessageType.encode(MessageType.fromObject(detail_obj)).finish();
-
-  const type_url = `type.googleapis.com/${type_name}`;
-
-  // Manually encode google.protobuf.Any: field 1 = type_url, field 2 = value
-  const any_writer = protobuf.Writer.create();
-  any_writer.uint32(10).string(type_url); // field 1, wire type 2
-  any_writer.uint32(18).bytes(detail_bytes); // field 2, wire type 2
-  const any_bytes = any_writer.finish();
-
-  // Manually encode google.rpc.Status: field 1 = code, field 2 = message, field 3 = details
-  const status_writer = protobuf.Writer.create();
-  status_writer.uint32(8).int32(grpc_code); // field 1, wire type 0
-  status_writer.uint32(18).string(message); // field 2, wire type 2
-  status_writer.uint32(26).bytes(any_bytes); // field 3, wire type 2
-
-  return status_writer.finish();
-}
+const { encode_error_detail } = require('./mock_server');
 
 function make_grpc_error (code, message, status_bytes) {
   const err = new Error(message);
@@ -71,7 +47,7 @@ describe('extract_type_name', () => {
 
 describe('decode_rpc_status', () => {
   it('decodes a status with code, message, and details', () => {
-    const status_bytes = encode_status_with_detail(
+    const status_bytes = encode_error_detail(
       grpc.status.NOT_FOUND,
       'not found',
       'artifact_system.ArtifactNotFoundError',
@@ -87,7 +63,7 @@ describe('decode_rpc_status', () => {
 
 describe('parse_grpc_error', () => {
   it('parses ArtifactNotFoundError', () => {
-    const status_bytes = encode_status_with_detail(
+    const status_bytes = encode_error_detail(
       grpc.status.NOT_FOUND,
       'artifact not found',
       'artifact_system.ArtifactNotFoundError',
@@ -107,7 +83,7 @@ describe('parse_grpc_error', () => {
   });
 
   it('parses WriteValidationError (ArtifactWriteError)', () => {
-    const status_bytes = encode_status_with_detail(
+    const status_bytes = encode_error_detail(
       grpc.status.INVALID_ARGUMENT,
       'validation failed',
       'artifact_system.ArtifactWriteError',
@@ -128,7 +104,7 @@ describe('parse_grpc_error', () => {
   });
 
   it('parses ConflictError (CommitConflict)', () => {
-    const status_bytes = encode_status_with_detail(
+    const status_bytes = encode_error_detail(
       grpc.status.ABORTED,
       'commit conflict',
       'artifact_system.CommitConflict',
@@ -150,7 +126,7 @@ describe('parse_grpc_error', () => {
   });
 
   it('parses TransactionError (SnapshotTransactionError)', () => {
-    const status_bytes = encode_status_with_detail(
+    const status_bytes = encode_error_detail(
       grpc.status.NOT_FOUND,
       'transaction not found',
       'artifact_system.SnapshotTransactionError',
@@ -167,7 +143,7 @@ describe('parse_grpc_error', () => {
   });
 
   it('parses IndexFetchError (FetchIndexError)', () => {
-    const status_bytes = encode_status_with_detail(
+    const status_bytes = encode_error_detail(
       grpc.status.NOT_FOUND,
       'index not found',
       'artifact_system.FetchIndexError',
@@ -184,7 +160,7 @@ describe('parse_grpc_error', () => {
   });
 
   it('parses TypeRegistrationError (RegisterTypeVersionError)', () => {
-    const status_bytes = encode_status_with_detail(
+    const status_bytes = encode_error_detail(
       grpc.status.INVALID_ARGUMENT,
       'registration failed',
       'artifact_system.RegisterTypeVersionError',
