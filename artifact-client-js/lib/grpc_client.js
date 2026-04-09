@@ -139,11 +139,11 @@ class ArtifactGrpcClient {
   }
 
   commit_transaction (request) {
-    return this._call(this._snapshot_transaction_client, 'CommitTransaction', request);
+    return this._call_once(this._snapshot_transaction_client, 'CommitTransaction', request);
   }
 
   rollback_transaction (request) {
-    return this._call(this._snapshot_transaction_client, 'RollbackTransaction', request);
+    return this._call_once(this._snapshot_transaction_client, 'RollbackTransaction', request);
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -151,7 +151,7 @@ class ArtifactGrpcClient {
   // ─────────────────────────────────────────────────────────────────────────
 
   create_artifact (request) {
-    return this._call(this._artifact_client, 'CreateArtifact', request);
+    return this._call_once(this._artifact_client, 'CreateArtifact', request);
   }
 
   get_artifact (request) {
@@ -163,11 +163,11 @@ class ArtifactGrpcClient {
   }
 
   update_artifact (request) {
-    return this._call(this._artifact_client, 'UpdateArtifact', request);
+    return this._call_once(this._artifact_client, 'UpdateArtifact', request);
   }
 
   delete_artifact (request) {
-    return this._call(this._artifact_client, 'DeleteArtifact', request);
+    return this._call_once(this._artifact_client, 'DeleteArtifact', request);
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -183,7 +183,7 @@ class ArtifactGrpcClient {
   // ─────────────────────────────────────────────────────────────────────────
 
   register_type_version (request) {
-    return this._call(this._type_registry_client, 'RegisterTypeVersion', request);
+    return this._call_once(this._type_registry_client, 'RegisterTypeVersion', request);
   }
 
   get_type_version (request) {
@@ -250,6 +250,33 @@ class ArtifactGrpcClient {
         );
       });
     }, this.retry_options);
+  }
+
+  /**
+   * Make a single-attempt unary RPC call with no retry.  Used for
+   * non-idempotent write operations (create, update, delete, commit) where
+   * retrying after a server-side success with a lost response would cause
+   * incorrect behavior (duplicates, false failures, etc.).
+   */
+  _call_once (client, method, request) {
+    if (!this._connected) {
+      throw new Error('Client is not connected. Call connect() first.');
+    }
+
+    const deadline = new Date(Date.now() + this.call_timeout_ms);
+    return new Promise((resolve, reject) => {
+      client[method](request, { deadline }, (err, response) => {
+        if (err) {
+          try {
+            parse_grpc_error(err);
+          } catch (parsed) {
+            return reject(parsed);
+          }
+          return reject(err); // defensive: parse_grpc_error should always throw
+        }
+        resolve(response);
+      });
+    });
   }
 
   /**
