@@ -3,6 +3,7 @@
 const { ArtifactGrpcClient } = require('./grpc_client');
 const { Snapshot } = require('./snapshot');
 const { Transaction } = require('./transaction');
+const { TypeRegistryCache } = require('./type_registry');
 
 /**
  * ArtifactClient is the public entry point for the Artifact Layer.
@@ -21,6 +22,7 @@ class ArtifactClient {
       throw new Error('service_address is required');
     }
     this._grpc_client = new ArtifactGrpcClient(options);
+    this._type_registry = new TypeRegistryCache(this._grpc_client);
   }
 
   async initialize () {
@@ -37,7 +39,7 @@ class ArtifactClient {
    */
   async snapshot () {
     const response = await this._grpc_client.create_snapshot({});
-    return new Snapshot(this._grpc_client, response.snapshot_id);
+    return new Snapshot(this._grpc_client, this._type_registry, response.snapshot_id);
   }
 
   /**
@@ -61,7 +63,9 @@ class ArtifactClient {
     }
 
     const create_response = await this._grpc_client.create_transaction(create_request);
-    const txn = new Transaction(this._grpc_client, create_response.transaction_id);
+    const txn = new Transaction(
+      this._grpc_client, this._type_registry, create_response.transaction_id,
+    );
 
     try {
       const value = await callback(txn);

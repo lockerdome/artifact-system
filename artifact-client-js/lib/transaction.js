@@ -9,14 +9,19 @@ const { Snapshot } = require('./snapshot');
  *
  * The Transaction does NOT call commit/rollback itself — that is the
  * responsibility of the client.transaction() wrapper.
+ *
+ * Artifact and index payloads are decoded from / encoded to bytes via the
+ * shared TypeRegistryCache.  Callers pass and receive JS objects.
  */
 class Transaction {
   /**
    * @param {import('./grpc_client').ArtifactGrpcClient} grpc_client
+   * @param {import('./type_registry').TypeRegistryCache} type_registry
    * @param {string} transaction_id
    */
-  constructor (grpc_client, transaction_id) {
+  constructor (grpc_client, type_registry, transaction_id) {
     this._grpc_client = grpc_client;
+    this._type_registry = type_registry;
     this._transaction_id = transaction_id;
     this._settled = false;
   }
@@ -45,11 +50,17 @@ class Transaction {
       artifact_id,
       context: this._read_context(),
     });
+    const payload = await this._type_registry.decode_artifact_payload(
+      response.version_id,
+      response.type_name,
+      response.payload,
+      this._read_context(),
+    );
     return {
       artifact_id: response.artifact_id,
       type_name: response.type_name,
       version_id: response.version_id,
-      payload: response.payload,
+      payload,
     };
   }
 
@@ -59,17 +70,21 @@ class Transaction {
       artifact_ids,
       context: this._read_context(),
     });
-    return response.results.map((result) => {
-      if (result.artifact) {
-        return {
-          artifact_id: result.artifact.artifact_id,
-          type_name: result.artifact.type_name,
-          version_id: result.artifact.version_id,
-          payload: result.artifact.payload,
-        };
-      }
-      return null;
-    });
+    return await Promise.all(response.results.map(async (result) => {
+      if (!result.artifact) return null;
+      const payload = await this._type_registry.decode_artifact_payload(
+        result.artifact.version_id,
+        result.artifact.type_name,
+        result.artifact.payload,
+        this._read_context(),
+      );
+      return {
+        artifact_id: result.artifact.artifact_id,
+        type_name: result.artifact.type_name,
+        version_id: result.artifact.version_id,
+        payload,
+      };
+    }));
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -78,13 +93,22 @@ class Transaction {
 
   async fetch_index (key_type, key) {
     this._assert_active();
+    const key_bytes = await this._type_registry.encode_index_key(
+      key_type, key, this._read_context(),
+    );
     const response = await this._grpc_client.fetch_index({
       key_type,
-      key,
+      key: key_bytes,
       context: this._read_context(),
     });
+    const index_payload = await this._type_registry.decode_index_payload(
+      key_type,
+      response.index_message_name,
+      response.index_payload,
+      this._read_context(),
+    );
     return {
-      index_payload: response.index_payload,
+      index_payload,
       index_message_name: response.index_message_name,
     };
   }
@@ -95,18 +119,27 @@ class Transaction {
 
   async get_type_version (version_id) {
     this._assert_active();
-    return await this._grpc_client.get_type_version({ version_id });
+    return await this._grpc_client.get_type_version({
+      version_id,
+      read_context: this._read_context(),
+    });
   }
 
   async list_type_versions (type_name) {
     this._assert_active();
-    const response = await this._grpc_client.list_type_versions({ type_name });
+    const response = await this._grpc_client.list_type_versions({
+      type_name,
+      read_context: this._read_context(),
+    });
     return response.version_ids;
   }
 
   async get_index_schema (key_type) {
     this._assert_active();
-    return await this._grpc_client.get_index_schema({ key_type });
+    return await this._grpc_client.get_index_schema({
+      key_type,
+      read_context: this._read_context(),
+    });
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -115,9 +148,12 @@ class Transaction {
 
   async create (version_id, payload) {
     this._assert_active();
+    const { payload_bytes } = await this._type_registry.encode_artifact_payload(
+      version_id, payload, this._read_context(),
+    );
     const response = await this._grpc_client.create_artifact({
       version_id,
-      payload,
+      payload: payload_bytes,
       transaction_id: this._transaction_id,
     });
     return {
@@ -128,10 +164,13 @@ class Transaction {
 
   async update (artifact_id, version_id, payload) {
     this._assert_active();
+    const { payload_bytes } = await this._type_registry.encode_artifact_payload(
+      version_id, payload, this._read_context(),
+    );
     const response = await this._grpc_client.update_artifact({
       artifact_id,
       version_id,
-      payload,
+      payload: payload_bytes,
       transaction_id: this._transaction_id,
     });
     return { snapshot_id: response.snapshot_id };
@@ -152,7 +191,11 @@ class Transaction {
 
   async register_type (type_name, proto_source, options = {}) {
     this._assert_active();
-    const request = { type_name, proto_source };
+    const request = {
+      type_name,
+      proto_source,
+      transaction_id: this._transaction_id,
+    };
     if (options.deny_create != null) request.deny_create = options.deny_create;
     if (options.deny_update != null) request.deny_update = options.deny_update;
     if (options.deny_delete != null) request.deny_delete = options.deny_delete;
@@ -169,7 +212,7 @@ class Transaction {
     const response = await this._grpc_client.create_snapshot({
       parent_transaction_id: this._transaction_id,
     });
-    return new Snapshot(this._grpc_client, response.snapshot_id);
+    return new Snapshot(this._grpc_client, this._type_registry, response.snapshot_id);
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -182,7 +225,9 @@ class Transaction {
     const response = await this._grpc_client.create_transaction({
       parent_transaction_id: this._transaction_id,
     });
-    const sub_txn = new Transaction(this._grpc_client, response.transaction_id);
+    const sub_txn = new Transaction(
+      this._grpc_client, this._type_registry, response.transaction_id,
+    );
 
     try {
       const value = await callback(sub_txn);
