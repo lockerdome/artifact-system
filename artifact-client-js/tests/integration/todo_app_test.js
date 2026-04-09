@@ -8,6 +8,7 @@ const grpc = require('@grpc/grpc-js');
 const {
   ArtifactClient,
   ArtifactNotFoundError,
+  ConflictError,
 } = require('../../lib/index');
 const { start_server } = require('./server_harness');
 
@@ -208,30 +209,58 @@ describe('Integration: Todo App', () => {
 
   // ─── 7. Unique index enforcement ───────────────────────────────────────
 
-  // TODO: unique index enforcement is not yet implemented on the server.
-  // Re-enable once the server rejects duplicate keys on unique indexes.
-  it('rejects duplicate list names (unique index)', { todo: 'server does not enforce unique indexes yet' }, async () => {
-    // Create a list
-    await client.transaction(async (txn) => {
-      await txn.create(list_version_id, {
-        name: 'Unique Test',
-        description: 'first',
-      });
+  it('rejects concurrent duplicate list names (unique index)', async () => {
+    // Unique index enforcement fires during commit-time 3-way merge.
+    // To trigger it, two transactions must both create the same key
+    // concurrently — i.e. they fork from the same base, each writes the
+    // same unique-key value, and the second commit detects the conflict.
+    //
+    // We use the raw gRPC client to open two transactions explicitly
+    // (the high-level client.transaction() auto-commits, which makes
+    // real concurrency awkward).
+    const grpc_client = client._grpc_client;
+    const type_registry = client._type_registry;
+
+    const tx1 = await grpc_client.create_transaction({});
+    const tx2 = await grpc_client.create_transaction({});
+
+    // Both transactions create a list with the same name.
+    const read_ctx = { transaction_id: tx1.transaction_id };
+    const { payload_bytes } = await type_registry.encode_artifact_payload(
+      list_version_id,
+      { name: 'Concurrent Dup', description: 'tx1' },
+      read_ctx,
+    );
+
+    await grpc_client.create_artifact({
+      version_id: list_version_id,
+      payload: payload_bytes,
+      transaction_id: tx1.transaction_id,
+    });
+    await grpc_client.create_artifact({
+      version_id: list_version_id,
+      payload: payload_bytes,
+      transaction_id: tx2.transaction_id,
     });
 
-    // Attempt to create another list with the same name
+    // First commit succeeds.
+    await grpc_client.commit_transaction({
+      transaction_id: tx1.transaction_id,
+    });
+
+    // Second commit should fail: the unique index key now has concurrent
+    // modifications from both branches, and the conflict resolver
+    // classifies unique index conflicts as non-retryable.
     await assert.rejects(
-      () => client.transaction(async (txn) => {
-        await txn.create(list_version_id, {
-          name: 'Unique Test',
-          description: 'duplicate',
-        });
+      () => grpc_client.commit_transaction({
+        transaction_id: tx2.transaction_id,
       }),
       (err) => {
         assert.ok(
-          err.code != null,
-          `expected a gRPC error with a code, got: ${err.name}: ${err.message}`,
+          err instanceof ConflictError,
+          `expected ConflictError, got: ${err.name}: ${err.message}`,
         );
+        assert.strictEqual(err.detail.retryable, false);
         return true;
       },
     );
