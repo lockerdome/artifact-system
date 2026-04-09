@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <cstdlib>
 #include <print>
 #include <thread>
 
@@ -16,7 +17,11 @@ void SignalHandler(int) {
 
 int main() {
   artifact_system::service::ServerConfig config;
-  // TODO: parse config from flags/env
+
+  const char* listen_address = std::getenv("ARTIFACT_LAYER_LISTEN_ADDRESS");
+  if (listen_address && listen_address[0] != '\0') {
+    config.listen_address = listen_address;
+  }
 
   artifact_system::service::ArtifactLayerServer server(config);
 
