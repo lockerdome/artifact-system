@@ -265,4 +265,36 @@ describe('Integration: Todo App', () => {
       },
     );
   });
+
+  // ─── 8. Sequential unique index enforcement ─────────────────────────────
+
+  it('rejects sequential duplicate list names (unique index)', async () => {
+    // Unlike the concurrent case above, this tests that the server also
+    // rejects a duplicate unique-key value when the second create happens
+    // in a transaction that forked *after* the first committed — i.e.
+    // there is no concurrent modification, just a write that would produce
+    // two entries under the same unique key.
+    await client.transaction(async (txn) => {
+      await txn.create(list_version_id, {
+        name: 'Sequential Dup',
+        description: 'first',
+      });
+    });
+
+    await assert.rejects(
+      () => client.transaction(async (txn) => {
+        await txn.create(list_version_id, {
+          name: 'Sequential Dup',
+          description: 'second',
+        });
+      }),
+      (err) => {
+        assert.ok(
+          err.code != null,
+          `expected a gRPC error, got: ${err.name}: ${err.message}`,
+        );
+        return true;
+      },
+    );
+  });
 });
