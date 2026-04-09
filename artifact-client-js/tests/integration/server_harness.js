@@ -3,6 +3,8 @@
 const { spawn } = require('child_process');
 const path = require('path');
 
+const STARTUP_TIMEOUT_MS = parseInt(process.env.ARTIFACT_LAYER_STARTUP_TIMEOUT_MS, 10) || 30000;
+
 const DEFAULT_BINARY_PATH = path.resolve(
   __dirname, '..', '..', '..', '..', 'artifact-system', 'artifact-layer',
   'build', 'release', 'artifact_layer_service',
@@ -30,7 +32,19 @@ function start_server () {
     });
 
     let stdout_buffer = '';
+    let stderr_buffer = '';
     let resolved = false;
+
+    const timeout_id = setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        server_process.kill('SIGKILL');
+        reject(new Error(
+          `artifact-layer server did not report LISTENING_PORT within ${STARTUP_TIMEOUT_MS}ms.\n` +
+          `stdout: ${stdout_buffer}\nstderr: ${stderr_buffer}`,
+        ));
+      }
+    }, STARTUP_TIMEOUT_MS);
 
     server_process.stdout.on('data', (data) => {
       stdout_buffer += data.toString();
@@ -38,6 +52,7 @@ function start_server () {
         const match = stdout_buffer.match(/^LISTENING_PORT=(\d+)/m);
         if (match) {
           resolved = true;
+          clearTimeout(timeout_id);
           const port = parseInt(match[1], 10);
           const address = `127.0.0.1:${port}`;
           resolve({
@@ -55,19 +70,22 @@ function start_server () {
       }
     });
 
-    let stderr_buffer = '';
     server_process.stderr.on('data', (data) => {
       stderr_buffer += data.toString();
     });
 
     server_process.on('error', (err) => {
       if (!resolved) {
+        resolved = true;
+        clearTimeout(timeout_id);
         reject(new Error(`Failed to spawn artifact-layer server at ${binary_path}: ${err.message}`));
       }
     });
 
     server_process.on('exit', (code) => {
       if (!resolved) {
+        resolved = true;
+        clearTimeout(timeout_id);
         reject(new Error(
           `artifact-layer server exited (code ${code}) before reporting ` +
           `LISTENING_PORT.\nstdout: ${stdout_buffer}\nstderr: ${stderr_buffer}`,

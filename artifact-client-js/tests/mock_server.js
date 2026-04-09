@@ -621,4 +621,4 @@ class MockArtifactServer {
   }
 }
 
-module.exports = { MockArtifactServer, make_grpc_error_with_detail };
+module.exports = { MockArtifactServer, make_grpc_error_with_detail, encode_error_detail };

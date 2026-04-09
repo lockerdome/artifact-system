@@ -11,17 +11,15 @@ const { TypeDecodeError, _error_root } = require('./errors');
  */
 const _TypeDefinitionType = _error_root.lookupType('artifact_system.TypeDefinition');
 
+const TO_OBJECT_OPTIONS = { longs: String, enums: String, defaults: true };
+
 /**
  * Decode a TypeDefinition payload (raw bytes from a GetArtifact response on
  * a TypeDefinition artifact) and return the JS object form.
  */
 function _decode_type_definition (payload_bytes) {
   const decoded = _TypeDefinitionType.decode(payload_bytes);
-  return _TypeDefinitionType.toObject(decoded, {
-    longs: String,
-    enums: String,
-    defaults: true,
-  });
+  return _TypeDefinitionType.toObject(decoded, TO_OBJECT_OPTIONS);
 }
 
 /**
@@ -30,16 +28,17 @@ function _decode_type_definition (payload_bytes) {
  * ArtifactClient's Snapshot and Transaction objects.
  *
  * Caches:
- *   - _version_root_cache:    version_id (string) → protobufjs.Root
- *   - _version_type_name_cache: version_id (string) → string (type_name)
- *   - _type_definition_name_cache: type_id (string) → string (type_name)
- *   - _index_schema_cache:    key_type (string) → { root, key_message_name,
- *                                                   index_message_name }
+ *   - _version_root_cache:    version_id (string) → Promise<protobufjs.Root>
+ *   - _version_type_id_cache: version_id (string) → Promise<string> (type_id)
+ *   - _version_type_name_cache: version_id (string) → Promise<string> (type_name)
+ *   - _type_definition_name_cache: type_id (string) → Promise<string> (type_name)
+ *   - _index_schema_cache:    key_type (string) → Promise<{ root, key_message_name,
+ *                                                   index_message_name }>
  *
  * version_ids and type_ids are immutable in the artifact system, so the type
- * caches never need invalidation.  Index schemas are not yet versioned;
- * the index cache is therefore also never invalidated.  TODO: revisit when
- * index migrations are introduced.
+ * caches never need invalidation.  The index schema cache is keyed on
+ * key_type and is valid for the lifetime of the client, since index schemas
+ * don't change within a running process.
  */
 class TypeRegistryCache {
   /**
@@ -48,9 +47,33 @@ class TypeRegistryCache {
   constructor (grpc_client) {
     this._grpc_client = grpc_client;
     this._version_root_cache = new Map();
+    this._version_type_id_cache = new Map();
     this._version_type_name_cache = new Map();
     this._type_definition_name_cache = new Map();
     this._index_schema_cache = new Map();
+  }
+
+  /**
+   * Generic cache-warming helper.  Stores the promise returned by `fetch_fn`
+   * in `cache` under `key` so that concurrent callers share one in-flight
+   * operation.  On failure the entry is evicted so the next caller retries.
+   *
+   * @param {Map} cache
+   * @param {string} key
+   * @param {function(): Promise} fetch_fn
+   * @returns {Promise<*>}
+   */
+  async _cached_fetch (cache, key, fetch_fn) {
+    const cached = cache.get(key);
+    if (cached) return cached;
+    const promise = fetch_fn();
+    cache.set(key, promise);
+    try {
+      return await promise;
+    } catch (err) {
+      cache.delete(key);
+      throw err;
+    }
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -60,15 +83,27 @@ class TypeRegistryCache {
   /**
    * Resolve a `version_id` to a protobufjs Root containing all messages
    * declared in that version's descriptor set.  Cached after first lookup.
+   * The cache stores promises so concurrent callers share one in-flight RPC.
    *
    * @param {string} version_id
    * @param {object} read_context  ReadContext used for the GetTypeVersion call.
    * @returns {Promise<protobuf.Root>}
    */
-  async _get_root_for_version (version_id, read_context) {
-    const cached = this._version_root_cache.get(version_id);
-    if (cached) return cached;
+  _get_root_for_version (version_id, read_context) {
+    return this._cached_fetch(this._version_root_cache, version_id,
+      () => this._fetch_root_for_version(version_id, read_context));
+  }
 
+  /**
+   * Fetch the protobufjs Root for a version_id from the server.  Also
+   * opportunistically caches the type_id from the response so that
+   * _get_type_name_for_version can skip a redundant RPC.
+   *
+   * @param {string} version_id
+   * @param {object} read_context
+   * @returns {Promise<protobuf.Root>}
+   */
+  async _fetch_root_for_version (version_id, read_context) {
     const response = await this._grpc_client.get_type_version({
       version_id,
       read_context,
@@ -89,12 +124,10 @@ class TypeRegistryCache {
     const fds_bytes = fds_type.encode(response.descriptor_set).finish();
     const root = protobuf.Root.fromDescriptor(fds_bytes);
 
-    this._version_root_cache.set(version_id, root);
-
-    // Opportunistically cache type_id → type_name discovered from this
-    // version, since GetTypeVersionResponse carries type_id.
+    // Opportunistically cache the type_id so _get_type_name_for_version
+    // can skip a redundant GetTypeVersion RPC.
     if (response.type_id != null) {
-      // No type_name yet — populated lazily by _get_type_name_for_version.
+      this._version_type_id_cache.set(version_id, Promise.resolve(String(response.type_id)));
     }
 
     return root;
@@ -107,46 +140,61 @@ class TypeRegistryCache {
    * and read its `type_name` field.
    *
    * Both `version_id → type_name` and `type_id → type_name` are cached.
+   * The cache stores promises so concurrent callers share one in-flight fetch.
    *
    * @param {string} version_id
    * @param {object} read_context
    * @returns {Promise<string>}
    */
-  async _get_type_name_for_version (version_id, read_context) {
-    const cached_name = this._version_type_name_cache.get(version_id);
-    if (cached_name) return cached_name;
+  _get_type_name_for_version (version_id, read_context) {
+    return this._cached_fetch(this._version_type_name_cache, version_id,
+      () => this._fetch_type_name_for_version(version_id, read_context));
+  }
 
-    // GetTypeVersion gives us the type_id for this version.
-    const version_response = await this._grpc_client.get_type_version({
-      version_id,
-      read_context,
+  /**
+   * Resolve version_id → type_id.  Uses _version_type_id_cache, which is
+   * also opportunistically populated by _fetch_root_for_version.
+   */
+  _get_type_id_for_version (version_id, read_context) {
+    return this._cached_fetch(this._version_type_id_cache, version_id, async () => {
+      const response = await this._grpc_client.get_type_version({
+        version_id,
+        read_context,
+      });
+      if (response.type_id == null) {
+        throw new TypeDecodeError(
+          `GetTypeVersion(${version_id}) returned no type_id`,
+        );
+      }
+      return String(response.type_id);
     });
-    const type_id = version_response.type_id;
-    if (type_id == null) {
-      throw new TypeDecodeError(
-        `GetTypeVersion(${version_id}) returned no type_id`,
-      );
-    }
+  }
 
-    const type_id_str = String(type_id);
-    let type_name = this._type_definition_name_cache.get(type_id_str);
-    if (!type_name) {
+  /**
+   * Resolve type_id → type_name by fetching the TypeDefinition artifact.
+   */
+  _get_type_name_for_type_id (type_id_str, read_context) {
+    return this._cached_fetch(this._type_definition_name_cache, type_id_str, async () => {
       const type_def_artifact = await this._grpc_client.get_artifact({
         artifact_id: type_id_str,
         context: read_context,
       });
       const type_def = _decode_type_definition(type_def_artifact.payload);
-      type_name = type_def.type_name;
-      if (!type_name) {
+      if (!type_def.type_name) {
         throw new TypeDecodeError(
           `TypeDefinition artifact ${type_id_str} has no type_name`,
         );
       }
-      this._type_definition_name_cache.set(type_id_str, type_name);
-    }
+      return type_def.type_name;
+    });
+  }
 
-    this._version_type_name_cache.set(version_id, type_name);
-    return type_name;
+  /**
+   * Resolve version_id → type_name by chaining type_id lookup → type_name lookup.
+   */
+  async _fetch_type_name_for_version (version_id, read_context) {
+    const type_id_str = await this._get_type_id_for_version(version_id, read_context);
+    return this._get_type_name_for_type_id(type_id_str, read_context);
   }
 
   /**
@@ -186,11 +234,7 @@ class TypeRegistryCache {
       version_id, type_name, read_context,
     );
     const decoded = message_type.decode(payload_bytes);
-    return message_type.toObject(decoded, {
-      longs: String,
-      enums: String,
-      defaults: true,
-    });
+    return message_type.toObject(decoded, TO_OBJECT_OPTIONS);
   }
 
   /**
@@ -223,10 +267,11 @@ class TypeRegistryCache {
 
   /**
    * Resolve an index `key_type` to its protobufjs types for the index key
-   * and index value messages.  Cached after first lookup.
+   * and index value messages.  Cached after first lookup.  The cache stores
+   * promises so concurrent callers share one in-flight RPC.
    *
-   * NOTE: index schemas are not yet versioned in the artifact system.  This
-   * cache is never invalidated.  Revisit when index migrations are added.
+   * The cache is keyed on key_type and is valid for the lifetime of the
+   * client, since index schemas don't change within a running process.
    *
    * @param {string} key_type
    * @param {object} read_context
@@ -238,10 +283,25 @@ class TypeRegistryCache {
    *   index_type_msg: protobuf.Type,
    * }>}
    */
-  async _get_index_schema (key_type, read_context) {
-    const cached = this._index_schema_cache.get(key_type);
-    if (cached) return cached;
+  _get_index_schema (key_type, read_context) {
+    return this._cached_fetch(this._index_schema_cache, key_type,
+      () => this._fetch_index_schema(key_type, read_context));
+  }
 
+  /**
+   * Fetch the index schema for a key_type from the server.
+   *
+   * @param {string} key_type
+   * @param {object} read_context
+   * @returns {Promise<{
+   *   root: protobuf.Root,
+   *   key_message_name: string,
+   *   index_message_name: string,
+   *   key_type_msg: protobuf.Type,
+   *   index_type_msg: protobuf.Type,
+   * }>}
+   */
+  async _fetch_index_schema (key_type, read_context) {
     const response = await this._grpc_client.get_index_schema({
       key_type,
       read_context,
@@ -277,15 +337,13 @@ class TypeRegistryCache {
       );
     }
 
-    const entry = {
+    return {
       root,
       key_message_name: response.key_message_name,
       index_message_name: response.index_message_name,
       key_type_msg,
       index_type_msg,
     };
-    this._index_schema_cache.set(key_type, entry);
-    return entry;
   }
 
   /**
@@ -334,11 +392,7 @@ class TypeRegistryCache {
     }
 
     const decoded = index_type_msg.decode(index_payload_bytes);
-    return index_type_msg.toObject(decoded, {
-      longs: String,
-      enums: String,
-      defaults: true,
-    });
+    return index_type_msg.toObject(decoded, TO_OBJECT_OPTIONS);
   }
 }
 

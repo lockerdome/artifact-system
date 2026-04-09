@@ -4,8 +4,10 @@ const fs = require('fs');
 const path = require('path');
 const grpc = require('@grpc/grpc-js');
 const protoLoader = require('@grpc/proto-loader');
-const { retry_with_backoff, is_retryable } = require('./retry');
+const { retry_with_backoff, is_retryable, DEFAULT_RETRY_OPTIONS } = require('./retry');
 const { parse_grpc_error, _error_root } = require('./errors');
+
+const DEFAULT_CALL_TIMEOUT_MS = 30000;
 
 const DESCRIPTOR_PATH = path.resolve(__dirname, '../proto/artifact_service.desc');
 
@@ -43,12 +45,6 @@ function _protobuf_deserialize (MessageType) {
   return (bytes) => MessageType.decode(bytes);
 }
 
-const DEFAULT_RETRY_OPTIONS = {
-  max_retries: 5,
-  base_delay_ms: 100,
-  max_delay_ms: 10000,
-};
-
 /**
  * Low-level gRPC transport for the Artifact Layer's four services.
  * Loads protos, creates stubs, promisifies RPCs, and handles error parsing.
@@ -59,6 +55,7 @@ class ArtifactGrpcClient {
    * @param {string} options.service_address - gRPC endpoint (host:port).
    * @param {object} [options.retry] - Retry options for transient errors.
    * @param {object} [options.channel_credentials] - gRPC channel credentials.
+   * @param {number} [options.call_timeout_ms] - Per-call gRPC deadline in milliseconds (default: 30000).
    */
   constructor (options) {
     if (!options || !options.service_address) {
@@ -68,6 +65,7 @@ class ArtifactGrpcClient {
     this.service_address = options.service_address;
     this.retry_options = { ...DEFAULT_RETRY_OPTIONS, ...options.retry };
     this.channel_credentials = options.channel_credentials ?? grpc.credentials.createInsecure();
+    this.call_timeout_ms = options.call_timeout_ms ?? DEFAULT_CALL_TIMEOUT_MS;
 
     this._snapshot_transaction_client = null;
     this._artifact_client = null;
@@ -76,7 +74,7 @@ class ArtifactGrpcClient {
     this._connected = false;
   }
 
-  async connect () {
+  connect () {
     if (this._connected) return;
 
     const descriptor_bytes = fs.readFileSync(DESCRIPTOR_PATH);
@@ -90,17 +88,27 @@ class ArtifactGrpcClient {
     const proto = grpc.loadPackageDefinition(package_definition);
     const pkg = proto.artifact_system;
 
+    // Create the first client normally — it owns the underlying gRPC channel.
+    // All remaining clients reuse that channel via channelOverride so that the
+    // four service stubs share a single HTTP/2 connection instead of each
+    // opening its own TCP connection.
     this._snapshot_transaction_client = new pkg.SnapshotTransactionService(
       this.service_address, this.channel_credentials,
     );
+
+    const shared_channel = this._snapshot_transaction_client.getChannel();
+
     this._artifact_client = new pkg.ArtifactService(
       this.service_address, this.channel_credentials,
+      { channelOverride: shared_channel },
     );
     this._index_client = new pkg.IndexService(
       this.service_address, this.channel_credentials,
+      { channelOverride: shared_channel },
     );
     this._type_registry_client = new pkg.TypeRegistryService(
       this.service_address, this.channel_credentials,
+      { channelOverride: shared_channel },
     );
 
     this._connected = true;
@@ -131,11 +139,11 @@ class ArtifactGrpcClient {
   }
 
   commit_transaction (request) {
-    return this._call(this._snapshot_transaction_client, 'CommitTransaction', request);
+    return this._invoke(this._snapshot_transaction_client, 'CommitTransaction', request);
   }
 
   rollback_transaction (request) {
-    return this._call(this._snapshot_transaction_client, 'RollbackTransaction', request);
+    return this._invoke(this._snapshot_transaction_client, 'RollbackTransaction', request);
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -143,7 +151,7 @@ class ArtifactGrpcClient {
   // ─────────────────────────────────────────────────────────────────────────
 
   create_artifact (request) {
-    return this._call(this._artifact_client, 'CreateArtifact', request);
+    return this._invoke(this._artifact_client, 'CreateArtifact', request);
   }
 
   get_artifact (request) {
@@ -155,11 +163,11 @@ class ArtifactGrpcClient {
   }
 
   update_artifact (request) {
-    return this._call(this._artifact_client, 'UpdateArtifact', request);
+    return this._invoke(this._artifact_client, 'UpdateArtifact', request);
   }
 
   delete_artifact (request) {
-    return this._call(this._artifact_client, 'DeleteArtifact', request);
+    return this._invoke(this._artifact_client, 'DeleteArtifact', request);
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -175,7 +183,7 @@ class ArtifactGrpcClient {
   // ─────────────────────────────────────────────────────────────────────────
 
   register_type_version (request) {
-    return this._call(this._type_registry_client, 'RegisterTypeVersion', request);
+    return this._invoke(this._type_registry_client, 'RegisterTypeVersion', request);
   }
 
   get_type_version (request) {
@@ -207,66 +215,80 @@ class ArtifactGrpcClient {
   // ─────────────────────────────────────────────────────────────────────────
 
   /**
-   * Make a unary RPC call using protobufjs serialization (bypassing
-   * proto-loader).  Used for RPCs whose responses contain descriptor set
-   * sub-messages — see the module-level comment for rationale.
+   * Build a gRPC callback that resolves/rejects a promise, parsing errors
+   * into typed ArtifactErrors.
    */
-  _call_raw (client, method_path, RequestType, ResponseType, request) {
-    if (!this._connected) {
-      throw new Error('Client is not connected. Call connect() first.');
-    }
-
-    return retry_with_backoff(() => {
-      return new Promise((resolve, reject) => {
-        client.makeUnaryRequest(
-          method_path,
-          _protobuf_serialize(RequestType),
-          _protobuf_deserialize(ResponseType),
-          request,
-          (err, response) => {
-            if (err) {
-              if (is_retryable(err)) {
-                return reject(err);
-              }
-              try {
-                parse_grpc_error(err);
-              } catch (parsed) {
-                return reject(parsed);
-              }
-            }
-            resolve(response);
-          },
-        );
-      });
-    }, this.retry_options);
+  _create_invoke_callback (resolve, reject) {
+    return (err, response) => {
+      if (err) {
+        try {
+          parse_grpc_error(err);
+        } catch (parsed) {
+          return reject(parsed);
+        }
+        return reject(err); // defensive: parse_grpc_error should always throw
+      }
+      resolve(response);
+    };
   }
 
   /**
-   * Make a unary RPC call with retry on transient errors and error parsing.
+   * Single-attempt unary RPC using proto-loader stubs.
    */
-  _call (client, method, request) {
+  _invoke (client, method, request) {
     if (!this._connected) {
       throw new Error('Client is not connected. Call connect() first.');
     }
-
-    return retry_with_backoff(() => {
-      return new Promise((resolve, reject) => {
-        client[method](request, (err, response) => {
-          if (err) {
-            if (is_retryable(err)) {
-              return reject(err);
-            }
-            try {
-              parse_grpc_error(err);
-            } catch (parsed) {
-              return reject(parsed);
-            }
-          }
-          resolve(response);
-        });
-      });
-    }, this.retry_options);
+    const deadline = new Date(Date.now() + this.call_timeout_ms);
+    return new Promise((resolve, reject) => {
+      client[method](request, { deadline }, this._create_invoke_callback(resolve, reject));
+    });
   }
+
+  /**
+   * Single-attempt unary RPC using protobufjs serialization (bypassing
+   * proto-loader).  Used for RPCs whose responses contain descriptor set
+   * sub-messages — see the module-level comment for rationale.
+   */
+  _invoke_raw (client, method_path, RequestType, ResponseType, request) {
+    if (!this._connected) {
+      throw new Error('Client is not connected. Call connect() first.');
+    }
+    const deadline = new Date(Date.now() + this.call_timeout_ms);
+    return new Promise((resolve, reject) => {
+      client.makeUnaryRequest(
+        method_path,
+        _protobuf_serialize(RequestType),
+        _protobuf_deserialize(ResponseType),
+        request,
+        { deadline },
+        this._create_invoke_callback(resolve, reject),
+      );
+    });
+  }
+
+  /**
+   * Unary RPC with retry on transient errors.  Used for idempotent reads.
+   * Errors are always parsed into typed ArtifactErrors before being
+   * checked for retryability, so callers never see raw gRPC errors.
+   */
+  _call (client, method, request) {
+    return retry_with_backoff(
+      () => this._invoke(client, method, request),
+      this.retry_options,
+    );
+  }
+
+  /**
+   * Unary RPC with retry, using protobufjs serialization.
+   */
+  _call_raw (client, method_path, RequestType, ResponseType, request) {
+    return retry_with_backoff(
+      () => this._invoke_raw(client, method_path, RequestType, ResponseType, request),
+      this.retry_options,
+    );
+  }
+
 }
 
 module.exports = { ArtifactGrpcClient };
