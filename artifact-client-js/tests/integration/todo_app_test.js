@@ -76,6 +76,9 @@ describe('Integration: Todo App', () => {
   let item_ids = [];
 
   it('creates a list and items, then fetches items via index', async () => {
+    assert.ok(list_version_id, 'prerequisite: list_version_id must be set by prior test');
+    assert.ok(item_version_id, 'prerequisite: item_version_id must be set by prior test');
+
     // Create a TodoList
     const list_result = await client.transaction(async (txn) => {
       const created = await txn.create(list_version_id, {
@@ -118,6 +121,9 @@ describe('Integration: Todo App', () => {
   // ─── 3. Update: mark an item as done ────────────────────────────────────
 
   it('updates an item and verifies the change via get', async () => {
+    assert.ok(list_id, 'prerequisite: list_id must be set by prior test');
+    assert.ok(item_ids.length > 0, 'prerequisite: item_ids must be set by prior test');
+
     const target_id = item_ids[0];
 
     await client.transaction(async (txn) => {
@@ -138,6 +144,9 @@ describe('Integration: Todo App', () => {
   // ─── 4. Delete one item, verify index shrinks ──────────────────────────
 
   it('deletes an item and verifies index shrinks', async () => {
+    assert.ok(list_id, 'prerequisite: list_id must be set by prior test');
+    assert.ok(item_ids.length > 0, 'prerequisite: item_ids must be set by prior test');
+
     const target_id = item_ids[2]; // "Bread"
 
     await client.transaction(async (txn) => {
@@ -165,6 +174,8 @@ describe('Integration: Todo App', () => {
   // ─── 5. Referential integrity: can't delete list with items ────────────
 
   it('rejects deletion of list while items still reference it', async () => {
+    assert.ok(list_id, 'prerequisite: list_id must be set by prior test');
+
     await assert.rejects(
       () => client.transaction(async (txn) => {
         await txn.delete(list_id);
@@ -184,6 +195,9 @@ describe('Integration: Todo App', () => {
   // ─── 6. Successful tear-down: delete items, then list ──────────────────
 
   it('deletes remaining items, then the list', async () => {
+    assert.ok(list_id, 'prerequisite: list_id must be set by prior test');
+    assert.ok(item_ids.length > 0, 'prerequisite: item_ids must be set by prior test');
+
     // Delete remaining items (item_ids[0] and item_ids[1])
     await client.transaction(async (txn) => {
       for (const id of item_ids.slice(0, 2)) {
@@ -210,6 +224,8 @@ describe('Integration: Todo App', () => {
   // ─── 7. Unique index enforcement ───────────────────────────────────────
 
   it('rejects concurrent duplicate list names (unique index)', async () => {
+    assert.ok(list_version_id, 'prerequisite: list_version_id must be set by prior test');
+
     // Two transactions fork from the same base and both create the same
     // unique-key value.  The first commit succeeds; the second is
     // rejected as a non-retryable conflict during the 3-way merge.
@@ -268,6 +284,8 @@ describe('Integration: Todo App', () => {
   // ─── 8. Sequential unique index enforcement ─────────────────────────────
 
   it('rejects sequential duplicate list names (unique index)', async () => {
+    assert.ok(list_version_id, 'prerequisite: list_version_id must be set by prior test');
+
     // Unlike the concurrent case above, this tests that the server also
     // rejects a duplicate unique-key value when the second create happens
     // in a transaction that forked *after* the first committed — i.e.
