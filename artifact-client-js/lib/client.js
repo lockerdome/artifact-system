@@ -53,7 +53,9 @@ class ArtifactClient {
    *
    * @param {function(Transaction): Promise<*>} callback
    * @param {object} [options]
-   * @param {string} [options.parent_snapshot_id] - Fork from a specific snapshot.
+   * @param {string} [options.parent_snapshot_id] - Fork from a specific snapshot instead of the
+   *   canonical branch head. To fork from another transaction's branch, use the nested
+   *   `txn.transaction()` method instead — top-level transactions only accept snapshot IDs.
    * @returns {Promise<{snapshot_id: string, value: *}>}
    */
   async transaction (callback, options = {}) {
