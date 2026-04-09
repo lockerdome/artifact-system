@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const grpc = require('@grpc/grpc-js');
 const protoLoader = require('@grpc/proto-loader');
-const { retry_with_backoff, is_retryable } = require('./retry');
+const { retry_with_backoff, is_retryable, DEFAULT_RETRY_OPTIONS } = require('./retry');
 const { parse_grpc_error, _error_root } = require('./errors');
 
 const DESCRIPTOR_PATH = path.resolve(__dirname, '../proto/artifact_service.desc');
@@ -43,12 +43,6 @@ function _protobuf_deserialize (MessageType) {
   return (bytes) => MessageType.decode(bytes);
 }
 
-const DEFAULT_RETRY_OPTIONS = {
-  max_retries: 5,
-  base_delay_ms: 100,
-  max_delay_ms: 10000,
-};
-
 /**
  * Low-level gRPC transport for the Artifact Layer's four services.
  * Loads protos, creates stubs, promisifies RPCs, and handles error parsing.
@@ -76,7 +70,7 @@ class ArtifactGrpcClient {
     this._connected = false;
   }
 
-  async connect () {
+  connect () {
     if (this._connected) return;
 
     const descriptor_bytes = fs.readFileSync(DESCRIPTOR_PATH);
@@ -233,6 +227,7 @@ class ArtifactGrpcClient {
               } catch (parsed) {
                 return reject(parsed);
               }
+              return reject(err); // defensive: parse_grpc_error should always throw
             }
             resolve(response);
           },
@@ -261,6 +256,7 @@ class ArtifactGrpcClient {
             } catch (parsed) {
               return reject(parsed);
             }
+            return reject(err); // defensive: parse_grpc_error should always throw
           }
           resolve(response);
         });

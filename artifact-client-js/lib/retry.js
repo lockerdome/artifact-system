@@ -16,7 +16,8 @@ function is_retryable (err) {
 }
 
 /**
- * Retries an async function with exponential backoff and jitter.
+ * Retries an async function with exponential backoff with full jitter.
+ * Delay is uniform random in [0, min(max_delay_ms, base_delay_ms * 2^attempt)].
  * Only retries on transient gRPC errors (UNAVAILABLE, DEADLINE_EXCEEDED).
  *
  * @param {function} fn - Async function to retry.
@@ -54,4 +55,10 @@ async function retry_with_backoff (fn, options = {}) {
   throw last_error;
 }
 
-module.exports = { retry_with_backoff, is_retryable, RETRYABLE_STATUS_CODES };
+const DEFAULT_RETRY_OPTIONS = {
+  max_retries: DEFAULT_MAX_RETRIES,
+  base_delay_ms: DEFAULT_BASE_DELAY_MS,
+  max_delay_ms: DEFAULT_MAX_DELAY_MS,
+};
+
+module.exports = { retry_with_backoff, is_retryable, RETRYABLE_STATUS_CODES, DEFAULT_RETRY_OPTIONS };
