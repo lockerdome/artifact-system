@@ -2,7 +2,7 @@
 
 const { ArtifactGrpcClient } = require('./grpc_client');
 const { Snapshot } = require('./snapshot');
-const { Transaction } = require('./transaction');
+const { run_transaction_lifecycle } = require('./transaction');
 const { TypeRegistryCache } = require('./type_registry');
 
 /**
@@ -45,10 +45,10 @@ class ArtifactClient {
   /**
    * Run a callback inside a transaction with auto-commit/rollback.
    *
-   * 1. CreateTransaction → transaction_id
+   * 1. CreateTransaction -> transaction_id
    * 2. Execute callback(txn)
-   * 3. On success: CommitTransaction → { snapshot_id, value }
-   * 4. On failure: RollbackTransaction → re-throw
+   * 3. On success: CommitTransaction -> { snapshot_id, value }
+   * 4. On failure: RollbackTransaction -> re-throw
    * 5. Mark txn as settled (all methods throw TransactionSettledError)
    *
    * @param {function(Transaction): Promise<*>} callback
@@ -63,28 +63,9 @@ class ArtifactClient {
     }
 
     const create_response = await this._grpc_client.create_transaction(create_request);
-    const txn = new Transaction(
-      this._grpc_client, this._type_registry, create_response.transaction_id,
+    return run_transaction_lifecycle(
+      this._grpc_client, this._type_registry, create_response.transaction_id, callback,
     );
-
-    try {
-      const value = await callback(txn);
-      const commit_response = await this._grpc_client.commit_transaction({
-        transaction_id: create_response.transaction_id,
-      });
-      return { snapshot_id: commit_response.snapshot_id, value };
-    } catch (err) {
-      try {
-        await this._grpc_client.rollback_transaction({
-          transaction_id: create_response.transaction_id,
-        });
-      } catch (rollback_err) {
-        throw new AggregateError([err, rollback_err], err.message);
-      }
-      throw err;
-    } finally {
-      txn._settle();
-    }
   }
 }
 
