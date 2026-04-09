@@ -5,9 +5,72 @@ const path = require('path');
 const grpc = require('@grpc/grpc-js');
 const protoLoader = require('@grpc/proto-loader');
 const protobuf = require('protobufjs');
+const descriptor = require('protobufjs/ext/descriptor');
 const { _error_root } = require('../lib/errors');
 
 const DESCRIPTOR_PATH = path.resolve(__dirname, '../proto/artifact_service.desc');
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test fixture types
+//
+// The mock server registers a single fixture artifact type and a single
+// fixture index schema at construction time, so tests can exercise the full
+// encode/decode pipeline without each test having to compile its own protos.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const FIXTURE_TYPE_PROTO = `
+syntax = "proto3";
+package test;
+message TestPayload {
+  bytes data = 1;
+  string label = 2;
+}
+`;
+
+const FIXTURE_INDEX_PROTO = `
+syntax = "proto3";
+package test;
+message IndexKey_Test {
+  string id = 1;
+}
+message IndexValue_Test {
+  uint64 artifact_id = 1;
+}
+message Index_Test {
+  repeated IndexValue_Test entries = 1;
+}
+`;
+
+const SnakeFileDescriptorSet = _error_root.lookupType('google.protobuf.FileDescriptorSet');
+const TypeDefinitionType = _error_root.lookupType('artifact_system.TypeDefinition');
+
+/**
+ * Compile a .proto source string into a snake_case JS object form of
+ * google.protobuf.FileDescriptorSet, suitable for handing back to the client
+ * via @grpc/proto-loader's keepCase decoding.
+ *
+ * Returns both the JS object form (for the gRPC response) and the
+ * protobufjs Root (so the mock can encode/decode payloads with the same
+ * Types the client will use after rebuilding from the descriptor).
+ */
+function compile_proto_to_descriptor_set (proto_source) {
+  const root = protobuf.parse(proto_source, { keepCase: true }).root;
+  const fds_message = root.toDescriptor('proto3');
+  const fds_bytes = descriptor.FileDescriptorSet.encode(fds_message).finish();
+
+  // Re-decode with the snake_case-aware FileDescriptorSet from _error_root so
+  // the resulting JS object has snake_case keys, matching what proto-loader
+  // expects when encoding the gRPC response.
+  const snake_message = SnakeFileDescriptorSet.decode(fds_bytes);
+  const descriptor_set_obj = SnakeFileDescriptorSet.toObject(snake_message, {
+    longs: String,
+    enums: String,
+    defaults: true,
+    bytes: Buffer,
+  });
+
+  return { descriptor_set_obj, root };
+}
 
 /**
  * Encode a google.rpc.Status with a single error detail, for returning in
@@ -41,11 +104,36 @@ function make_grpc_error_with_detail (code, message, type_name, detail_obj) {
 /**
  * In-process gRPC server implementing all 4 artifact layer services.
  * Provides configurable in-memory state and failure injection.
+ *
+ * Auto-registers a fixture artifact type (`test.TestPayload`) and a fixture
+ * index schema (`test_index`) at construction so tests can encode/decode
+ * payloads without manual proto setup.  See `test_version_id`,
+ * `test_type_name`, and `test_index_key_type`.
  */
 class MockArtifactServer {
   constructor () {
     this.server = null;
     this.port = null;
+
+    // ── Fixture: artifact type ─────────────────────────────────────────────
+    const type_compiled = compile_proto_to_descriptor_set(FIXTURE_TYPE_PROTO);
+    this._test_descriptor_set_obj = type_compiled.descriptor_set_obj;
+    this._test_root = type_compiled.root;
+    this._TestPayloadType = this._test_root.lookupType('test.TestPayload');
+    this.test_type_name = 'test.TestPayload';
+    this.test_type_id = '1000000';
+    this.test_version_id = '1000001';
+
+    // ── Fixture: index schema ──────────────────────────────────────────────
+    const index_compiled = compile_proto_to_descriptor_set(FIXTURE_INDEX_PROTO);
+    this._test_index_descriptor_set_obj = index_compiled.descriptor_set_obj;
+    this._test_index_root = index_compiled.root;
+    this._TestIndexKeyType = this._test_index_root.lookupType('test.IndexKey_Test');
+    this._TestIndexValueType = this._test_index_root.lookupType('test.IndexValue_Test');
+    this._TestIndexType = this._test_index_root.lookupType('test.Index_Test');
+    this.test_index_key_type = 'test_index';
+    this.test_index_key_message_name = 'test.IndexKey_Test';
+    this.test_index_message_name = 'test.Index_Test';
 
     // In-memory state
     this._next_artifact_id = 1;
@@ -63,16 +151,43 @@ class MockArtifactServer {
 
     // Failure injection: { method_name: { code, message, ... } }
     this._failures = {};
+
+    this._install_fixture_type();
+  }
+
+  /**
+   * Seed the in-memory state with the fixture type registration so that
+   * GetTypeVersion (for test_version_id) and GetArtifact (for test_type_id,
+   * which holds the TypeDefinition) both return realistic data.
+   */
+  _install_fixture_type () {
+    this._type_versions.set(this.test_version_id, {
+      version_id: this.test_version_id,
+      type_id: this.test_type_id,
+      descriptor_set: this._test_descriptor_set_obj,
+      proto_source: FIXTURE_TYPE_PROTO,
+    });
+    this._types.set(this.test_type_name, [this.test_version_id]);
+
+    // The TypeDefinition artifact for the test type lives at test_type_id.
+    // Its payload is a TypeDefinition message; the client decodes it to
+    // resolve version_id → type_name.
+    const type_def_payload = TypeDefinitionType.encode(
+      TypeDefinitionType.fromObject({ type_name: this.test_type_name }),
+    ).finish();
+
+    this._artifacts.set(this.test_type_id, {
+      artifact_id: this.test_type_id,
+      type_name: 'artifact_system.TypeDefinition',
+      version_id: this.test_version_id,
+      payload: Buffer.from(type_def_payload),
+    });
   }
 
   _track_call (method) {
     this.calls[method] = (this.calls[method] || 0) + 1;
   }
 
-  /**
-   * Configure a method to fail with a specific error.
-   * Pass null to clear the failure.
-   */
   set_failure (method, error) {
     if (error) {
       this._failures[method] = error;
@@ -167,7 +282,7 @@ class MockArtifactServer {
     const artifact_id = this._new_artifact_id();
     this._artifacts.set(artifact_id, {
       artifact_id,
-      type_name: 'test.TestType',
+      type_name: this.test_type_name,
       version_id,
       payload,
     });
@@ -270,11 +385,15 @@ class MockArtifactServer {
     const { type_name, proto_source } = call.request;
     const version_id = this._new_artifact_id();
 
+    // Reuse the fixture descriptor_set so any subsequent decode against this
+    // version_id finds *some* valid type definition; tests that exercise the
+    // register-type path don't depend on the user's proto_source actually
+    // being compiled.
     this._type_versions.set(version_id, {
       version_id,
-      type_id: '0',
+      type_id: this.test_type_id,
       proto_source,
-      descriptor_set: null,
+      descriptor_set: this._test_descriptor_set_obj,
     });
 
     if (!this._types.has(type_name)) {
@@ -313,16 +432,16 @@ class MockArtifactServer {
     this._track_call('GetIndexSchema');
     if (this._check_failure('GetIndexSchema', callback)) return;
 
-    // Return a basic schema for testing
     callback(null, {
       index_definition_id: '1',
       key_type: call.request.key_type,
-      key_fields: ['field1'],
+      key_fields: ['id'],
       order_fields: [],
       unique: false,
-      key_message_name: 'IndexKey_Test',
-      value_message_name: 'IndexValue_Test',
-      index_message_name: 'Index_Test',
+      index_descriptor_set: this._test_index_descriptor_set_obj,
+      key_message_name: this.test_index_key_message_name,
+      value_message_name: 'test.IndexValue_Test',
+      index_message_name: this.test_index_message_name,
     });
   }
 
@@ -395,22 +514,96 @@ class MockArtifactServer {
   }
 
   /**
-   * Seed an artifact directly into the in-memory store (for test setup).
+   * Encode a JS payload object using the fixture test type and return the
+   * resulting bytes.  Useful when tests need to compare against the wire
+   * form directly.
    */
-  seed_artifact (artifact_id, type_name, version_id, payload) {
-    this._artifacts.set(artifact_id, { artifact_id, type_name, version_id, payload });
+  encode_test_payload (payload_obj) {
+    return Buffer.from(
+      this._TestPayloadType.encode(this._TestPayloadType.fromObject(payload_obj)).finish(),
+    );
+  }
+
+  /**
+   * Encode a JS index key object using the fixture index schema.
+   */
+  encode_test_index_key (key_obj) {
+    return Buffer.from(
+      this._TestIndexKeyType.encode(this._TestIndexKeyType.fromObject(key_obj)).finish(),
+    );
+  }
+
+  /**
+   * Encode a JS index payload object using the fixture index schema.
+   */
+  encode_test_index_payload (index_obj) {
+    return Buffer.from(
+      this._TestIndexType.encode(this._TestIndexType.fromObject(index_obj)).finish(),
+    );
+  }
+
+  /**
+   * Seed an artifact directly into the in-memory store.
+   *
+   * Accepts a payload as either:
+   *   - a plain JS object: encoded via the fixture test type
+   *   - a Buffer / Uint8Array: stored as-is (caller is responsible for
+   *     making sure the bytes are decodable against `version_id`)
+   *
+   * The artifact is registered as the fixture test type unless `type_name`
+   * and `version_id` are explicitly provided.
+   */
+  seed_artifact (artifact_id, payload, options = {}) {
+    const type_name = options.type_name || this.test_type_name;
+    const version_id = options.version_id || this.test_version_id;
+    let payload_bytes;
+    if (Buffer.isBuffer(payload) || payload instanceof Uint8Array) {
+      payload_bytes = Buffer.from(payload);
+    } else {
+      payload_bytes = this.encode_test_payload(payload);
+    }
+    this._artifacts.set(artifact_id, {
+      artifact_id,
+      type_name,
+      version_id,
+      payload: payload_bytes,
+    });
   }
 
   /**
    * Seed an index entry directly into the in-memory store.
+   *
+   * Accepts key/value as JS objects (encoded via fixture index schema) or
+   * raw bytes.
    */
-  seed_index (key_type, key, index_payload, index_message_name) {
-    const key_hex = Buffer.isBuffer(key) ? key.toString('hex') : Buffer.from(key).toString('hex');
-    this._indexes.set(`${key_type}:${key_hex}`, { index_payload, index_message_name });
+  seed_index (key, index_payload, options = {}) {
+    const key_type = options.key_type || this.test_index_key_type;
+    const index_message_name = options.index_message_name || this.test_index_message_name;
+
+    let key_bytes;
+    if (Buffer.isBuffer(key) || key instanceof Uint8Array) {
+      key_bytes = Buffer.from(key);
+    } else {
+      key_bytes = this.encode_test_index_key(key);
+    }
+
+    let index_payload_bytes;
+    if (Buffer.isBuffer(index_payload) || index_payload instanceof Uint8Array) {
+      index_payload_bytes = Buffer.from(index_payload);
+    } else {
+      index_payload_bytes = this.encode_test_index_payload(index_payload);
+    }
+
+    const key_hex = key_bytes.toString('hex');
+    this._indexes.set(`${key_type}:${key_hex}`, {
+      index_payload: index_payload_bytes,
+      index_message_name,
+    });
   }
 
   /**
-   * Reset all in-memory state and call tracking.
+   * Reset all in-memory state and call tracking.  Re-installs the fixture
+   * type so subsequent reads can still resolve descriptor_set / type_name.
    */
   reset () {
     this._next_artifact_id = 1;
@@ -424,6 +617,7 @@ class MockArtifactServer {
     this._indexes.clear();
     this.calls = {};
     this._failures = {};
+    this._install_fixture_type();
   }
 }
 

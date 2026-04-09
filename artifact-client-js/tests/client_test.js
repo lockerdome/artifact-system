@@ -27,12 +27,12 @@ describe('ArtifactClient', () => {
   });
 
   it('snapshot() returns a working Snapshot', async () => {
-    mock_server.seed_artifact('100', 'test.Type', '1', Buffer.from('hello'));
+    mock_server.seed_artifact('100', { data: Buffer.from('hello') });
 
     const snapshot = await client.snapshot();
     const artifact = await snapshot.get('100');
     assert.strictEqual(artifact.artifact_id, '100');
-    assert.strictEqual(artifact.type_name, 'test.Type');
+    assert.strictEqual(artifact.type_name, mock_server.test_type_name);
   });
 
   it('does not expose read/write/registry methods', () => {
@@ -48,7 +48,10 @@ describe('ArtifactClient', () => {
 
   it('transaction() auto-commits on success', async () => {
     const result = await client.transaction(async (txn) => {
-      const created = await txn.create('1', Buffer.from('data'));
+      const created = await txn.create(
+        mock_server.test_version_id,
+        { data: Buffer.from('data') },
+      );
       return created.artifact_id;
     });
 

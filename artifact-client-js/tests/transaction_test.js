@@ -36,7 +36,10 @@ describe('Transaction', () => {
   describe('auto-commit on success', () => {
     it('commits and returns snapshot_id + value', async () => {
       const result = await client.transaction(async (txn) => {
-        const created = await txn.create('1', Buffer.from('data'));
+        const created = await txn.create(
+          mock_server.test_version_id,
+          { data: Buffer.from('data') },
+        );
         return created.artifact_id;
       });
 
@@ -77,16 +80,17 @@ describe('Transaction', () => {
 
   describe('reads within transaction', () => {
     it('get() works inside transaction', async () => {
-      mock_server.seed_artifact('50', 'test.T', '1', Buffer.from('x'));
+      mock_server.seed_artifact('50', { data: Buffer.from('x'), label: 'fifty' });
 
       await client.transaction(async (txn) => {
         const artifact = await txn.get('50');
         assert.strictEqual(artifact.artifact_id, '50');
+        assert.strictEqual(artifact.payload.label, 'fifty');
       });
     });
 
     it('batch_get() works inside transaction', async () => {
-      mock_server.seed_artifact('60', 'test.T', '1', Buffer.from('a'));
+      mock_server.seed_artifact('60', { data: Buffer.from('a') });
 
       await client.transaction(async (txn) => {
         const results = await txn.batch_get(['60', '61']);
@@ -96,12 +100,17 @@ describe('Transaction', () => {
     });
 
     it('fetch_index() works inside transaction', async () => {
-      const key = Buffer.from([5, 6]);
-      mock_server.seed_index('idx', key, Buffer.from('val'), 'Index_Foo');
+      mock_server.seed_index(
+        { id: 'in-txn' },
+        { entries: [{ artifact_id: '7' }] },
+      );
 
       await client.transaction(async (txn) => {
-        const result = await txn.fetch_index('idx', key);
-        assert.strictEqual(result.index_message_name, 'Index_Foo');
+        const result = await txn.fetch_index(
+          mock_server.test_index_key_type,
+          { id: 'in-txn' },
+        );
+        assert.strictEqual(result.index_payload.entries[0].artifact_id, '7');
       });
     });
   });
@@ -109,23 +118,30 @@ describe('Transaction', () => {
   describe('writes within transaction', () => {
     it('create() returns artifact_id and snapshot_id', async () => {
       await client.transaction(async (txn) => {
-        const created = await txn.create('1', Buffer.from('payload'));
+        const created = await txn.create(
+          mock_server.test_version_id,
+          { data: Buffer.from('payload') },
+        );
         assert.ok(created.artifact_id);
         assert.ok(created.snapshot_id);
       });
     });
 
     it('update() returns snapshot_id', async () => {
-      mock_server.seed_artifact('70', 'test.T', '1', Buffer.from('old'));
+      mock_server.seed_artifact('70', { data: Buffer.from('old') });
 
       await client.transaction(async (txn) => {
-        const result = await txn.update('70', '2', Buffer.from('new'));
+        const result = await txn.update(
+          '70',
+          mock_server.test_version_id,
+          { data: Buffer.from('new') },
+        );
         assert.ok(result.snapshot_id);
       });
     });
 
     it('delete() returns snapshot_id', async () => {
-      mock_server.seed_artifact('80', 'test.T', '1', Buffer.from('x'));
+      mock_server.seed_artifact('80', { data: Buffer.from('x') });
 
       await client.transaction(async (txn) => {
         const result = await txn.delete('80');
@@ -162,7 +178,10 @@ describe('Transaction', () => {
     it('sub-transaction commits into parent', async () => {
       const result = await client.transaction(async (txn) => {
         const sub_result = await txn.transaction(async (subtxn) => {
-          const created = await subtxn.create('1', Buffer.from('sub'));
+          const created = await subtxn.create(
+            mock_server.test_version_id,
+            { data: Buffer.from('sub') },
+          );
           return created.artifact_id;
         });
         assert.ok(sub_result.snapshot_id);
@@ -239,9 +258,9 @@ describe('Transaction', () => {
       const methods = [
         () => leaked_txn.get('1'),
         () => leaked_txn.batch_get(['1']),
-        () => leaked_txn.fetch_index('k', Buffer.from([1])),
-        () => leaked_txn.create('1', Buffer.from('x')),
-        () => leaked_txn.update('1', '1', Buffer.from('x')),
+        () => leaked_txn.fetch_index('k', { id: 'x' }),
+        () => leaked_txn.create('1', { data: Buffer.from('x') }),
+        () => leaked_txn.update('1', '1', { data: Buffer.from('x') }),
         () => leaked_txn.delete('1'),
         () => leaked_txn.register_type('t', 'src'),
         () => leaked_txn.get_type_version('1'),
@@ -260,7 +279,7 @@ describe('Transaction', () => {
     });
 
     it('snapshot created from txn remains usable after txn settles', async () => {
-      mock_server.seed_artifact('90', 'test.T', '1', Buffer.from('data'));
+      mock_server.seed_artifact('90', { data: Buffer.from('data') });
       let txn_snapshot;
 
       await client.transaction(async (txn) => {

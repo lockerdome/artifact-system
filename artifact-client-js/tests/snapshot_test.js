@@ -26,14 +26,17 @@ describe('Snapshot', () => {
   });
 
   describe('from canonical branch', () => {
-    it('get() returns an artifact', async () => {
-      mock_server.seed_artifact('10', 'test.Msg', '1', Buffer.from('payload'));
+    it('get() returns an artifact with decoded payload', async () => {
+      mock_server.seed_artifact('10', { data: Buffer.from('payload'), label: 'hello' });
       const snapshot = await client.snapshot();
       const artifact = await snapshot.get('10');
 
       assert.strictEqual(artifact.artifact_id, '10');
-      assert.strictEqual(artifact.type_name, 'test.Msg');
-      assert.strictEqual(artifact.version_id, '1');
+      assert.strictEqual(artifact.type_name, mock_server.test_type_name);
+      assert.strictEqual(artifact.version_id, mock_server.test_version_id);
+      // Payload is decoded to a JS object, not raw bytes
+      assert.strictEqual(artifact.payload.label, 'hello');
+      assert.deepStrictEqual(Buffer.from(artifact.payload.data), Buffer.from('payload'));
     });
 
     it('get() throws ArtifactNotFoundError for missing artifact', async () => {
@@ -48,33 +51,42 @@ describe('Snapshot', () => {
       );
     });
 
-    it('batch_get() returns artifacts and nulls', async () => {
-      mock_server.seed_artifact('1', 'test.A', '1', Buffer.from('a'));
-      mock_server.seed_artifact('3', 'test.C', '1', Buffer.from('c'));
+    it('batch_get() returns decoded artifacts and nulls', async () => {
+      mock_server.seed_artifact('1', { data: Buffer.from('a'), label: 'a-label' });
+      mock_server.seed_artifact('3', { data: Buffer.from('c'), label: 'c-label' });
 
       const snapshot = await client.snapshot();
       const results = await snapshot.batch_get(['1', '2', '3']);
 
       assert.strictEqual(results.length, 3);
       assert.strictEqual(results[0].artifact_id, '1');
+      assert.strictEqual(results[0].payload.label, 'a-label');
       assert.strictEqual(results[1], null);
       assert.strictEqual(results[2].artifact_id, '3');
+      assert.strictEqual(results[2].payload.label, 'c-label');
     });
 
-    it('fetch_index() returns index data', async () => {
-      const key = Buffer.from([1, 2, 3]);
-      mock_server.seed_index('my_index', key, Buffer.from('index_data'), 'Index_Test');
+    it('fetch_index() returns decoded index data', async () => {
+      mock_server.seed_index(
+        { id: 'k1' },
+        { entries: [{ artifact_id: '42' }, { artifact_id: '43' }] },
+      );
 
       const snapshot = await client.snapshot();
-      const result = await snapshot.fetch_index('my_index', key);
+      const result = await snapshot.fetch_index(
+        mock_server.test_index_key_type,
+        { id: 'k1' },
+      );
 
-      assert.strictEqual(result.index_message_name, 'Index_Test');
+      assert.strictEqual(result.index_message_name, mock_server.test_index_message_name);
+      assert.strictEqual(result.index_payload.entries.length, 2);
+      assert.strictEqual(result.index_payload.entries[0].artifact_id, '42');
     });
 
     it('fetch_index() throws IndexFetchError for missing index', async () => {
       const snapshot = await client.snapshot();
       await assert.rejects(
-        () => snapshot.fetch_index('no_such_index', Buffer.from([1])),
+        () => snapshot.fetch_index(mock_server.test_index_key_type, { id: 'missing' }),
         (err) => {
           assert.ok(err instanceof IndexFetchError);
           return true;
@@ -85,7 +97,7 @@ describe('Snapshot', () => {
 
   describe('from transaction', () => {
     it('txn.snapshot() returns a usable Snapshot', async () => {
-      mock_server.seed_artifact('20', 'test.T', '1', Buffer.from('x'));
+      mock_server.seed_artifact('20', { data: Buffer.from('x') });
       let txn_snapshot;
 
       await client.transaction(async (txn) => {
@@ -139,7 +151,7 @@ describe('Snapshot', () => {
     });
 
     it('remains usable indefinitely after creation', async () => {
-      mock_server.seed_artifact('30', 'test.X', '1', Buffer.from('y'));
+      mock_server.seed_artifact('30', { data: Buffer.from('y') });
       const snapshot = await client.snapshot();
 
       // Use it multiple times
