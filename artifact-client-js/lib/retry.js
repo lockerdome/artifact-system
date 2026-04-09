@@ -28,9 +28,15 @@ function is_retryable (err) {
  * @returns {Promise<*>}
  */
 async function retry_with_backoff (fn, options = {}) {
-  const max_retries = options.max_retries ?? DEFAULT_MAX_RETRIES;
-  const base_delay_ms = options.base_delay_ms ?? DEFAULT_BASE_DELAY_MS;
-  const max_delay_ms = options.max_delay_ms ?? DEFAULT_MAX_DELAY_MS;
+  const max_retries = Number.isFinite(options.max_retries)
+    ? Math.max(0, Math.trunc(options.max_retries))
+    : DEFAULT_MAX_RETRIES;
+  const base_delay_ms = Number.isFinite(options.base_delay_ms)
+    ? Math.max(0, options.base_delay_ms)
+    : DEFAULT_BASE_DELAY_MS;
+  const max_delay_ms = Number.isFinite(options.max_delay_ms)
+    ? Math.max(0, options.max_delay_ms)
+    : DEFAULT_MAX_DELAY_MS;
 
   let last_error;
 
