@@ -5,9 +5,43 @@ const path = require('path');
 const grpc = require('@grpc/grpc-js');
 const protoLoader = require('@grpc/proto-loader');
 const { retry_with_backoff, is_retryable } = require('./retry');
-const { parse_grpc_error } = require('./errors');
+const { parse_grpc_error, _error_root } = require('./errors');
 
 const DESCRIPTOR_PATH = path.resolve(__dirname, '../proto/artifact_service.desc');
+
+// ─────────────────────────────────────────────────────────────────────────────
+// protobufjs-based serializers for RPCs that return descriptor sets.
+//
+// The proto-loader stubs decode responses with `defaults: true`, which
+// populates absent optional fields with their default values.  For
+// google.protobuf.FileDescriptorSet sub-messages this is destructive:
+// Google's descriptor.proto (which defines FieldDescriptorProto) is
+// written in proto2 and declares `optional int32 oneof_index`.  Under
+// `defaults: true`, that field gets set to 0 on every field descriptor —
+// even non-oneof fields — and the client cannot distinguish between
+// "genuinely in oneof 0" and "defaulted to 0" afterwards.
+//
+// Instead of trying to scrub these spurious defaults, we bypass proto-loader
+// entirely for GetTypeVersion and GetIndexSchema.  The request/response
+// types are loaded from _error_root (which has snake_case field names,
+// matching the rest of the client), and grpc-js's makeUnaryRequest is used
+// with custom serialize/deserialize functions.  The descriptor_set field
+// arrives as a protobufjs Message — no defaults, no conversion — and is
+// passed directly to protobuf.Root.fromDescriptor().
+// ─────────────────────────────────────────────────────────────────────────────
+
+const _GetTypeVersionRequest = _error_root.lookupType('artifact_system.GetTypeVersionRequest');
+const _GetTypeVersionResponse = _error_root.lookupType('artifact_system.GetTypeVersionResponse');
+const _GetIndexSchemaRequest = _error_root.lookupType('artifact_system.GetIndexSchemaRequest');
+const _GetIndexSchemaResponse = _error_root.lookupType('artifact_system.GetIndexSchemaResponse');
+
+function _protobuf_serialize (MessageType) {
+  return (obj) => Buffer.from(MessageType.encode(MessageType.fromObject(obj)).finish());
+}
+
+function _protobuf_deserialize (MessageType) {
+  return (bytes) => MessageType.decode(bytes);
+}
 
 const DEFAULT_RETRY_OPTIONS = {
   max_retries: 5,
@@ -145,7 +179,13 @@ class ArtifactGrpcClient {
   }
 
   get_type_version (request) {
-    return this._call(this._type_registry_client, 'GetTypeVersion', request);
+    return this._call_raw(
+      this._type_registry_client,
+      '/artifact_system.TypeRegistryService/GetTypeVersion',
+      _GetTypeVersionRequest,
+      _GetTypeVersionResponse,
+      request,
+    );
   }
 
   list_type_versions (request) {
@@ -153,12 +193,53 @@ class ArtifactGrpcClient {
   }
 
   get_index_schema (request) {
-    return this._call(this._type_registry_client, 'GetIndexSchema', request);
+    return this._call_raw(
+      this._type_registry_client,
+      '/artifact_system.TypeRegistryService/GetIndexSchema',
+      _GetIndexSchemaRequest,
+      _GetIndexSchemaResponse,
+      request,
+    );
   }
 
   // ─────────────────────────────────────────────────────────────────────────
   // Internal
   // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Make a unary RPC call using protobufjs serialization (bypassing
+   * proto-loader).  Used for RPCs whose responses contain descriptor set
+   * sub-messages — see the module-level comment for rationale.
+   */
+  _call_raw (client, method_path, RequestType, ResponseType, request) {
+    if (!this._connected) {
+      throw new Error('Client is not connected. Call connect() first.');
+    }
+
+    return retry_with_backoff(() => {
+      return new Promise((resolve, reject) => {
+        client.makeUnaryRequest(
+          method_path,
+          _protobuf_serialize(RequestType),
+          _protobuf_deserialize(ResponseType),
+          request,
+          (err, response) => {
+            if (err) {
+              if (is_retryable(err)) {
+                return reject(err);
+              }
+              try {
+                parse_grpc_error(err);
+              } catch (parsed) {
+                return reject(parsed);
+              }
+            }
+            resolve(response);
+          },
+        );
+      });
+    }, this.retry_options);
+  }
 
   /**
    * Make a unary RPC call with retry on transient errors and error parsing.

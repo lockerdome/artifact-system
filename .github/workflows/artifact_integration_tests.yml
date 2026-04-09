@@ -1,0 +1,64 @@
+name: Artifact Integration Tests
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'artifact-system/artifact-layer/**'
+      - 'artifact-system/artifact-client-js/**'
+      - '.github/workflows/artifact_integration_tests.yml'
+  pull_request:
+    paths:
+      - 'artifact-system/artifact-layer/**'
+      - 'artifact-system/artifact-client-js/**'
+      - '.github/workflows/artifact_integration_tests.yml'
+
+jobs:
+  integration-tests:
+    runs-on: ubuntu-24.04
+    env:
+      CC: gcc-14
+      CXX: g++-14
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 2G
+      CCACHE_COMPRESS: 'true'
+
+    steps:
+      - uses: actions/checkout@v6
+
+      # ── Build the C++ artifact-layer server ──────────────────────────────
+
+      - name: Install C++ build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build build-essential pkg-config curl libssl-dev libcurl4-openssl-dev gcc-14 g++-14 ccache
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ${{ runner.os }}-ccache-integration-${{ github.ref }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-ccache-integration-${{ github.ref }}-
+            ${{ runner.os }}-ccache-integration-
+            ${{ runner.os }}-ccache-
+          save-always: true
+
+      - name: Build artifact-layer server
+        working-directory: artifact-system/artifact-layer
+        run: |
+          cmake --preset release -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          cmake --build --preset release
+
+      # ── Set up Node.js and run integration tests ─────────────────────────
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Install node modules
+        working-directory: artifact-system/artifact-client-js
+        run: npm install
+
+      - name: Run integration tests
+        working-directory: artifact-system/artifact-client-js
+        env:
+          ARTIFACT_LAYER_BINARY_PATH: ${{ github.workspace }}/artifact-system/artifact-layer/build/release/artifact_layer_service
+        run: npm run test:integration

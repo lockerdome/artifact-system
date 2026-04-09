@@ -1,5 +1,7 @@
 "use strict";
 
+const TO_OBJECT_OPTIONS = { longs: String, enums: String, defaults: true };
+
 /**
  * Snapshot provides a consistent point-in-time read interface.
  * All reads are scoped to this snapshot's ID via a ReadContext.
@@ -99,10 +101,13 @@ class Snapshot {
   // ─────────────────────────────────────────────────────────────────────────
 
   async get_type_version (version_id) {
-    return await this._grpc_client.get_type_version({
+    const response = await this._grpc_client.get_type_version({
       version_id,
       read_context: this._read_context(),
     });
+    // get_type_version uses protobufjs deserialization (returns a Message
+    // with Long fields); convert to a plain JS object for the public API.
+    return response.constructor.toObject(response, TO_OBJECT_OPTIONS);
   }
 
   async list_type_versions (type_name) {
@@ -114,10 +119,12 @@ class Snapshot {
   }
 
   async get_index_schema (key_type) {
-    return await this._grpc_client.get_index_schema({
+    const response = await this._grpc_client.get_index_schema({
       key_type,
       read_context: this._read_context(),
     });
+    // get_index_schema uses protobufjs deserialization; convert for public API.
+    return response.constructor.toObject(response, TO_OBJECT_OPTIONS);
   }
 }
 

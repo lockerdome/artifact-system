@@ -93,7 +93,9 @@ void ArtifactLayerServer::Start() {
     std::println(stderr, "Failed to start gRPC server on {}", impl_->config.listen_address);
     return;
   }
-  std::println("Artifact layer server listening on {}", impl_->config.listen_address);
+  std::println("LISTENING_PORT={}", impl_->selected_port);
+  std::fflush(stdout);
+  std::println("Artifact layer server listening on {} (port {})", impl_->config.listen_address, impl_->selected_port);
   impl_->server->Wait();
 }
 

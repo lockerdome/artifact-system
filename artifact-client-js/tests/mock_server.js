@@ -65,7 +65,7 @@ function compile_proto_to_descriptor_set (proto_source) {
   const descriptor_set_obj = SnakeFileDescriptorSet.toObject(snake_message, {
     longs: String,
     enums: String,
-    defaults: true,
+    defaults: false,
     bytes: Buffer,
   });
 

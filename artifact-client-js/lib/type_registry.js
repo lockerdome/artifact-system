@@ -4,113 +4,12 @@ const protobuf = require('protobufjs');
 const { TypeDecodeError, _error_root } = require('./errors');
 
 /**
- * Built-in google.protobuf.FileDescriptorSet message Type, sourced from the
- * shared `_error_root` in errors.js.
- *
- * Why this Type rather than `protobufjs/ext/descriptor`'s standalone version:
- * `_error_root` was built via `protobuf.Root.fromDescriptor(...)` from the
- * compiled `proto/artifact_service.desc` (which already includes
- * `descriptor.proto` via protoc's `--include_imports`).  Types built that
- * way take their field names *verbatim* from the binary
- * `FieldDescriptorProto.name` strings — i.e. exactly as they were written
- * in the original `.proto` source.  For descriptor.proto specifically,
- * those names happen to be snake_case (`message_type`, `enum_type`, ...),
- * but the principle is "preserve the source casing", whatever it is.
- *
- * `@grpc/proto-loader` is also configured with `keepCase: true`, so when it
- * decodes `descriptor_set` from a gRPC response it produces a JS object
- * whose keys match descriptor.proto's source casing.  Both sides agree, so
- * `_FileDescriptorSetType.fromObject(obj)` accepts proto-loader's output
- * directly with no field-name conversion.
- *
- * The standalone `protobufjs/ext/descriptor` module would NOT work here:
- * it loads `descriptor.proto` via protobufjs's text parser with default
- * options, which converts field names to camelCase (`messageType`, ...) —
- * a different shape from what proto-loader gives us.
- */
-const _FileDescriptorSetType = _error_root.lookupType('google.protobuf.FileDescriptorSet');
-
-/**
  * Built-in TypeDefinition message used to resolve a `version_id` to its
  * `type_name`.  The artifact_service.desc descriptor set built by
  * `npm run generate-proto` includes artifact_types.proto, which contains
  * the TypeDefinition message definition.
  */
 const _TypeDefinitionType = _error_root.lookupType('artifact_system.TypeDefinition');
-
-/**
- * Recursively remove `oneof_index` from `FieldDescriptorProto`s whose parent
- * message has no oneofs.
- *
- * Why this is needed: `@grpc/proto-loader` is configured with
- * `defaults: true`, which populates every proto2 optional field with its
- * default value when decoding.  `FieldDescriptorProto.oneof_index` is an
- * `optional int32` (default 0), so every field comes back with
- * `oneof_index: 0` regardless of whether it actually belongs to a oneof.
- *
- * When we re-encode and feed the bytes to `protobuf.Root.fromDescriptor`,
- * protobufjs sees the present-but-spurious `oneof_index` and tries to
- * register the field in `oneofsArray[0]`, which doesn't exist on messages
- * without oneofs — crashing with "Cannot read properties of undefined".
- *
- * We mutate the descriptor object in-place (it's already a fresh decode
- * result owned by the caller).
- */
-function _strip_spurious_oneof_index (descriptor_set_obj) {
-  if (!descriptor_set_obj || !descriptor_set_obj.file) return;
-  for (const file of descriptor_set_obj.file) {
-    _strip_oneof_index_in_messages(file.message_type);
-  }
-}
-
-function _strip_oneof_index_in_messages (messages) {
-  if (!messages) return;
-  for (const msg of messages) {
-    const has_oneofs = Array.isArray(msg.oneof_decl) && msg.oneof_decl.length > 0;
-    if (Array.isArray(msg.field)) {
-      for (const field of msg.field) {
-        if (!has_oneofs && field.oneof_index != null) {
-          delete field.oneof_index;
-        }
-      }
-    }
-    _strip_oneof_index_in_messages(msg.nested_type);
-  }
-}
-
-/**
- * Build a protobufjs Root for the messages defined in a `descriptor_set` JS
- * object (as returned by `@grpc/proto-loader` with `keepCase: true`).
- *
- * Implementation: re-encode the JS object to its binary protobuf form using
- * `_FileDescriptorSetType` (whose field names match descriptor.proto's
- * source casing), then call `protobuf.Root.fromDescriptor(buffer)`.  When
- * `fromDescriptor` is given a Buffer it decodes internally and builds Types
- * whose field names come straight from the user's `.proto` source.
- *
- * The casing of decoded user payloads (`Type.toObject(...)`) therefore
- * mirrors whatever case the artifact's `.proto` was written in — there is
- * no normalization or conversion at any layer.
- */
-function _build_root_from_descriptor_object (descriptor_set_obj) {
-  _strip_spurious_oneof_index(descriptor_set_obj);
-
-  // Note: we deliberately do not call `verify()` here.  proto-loader is
-  // configured with `enums: String`, so descriptor enums (e.g.
-  // FieldDescriptorProto.label = "LABEL_OPTIONAL") arrive as strings.
-  // protobufjs's `verify()` is strict and requires numeric enum values,
-  // but `fromObject()` happily converts string enum names to numbers.
-  let message;
-  try {
-    message = _FileDescriptorSetType.fromObject(descriptor_set_obj);
-  } catch (err) {
-    throw new TypeDecodeError(
-      `Invalid FileDescriptorSet from server: ${err.message}`,
-    );
-  }
-  const buffer = _FileDescriptorSetType.encode(message).finish();
-  return protobuf.Root.fromDescriptor(buffer);
-}
 
 /**
  * Decode a TypeDefinition payload (raw bytes from a GetArtifact response on
@@ -181,10 +80,14 @@ class TypeRegistryCache {
       );
     }
 
-    // The proto-loader has already parsed descriptor_set into a JS object
-    // shape.  Convert it back to the protobufjs descriptor message form
-    // and build a Root.
-    const root = _build_root_from_descriptor_object(response.descriptor_set);
+    // get_type_version uses protobufjs-based serialization (bypassing
+    // proto-loader), so response.descriptor_set is a protobufjs Message
+    // with no defaults pollution.  Re-encode to bytes so
+    // Root.fromDescriptor can decode internally with its own (camelCase)
+    // descriptor walker.
+    const fds_type = response.descriptor_set.constructor;
+    const fds_bytes = fds_type.encode(response.descriptor_set).finish();
+    const root = protobuf.Root.fromDescriptor(fds_bytes);
 
     this._version_root_cache.set(version_id, root);
 
@@ -305,12 +208,10 @@ class TypeRegistryCache {
     const message_type = await this.resolve_artifact_type(
       version_id, type_name, read_context,
     );
-    const err = message_type.verify(payload_object);
-    if (err) {
-      throw new TypeDecodeError(
-        `Payload for version_id ${version_id} (${type_name}) failed verification: ${err}`,
-      );
-    }
+    // Note: we deliberately skip verify() here.  protobufjs's verify() is
+    // strict about numeric types (e.g. uint64 fields require integer|Long)
+    // but this client represents all IDs as strings (longs: String).
+    // fromObject() handles string → Long conversion natively.
     const message = message_type.fromObject(payload_object);
     const payload_bytes = message_type.encode(message).finish();
     return { type_name, payload_bytes };
@@ -352,7 +253,9 @@ class TypeRegistryCache {
       );
     }
 
-    const root = _build_root_from_descriptor_object(response.index_descriptor_set);
+    const fds_type = response.index_descriptor_set.constructor;
+    const fds_bytes = fds_type.encode(response.index_descriptor_set).finish();
+    const root = protobuf.Root.fromDescriptor(fds_bytes);
 
     let key_type_msg;
     try {
@@ -395,13 +298,9 @@ class TypeRegistryCache {
    */
   async encode_index_key (key_type, key_object, read_context) {
     const schema = await this._get_index_schema(key_type, read_context);
-    const err = schema.key_type_msg.verify(key_object);
-    if (err) {
-      throw new TypeDecodeError(
-        `Index key for key_type ${key_type} (${schema.key_message_name}) ` +
-        `failed verification: ${err}`,
-      );
-    }
+    // Skip verify() — same reasoning as encode_artifact_payload: uint64
+    // fields are strings in this client, and fromObject() handles the
+    // string → Long conversion.
     const message = schema.key_type_msg.fromObject(key_object);
     return schema.key_type_msg.encode(message).finish();
   }

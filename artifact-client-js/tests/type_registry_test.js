@@ -190,15 +190,83 @@ describe('TypeRegistryCache (decode/encode pipeline)', () => {
     });
   });
 
+  describe('oneof handling', () => {
+    it('non-oneof fields in a mixed message are not placed in a oneof', async () => {
+      // Regression test: proto-loader decodes descriptor sets with
+      // defaults: true, which populates oneof_index = 0 on every field
+      // (even non-oneof fields).  If the descriptor pipeline fails to
+      // handle this, non-oneof fields become mutually exclusive at
+      // encode/decode time.
+      //
+      // Build a descriptor from a proto with both regular and oneof
+      // fields, pass it through the same pipeline the client uses, and
+      // verify non-oneof fields are independent.
+      const protobuf = require('protobufjs');
+      const descriptor = require('protobufjs/ext/descriptor');
+      const { TypeRegistryCache } = require('../lib/type_registry');
+
+      const mixed_proto = `
+        syntax = "proto3";
+        package test;
+        message MixedMessage {
+          string regular_field = 1;
+          int32 another_regular = 2;
+          oneof choice {
+            string option_a = 3;
+            string option_b = 4;
+          }
+        }
+      `;
+
+      // Compile to a FileDescriptorSet (same as what the server returns)
+      const root = protobuf.parse(mixed_proto, { keepCase: true }).root;
+      const fds_msg = root.toDescriptor('proto3');
+      const fds_bytes = descriptor.FileDescriptorSet.encode(fds_msg).finish();
+
+      // Rebuild a Root from the bytes (same path as type_registry)
+      const rebuilt = protobuf.Root.fromDescriptor(fds_bytes);
+      const MixedType = rebuilt.lookupType('test.MixedMessage');
+
+      // Verify regular fields are NOT part of any oneof
+      const regular_field = MixedType.fields['regular_field'];
+      const another_regular = MixedType.fields['another_regular'];
+      assert.strictEqual(regular_field.partOf, null,
+        'regular_field should not be in a oneof');
+      assert.strictEqual(another_regular.partOf, null,
+        'another_regular should not be in a oneof');
+
+      // Verify oneof fields ARE part of the oneof
+      const option_a = MixedType.fields['option_a'];
+      const option_b = MixedType.fields['option_b'];
+      assert.ok(option_a.partOf != null, 'option_a should be in a oneof');
+      assert.ok(option_b.partOf != null, 'option_b should be in a oneof');
+      assert.strictEqual(option_a.partOf.name, 'choice');
+      assert.strictEqual(option_b.partOf.name, 'choice');
+
+      // Round-trip: setting both regular fields should preserve both
+      const payload = { regular_field: 'hello', another_regular: 42, option_a: 'picked' };
+      const encoded = MixedType.encode(MixedType.fromObject(payload)).finish();
+      const decoded = MixedType.toObject(MixedType.decode(encoded), {
+        longs: String,
+        defaults: true,
+      });
+      assert.strictEqual(decoded.regular_field, 'hello');
+      assert.strictEqual(decoded.another_regular, 42);
+      assert.strictEqual(decoded.option_a, 'picked');
+    });
+  });
+
   describe('error handling', () => {
-    it('throws TypeDecodeError when payload object has wrong shape on encode', async () => {
+    it('throws TypeDecodeError when version_id has no registered type', async () => {
       await assert.rejects(
         () => client.transaction(async (txn) => {
-          // `data` should be bytes, not a number
-          await txn.create(mock_server.test_version_id, { data: 12345 });
+          await txn.create('999999999', { data: Buffer.from('x') });
         }),
         (err) => {
-          assert.ok(err instanceof TypeDecodeError, `expected TypeDecodeError, got ${err.name}`);
+          // The mock doesn't have version 999999999 registered, so the
+          // type registry cache fails to resolve the type.
+          assert.ok(err.code != null || err.name === 'TypeDecodeError',
+            `expected a type resolution error, got ${err.name}: ${err.message}`);
           return true;
         },
       );

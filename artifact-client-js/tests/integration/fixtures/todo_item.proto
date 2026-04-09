@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package todo;
+
+import "artifact_options.proto";
+
+message TodoItem {
+  option (artifact_system.indexes) = {
+    key_type: "todo_items_by_list"
+    key: ["list_id"]
+    order: { field: "artifact_id" direction: ASCENDING }
+  };
+
+  uint64 list_id = 1 [(artifact_system.references) = {
+    target_type_name: "todo.TodoList"
+    on_delete: RESTRICT
+  }];
+  string title = 2;
+  bool done = 3;
+}
