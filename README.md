@@ -111,7 +111,7 @@ Key fields may reference repeated scalar fields and fields nested within repeate
 
 **Path-correlated expansion:** Sibling fields within the same repeated message are correlated, not crossed. For the index `key: ["inputs.types", "is_view_capability"]` with order fields `inputs.name` and `inputs.required`, each emitted row binds `inputs.name` and `inputs.required` to the same `inputs` element that produced the `types` value.
 
-**Virtual `_index` fields:** For any repeated field in the ancestry chain, `<path>._index` can be used in order fields to expose the 0-based position of the element in its parent array. For example, `inputs._index` gives the position in the `inputs` array, and `inputs.types._index` gives the position in the `types` array within each input.
+**Virtual `_index` fields:** For any repeated field in the ancestry chain, `<path>._index` resolves to the 0-based position of the element in its parent array. It can be used in both key and order fields. For example, `inputs._index` gives the position in the `inputs` array, and `inputs.types._index` gives the position in the `types` array within each input. Virtual `_index` fields are typed as `uint32`.
 
 **Order field constraints:** Order fields may reference sibling scalars at any repeated depth already expanded by key fields, `_index` for any repeated in the chain, root-level scalars, or `artifact_id`. Order fields **cannot** introduce new repeated paths not already expanded by key fields.
 
