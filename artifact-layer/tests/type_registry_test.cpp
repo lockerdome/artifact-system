@@ -652,6 +652,44 @@ TEST_F(TypeRegistryTest, InvalidIndexDefinition_UnspecifiedOrder) {
   ExpectViolationCategory(result_or.status(), TypeRegistrationViolation::INVALID_INDEX_DEFINITION);
 }
 
+TEST_F(TypeRegistryTest, InvalidIndexDefinition_KeyFieldNotFound) {
+  const char* source = R"(
+    syntax = "proto3";
+    package test;
+    import "artifact_options.proto";
+    message BadKeyField {
+      option (artifact_system.indexes) = {
+        key_type: "bad_key_field"
+        key: ["nonexistent_field"]
+        order: { field: "artifact_id" direction: ASCENDING }
+      };
+      string name = 1;
+    }
+  )";
+  auto result_or = registry_->RegisterTypeVersion("test.BadKeyField", source);
+  ASSERT_FALSE(result_or.ok());
+  ExpectViolationCategory(result_or.status(), TypeRegistrationViolation::INVALID_INDEX_DEFINITION);
+}
+
+TEST_F(TypeRegistryTest, InvalidIndexDefinition_OrderFieldNotFound) {
+  const char* source = R"(
+    syntax = "proto3";
+    package test;
+    import "artifact_options.proto";
+    message BadOrderField {
+      option (artifact_system.indexes) = {
+        key_type: "bad_order_field"
+        key: ["name"]
+        order: { field: "nonexistent_field" direction: ASCENDING }
+      };
+      string name = 1;
+    }
+  )";
+  auto result_or = registry_->RegisterTypeVersion("test.BadOrderField", source);
+  ASSERT_FALSE(result_or.ok());
+  ExpectViolationCategory(result_or.status(), TypeRegistrationViolation::INVALID_INDEX_DEFINITION);
+}
+
 TEST_F(TypeRegistryTest, IndexIncompatibility_Removed) {
   // Register v1 with an index.
   auto v1_or = registry_->RegisterTypeVersion("test.SimpleArtifact", kSimpleProtoSource);
