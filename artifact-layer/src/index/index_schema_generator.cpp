@@ -47,8 +47,20 @@ std::string MakeUniqueFieldName(std::string base, std::set<std::string>* used_na
   }
 }
 
-// Alias for the shared field path resolver.
-const auto& ResolveFieldPath = artifact::ResolveFieldPathLeaf;
+// Check if a field path ends with the virtual _index segment.
+bool IsVirtualIndexPath(std::string_view path) {
+  return path.size() >= 6 && path.substr(path.size() - 6) == "_index" && (path.size() == 6 || path[path.size() - 7] == '.');
+}
+
+// Resolve a field path for index schema generation. Returns the leaf
+// FieldDescriptor, or nullptr for virtual _index paths.
+absl::StatusOr<const google::protobuf::FieldDescriptor*> ResolveIndexFieldLeaf(const google::protobuf::Descriptor& root, std::string_view path) {
+  auto resolved_or = artifact::ResolveIndexFieldPath(root, path);
+  if (!resolved_or.ok()) {
+    return resolved_or.status();
+  }
+  return artifact::IndexFieldPathLeaf(*resolved_or);
+}
 
 Type ToFieldType(const google::protobuf::FieldDescriptor& field) {
   return static_cast<Type>(field.type());
@@ -117,19 +129,32 @@ absl::StatusOr<GeneratedIndexSchema> GenerateIndexSchema(const artifact_system::
   key_message->set_name(key_name);
   std::set<std::string> key_names;
   for (int i = 0; i < index_definition.key_size(); ++i) {
-    auto field_or = ResolveFieldPath(parent_descriptor, index_definition.key(i));
+    const std::string& key_path = index_definition.key(i);
+    const std::string field_name = MakeUniqueFieldName(SanitizeForIdentifier(key_path), &key_names);
+    auto* oneof = key_message->add_oneof_decl();
+    oneof->set_name(absl::StrCat("_", field_name));
+
+    if (IsVirtualIndexPath(key_path)) {
+      auto* field = key_message->add_field();
+      field->set_name(field_name);
+      field->set_number(i + 1);
+      field->set_label(Label::FieldDescriptorProto_Label_LABEL_OPTIONAL);
+      field->set_type(Type::FieldDescriptorProto_Type_TYPE_UINT32);
+      field->set_proto3_optional(true);
+      field->set_oneof_index(key_message->oneof_decl_size() - 1);
+      continue;
+    }
+
+    auto field_or = ResolveIndexFieldLeaf(parent_descriptor, key_path);
     if (!field_or.ok()) {
       return field_or.status();
     }
-    const google::protobuf::FieldDescriptor* field = *field_or;
-    dependency_names.insert(std::string(field->file()->name()));
-    if (field->type() == google::protobuf::FieldDescriptor::TYPE_ENUM) {
-      dependency_names.insert(std::string(field->enum_type()->file()->name()));
+    const google::protobuf::FieldDescriptor* source = *field_or;
+    dependency_names.insert(std::string(source->file()->name()));
+    if (source->type() == google::protobuf::FieldDescriptor::TYPE_ENUM) {
+      dependency_names.insert(std::string(source->enum_type()->file()->name()));
     }
-    const std::string field_name = MakeUniqueFieldName(SanitizeForIdentifier(index_definition.key(i)), &key_names);
-    auto* oneof = key_message->add_oneof_decl();
-    oneof->set_name(absl::StrCat("_", field_name));
-    AddScalarField(key_message, field_name, i + 1, *field, Label::FieldDescriptorProto_Label_LABEL_OPTIONAL, key_message->oneof_decl_size() - 1);
+    AddScalarField(key_message, field_name, i + 1, *source, Label::FieldDescriptorProto_Label_LABEL_OPTIONAL, key_message->oneof_decl_size() - 1);
   }
 
   google::protobuf::DescriptorProto* value_message = file_proto.add_message_type();
@@ -152,7 +177,11 @@ absl::StatusOr<GeneratedIndexSchema> GenerateIndexSchema(const artifact_system::
       field->set_type(Type::FieldDescriptorProto_Type_TYPE_UINT64);
       continue;
     }
-    auto source_field_or = ResolveFieldPath(parent_descriptor, field_path);
+    if (IsVirtualIndexPath(field_path)) {
+      field->set_type(Type::FieldDescriptorProto_Type_TYPE_UINT32);
+      continue;
+    }
+    auto source_field_or = ResolveIndexFieldLeaf(parent_descriptor, field_path);
     if (!source_field_or.ok()) {
       return source_field_or.status();
     }

@@ -20,6 +20,7 @@
 #include "artifact/artifact_store.h"
 #include "artifact/field_path.h"
 #include "artifact/proto_utils.h"
+#include "index/repeated_chain_analysis.h"
 #include "artifact_internal.pb.h"
 #include "artifact_options.pb.h"
 #include "artifact_service.pb.h"
@@ -93,41 +94,42 @@ std::vector<TypeRegistrationViolation> ValidateNewIndexDefinition(const IndexDef
   }
 
   // Validate that all indexed field paths resolve on the descriptor.
-  // Collects the resolved fields for the repeated-field check below.
-  auto validate_field = [&](const std::string& role, const std::string& field_path) -> const google::protobuf::FieldDescriptor* {
-    auto field_or = artifact::ResolveFieldPathLeaf(descriptor, field_path);
-    if (!field_or.ok()) {
+  auto validate_field = [&](const std::string& role, const std::string& field_path) {
+    auto resolved_or = artifact::ResolveIndexFieldPath(descriptor, field_path);
+    if (!resolved_or.ok()) {
       TypeRegistrationViolation v;
       v.set_category(TypeRegistrationViolation::INVALID_INDEX_DEFINITION);
       v.set_subject(subject);
-      v.set_description(absl::StrCat("invalid ", role, " field '", field_path, "': ", field_or.status().message()));
+      v.set_description(absl::StrCat("invalid ", role, " field '", field_path, "': ", resolved_or.status().message()));
       violations.push_back(std::move(v));
-      return nullptr;
     }
-    return *field_or;
   };
 
-  int repeated_count = 0;
   for (const auto& key_field_name : def.key()) {
-    const auto* field = validate_field("key", key_field_name);
-    if (field != nullptr && field->is_repeated()) {
-      ++repeated_count;
-    }
+    validate_field("key", key_field_name);
   }
   for (const auto& order : def.order()) {
     if (order.field() == "artifact_id")
       continue;
-    const auto* field = validate_field("order", order.field());
-    if (field != nullptr && field->is_repeated()) {
-      ++repeated_count;
+    validate_field("order", order.field());
+  }
+
+  // Validate that repeated fields form a single linear ancestry chain.
+  // Collect key and order paths for chain analysis.
+  std::vector<std::string> key_paths(def.key().begin(), def.key().end());
+  std::vector<std::string> order_paths;
+  for (const auto& order : def.order()) {
+    if (order.field() != "artifact_id") {
+      order_paths.push_back(order.field());
     }
   }
 
-  if (repeated_count > 1) {
+  auto chain_or = index::AnalyzeRepeatedChain(descriptor, key_paths, order_paths);
+  if (!chain_or.ok()) {
     TypeRegistrationViolation v;
     v.set_category(TypeRegistrationViolation::INVALID_INDEX_DEFINITION);
     v.set_subject(subject);
-    v.set_description("more than one repeated field referenced across key and order fields");
+    v.set_description(std::string(chain_or.status().message()));
     violations.push_back(std::move(v));
   }
 
