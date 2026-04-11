@@ -13,6 +13,7 @@
 
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_split.h"
 #include "artifact/field_path.h"
 #include "artifact_options.pb.h"
 #include "encoding/index_key_encoder.h"
@@ -20,29 +21,56 @@
 #include "google/protobuf/dynamic_message.h"
 #include "google/protobuf/message.h"
 #include "google/protobuf/reflection.h"
+#include "index/repeated_chain_analysis.h"
 
 namespace artifact_system::index {
 namespace {
 
-// Alias for the shared field path resolver.
-const auto& ResolveFieldPath = artifact::ResolveFieldPath;
+struct IndexFieldInfo {
+  std::string path;
+  artifact::ResolvedIndexFieldPath resolved;
+};
 
-absl::StatusOr<const google::protobuf::Message*> ResolveLeafParentMessage(const google::protobuf::Message& root,
-                                                                          const std::vector<const google::protobuf::FieldDescriptor*>& path) {
+struct ExpansionContext {
+  std::unordered_map<std::string, int> repeated_indices;
+};
+
+// Navigate from root through the segments of a resolved field path to reach the
+// parent message of the leaf field. Uses ctx.repeated_indices for repeated
+// message intermediates. Returns nullptr if an optional message is not set.
+absl::StatusOr<const google::protobuf::Message*> NavigateToLeafParent(const google::protobuf::Message& root,
+                                                                      const artifact::ResolvedIndexFieldPath& resolved, std::string_view path,
+                                                                      const ExpansionContext& ctx) {
   const google::protobuf::Message* current = &root;
-  for (size_t i = 0; i + 1 < path.size(); ++i) {
-    const auto* field = path[i];
-    if (field->cpp_type() != google::protobuf::FieldDescriptor::CPPTYPE_MESSAGE) {
-      return absl::InvalidArgumentError("non-message intermediate field in path");
+  const std::vector<std::string_view> parts = absl::StrSplit(path, '.');
+  std::string prefix;
+
+  for (size_t i = 0; i + 1 < resolved.segments.size(); ++i) {
+    const auto& seg = resolved.segments[i];
+    if (seg.is_virtual_index) {
+      break;
     }
-    if (field->is_repeated()) {
-      return absl::InvalidArgumentError("repeated message intermediate fields are not supported in path");
+    if (!prefix.empty()) {
+      prefix.push_back('.');
     }
+    prefix.append(parts[i].data(), parts[i].size());
+
     const auto* reflection = current->GetReflection();
-    if (field->has_presence() && !reflection->HasField(*current, field)) {
-      return static_cast<const google::protobuf::Message*>(nullptr);
+    if (seg.is_repeated) {
+      auto it = ctx.repeated_indices.find(prefix);
+      if (it == ctx.repeated_indices.end()) {
+        return absl::InternalError(absl::StrCat("repeated index missing for: ", prefix));
+      }
+      if (it->second >= reflection->FieldSize(*current, seg.descriptor)) {
+        return static_cast<const google::protobuf::Message*>(nullptr);
+      }
+      current = &reflection->GetRepeatedMessage(*current, seg.descriptor, it->second);
+    } else {
+      if (seg.descriptor->has_presence() && !reflection->HasField(*current, seg.descriptor)) {
+        return static_cast<const google::protobuf::Message*>(nullptr);
+      }
+      current = &reflection->GetMessage(*current, seg.descriptor);
     }
-    current = &reflection->GetMessage(*current, field);
   }
   return current;
 }
@@ -203,126 +231,211 @@ absl::StatusOr<std::string> EncodedIndexCellString(const IndexCell& cell) {
   return std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size());
 }
 
-struct ResolvedKeyField {
-  std::string field_path;
-  std::vector<const google::protobuf::FieldDescriptor*> resolved_path;
-};
+// Extract a scalar value for a field given the current expansion context.
+// Returns nullopt if the value is absent (optional not set), meaning the entry
+// should be skipped.
+absl::StatusOr<std::optional<IndexCell>> ExtractFieldValueInContext(const google::protobuf::Message& root, const IndexFieldInfo& field_info,
+                                                                    const ExpansionContext& ctx) {
+  // Virtual _index field: return the iteration index of the parent repeated.
+  if (field_info.resolved.leaf_is_virtual_index) {
+    const size_t last_dot = field_info.path.rfind('.');
+    if (last_dot == std::string::npos) {
+      return absl::InternalError("_index path has no parent prefix");
+    }
+    const std::string parent_prefix = field_info.path.substr(0, last_dot);
+    const auto it = ctx.repeated_indices.find(parent_prefix);
+    if (it == ctx.repeated_indices.end()) {
+      return absl::InternalError(absl::StrCat("_index context missing for: ", parent_prefix));
+    }
+    return std::optional<IndexCell>(IndexCell(static_cast<uint32_t>(it->second)));
+  }
 
-absl::StatusOr<std::vector<IndexCell>> ExtractKeyCandidates(const google::protobuf::Message& artifact_message, const ResolvedKeyField& key_field) {
-  auto parent_or = ResolveLeafParentMessage(artifact_message, key_field.resolved_path);
+  auto parent_or = NavigateToLeafParent(root, field_info.resolved, field_info.path, ctx);
   if (!parent_or.ok()) {
     return parent_or.status();
   }
-  const google::protobuf::Message* parent_message = *parent_or;
-  if (parent_message == nullptr) {
-    return std::vector<IndexCell>{};
+  if (*parent_or == nullptr) {
+    return std::optional<IndexCell>{};
   }
 
-  const auto* leaf = key_field.resolved_path.back();
-  const auto* reflection = parent_message->GetReflection();
+  const auto* parent = *parent_or;
+  const auto& leaf_seg = field_info.resolved.segments.back();
+  const auto* leaf_fd = leaf_seg.descriptor;
+  const auto* reflection = parent->GetReflection();
 
-  if (leaf->is_repeated()) {
-    const int count = reflection->FieldSize(*parent_message, leaf);
-    std::vector<IndexCell> values;
-    std::set<std::string> seen;
-    values.reserve(count);
-    for (int i = 0; i < count; ++i) {
-      auto value_or = ScalarValueForField(*parent_message, *leaf, i);
-      if (!value_or.ok()) {
-        return value_or.status();
-      }
-      auto encoded_or = EncodedIndexCellString(*value_or);
-      if (!encoded_or.ok()) {
-        return encoded_or.status();
-      }
-      if (seen.insert(*encoded_or).second) {
-        values.push_back(*std::move(value_or));
-      }
+  if (leaf_seg.is_repeated) {
+    const auto it = ctx.repeated_indices.find(field_info.path);
+    if (it == ctx.repeated_indices.end()) {
+      return absl::InternalError(absl::StrCat("repeated index missing for leaf: ", field_info.path));
     }
-    return values;
+    if (it->second >= reflection->FieldSize(*parent, leaf_fd)) {
+      return std::optional<IndexCell>{};
+    }
+    auto val = ScalarValueForField(*parent, *leaf_fd, it->second);
+    if (!val.ok()) {
+      return val.status();
+    }
+    return std::optional<IndexCell>(*std::move(val));
   }
 
-  if (leaf->has_presence() && !reflection->HasField(*parent_message, leaf)) {
-    return std::vector<IndexCell>{};
+  if (leaf_fd->has_presence() && !reflection->HasField(*parent, leaf_fd)) {
+    return std::optional<IndexCell>{};
   }
-
-  auto value_or = ScalarValueForField(*parent_message, *leaf, -1);
-  if (!value_or.ok()) {
-    return value_or.status();
+  auto val = ScalarValueForField(*parent, *leaf_fd, -1);
+  if (!val.ok()) {
+    return val.status();
   }
-  return std::vector<IndexCell>{*std::move(value_or)};
+  return std::optional<IndexCell>(*std::move(val));
 }
 
-struct KeySelection {
-  std::vector<IndexCell> ordered_values;
-  std::unordered_map<std::string, IndexCell> by_path;
-};
+// Get the element count for a repeated field at a given chain depth.
+absl::StatusOr<int> GetChainFieldCount(const google::protobuf::Message& root, const RepeatedChainAnalysis& analysis, int chain_depth,
+                                       const ExpansionContext& ctx) {
+  const auto& ancestor = analysis.chain[static_cast<size_t>(chain_depth)];
+  const std::vector<std::string_view> parts = absl::StrSplit(ancestor.path_prefix, '.');
 
-void BuildKeyCombinations(const std::vector<ResolvedKeyField>& key_fields, const std::vector<std::vector<IndexCell>>& candidates_by_field, size_t cursor,
-                          KeySelection* current, std::vector<KeySelection>* out) {
-  if (cursor == candidates_by_field.size()) {
-    out->push_back(*current);
-    return;
-  }
-  for (const IndexCell& candidate : candidates_by_field[cursor]) {
-    current->ordered_values.push_back(candidate);
-    current->by_path[key_fields[cursor].field_path] = candidate;
-    BuildKeyCombinations(key_fields, candidates_by_field, cursor + 1, current, out);
-    current->ordered_values.pop_back();
-    current->by_path.erase(key_fields[cursor].field_path);
-  }
-}
+  // Navigate to the parent message containing this repeated field.
+  const google::protobuf::Message* parent = &root;
+  std::string prefix;
+  for (size_t i = 0; i + 1 < parts.size(); ++i) {
+    if (!prefix.empty()) {
+      prefix.push_back('.');
+    }
+    prefix.append(parts[i].data(), parts[i].size());
 
-absl::StatusOr<std::optional<std::vector<IndexCell>>> ExtractOrderValues(const artifact_system::IndexDefinition& index_definition,
-                                                                         const google::protobuf::Message& artifact_message, uint64_t artifact_id,
-                                                                         const std::unordered_map<std::string, IndexCell>& key_selection_by_path) {
-  std::vector<IndexCell> values;
-  values.reserve(index_definition.order_size());
-
-  for (const auto& order : index_definition.order()) {
-    if (order.direction() == artifact_system::OrderDefinition::ORDER_BY_UNSPECIFIED) {
-      return absl::InvalidArgumentError("index definition must include explicit order direction");
+    const auto* field = parent->GetDescriptor()->FindFieldByName(std::string(parts[i]));
+    if (field == nullptr) {
+      return absl::InternalError(absl::StrCat("field not found: ", parts[i]));
     }
-    if (order.field() == "artifact_id") {
-      values.push_back(artifact_id);
-      continue;
-    }
-
-    auto path_or = ResolveFieldPath(*artifact_message.GetDescriptor(), order.field());
-    if (!path_or.ok()) {
-      return path_or.status();
-    }
-    auto parent_or = ResolveLeafParentMessage(artifact_message, *path_or);
-    if (!parent_or.ok()) {
-      return parent_or.status();
-    }
-    const google::protobuf::Message* parent = *parent_or;
-    if (parent == nullptr) {
-      return std::optional<std::vector<IndexCell>>{};
-    }
-
-    const auto* leaf = path_or->back();
-    if (leaf->is_repeated()) {
-      const auto selection_it = key_selection_by_path.find(order.field());
-      if (selection_it == key_selection_by_path.end()) {
-        return absl::InvalidArgumentError(absl::StrCat("repeated order field must also be a key field: ", order.field()));
-      }
-      values.push_back(selection_it->second);
-      continue;
-    }
-
     const auto* reflection = parent->GetReflection();
-    if (leaf->has_presence() && !reflection->HasField(*parent, leaf)) {
-      return std::optional<std::vector<IndexCell>>{};
+    if (field->is_repeated()) {
+      const auto it = ctx.repeated_indices.find(prefix);
+      if (it == ctx.repeated_indices.end()) {
+        return absl::InternalError(absl::StrCat("repeated index missing for: ", prefix));
+      }
+      if (it->second >= reflection->FieldSize(*parent, field)) {
+        return 0;
+      }
+      parent = &reflection->GetRepeatedMessage(*parent, field, it->second);
+    } else {
+      if (field->has_presence() && !reflection->HasField(*parent, field)) {
+        return 0;
+      }
+      parent = &reflection->GetMessage(*parent, field);
     }
-    auto value_or = ScalarValueForField(*parent, *leaf, -1);
-    if (!value_or.ok()) {
-      return value_or.status();
-    }
-    values.push_back(*std::move(value_or));
   }
 
-  return values;
+  return parent->GetReflection()->FieldSize(*parent, ancestor.descriptor);
+}
+
+// Emit a single index entry from the current expansion context.
+absl::StatusOr<std::optional<DerivedIndexEntry>> EmitEntry(const google::protobuf::Message& root, const std::vector<IndexFieldInfo>& key_fields,
+                                                           const artifact_system::IndexDefinition& index_def,
+                                                           const std::vector<IndexFieldInfo>& order_fields, uint64_t artifact_id,
+                                                           uint64_t index_def_id, const ExpansionContext& ctx) {
+  std::vector<IndexCell> key_values;
+  key_values.reserve(key_fields.size());
+  for (const auto& kf : key_fields) {
+    auto val_or = ExtractFieldValueInContext(root, kf, ctx);
+    if (!val_or.ok()) {
+      return val_or.status();
+    }
+    if (!val_or->has_value()) {
+      return std::optional<DerivedIndexEntry>{};
+    }
+    key_values.push_back(std::move(val_or->value()));
+  }
+
+  std::vector<IndexCell> order_values;
+  order_values.reserve(static_cast<size_t>(index_def.order_size()));
+  for (const auto& of : order_fields) {
+    if (of.path == "artifact_id") {
+      order_values.push_back(artifact_id);
+      continue;
+    }
+    auto val_or = ExtractFieldValueInContext(root, of, ctx);
+    if (!val_or.ok()) {
+      return val_or.status();
+    }
+    if (!val_or->has_value()) {
+      return std::optional<DerivedIndexEntry>{};
+    }
+    order_values.push_back(std::move(val_or->value()));
+  }
+
+  std::vector<uint8_t> encoded_key;
+  for (const IndexCell& value : key_values) {
+    absl::Status encode_status = EncodeIndexCell(value, &encoded_key);
+    if (!encode_status.ok()) {
+      return encode_status;
+    }
+  }
+
+  DerivedIndexEntry entry;
+  entry.index_def_id = index_def_id;
+  entry.key_type = index_def.key_type();
+  entry.encoded_key = std::move(encoded_key);
+  entry.order_values = std::move(order_values);
+  entry.key_values = std::move(key_values);
+  return std::optional<DerivedIndexEntry>(std::move(entry));
+}
+
+// Recursively expand nested repeated fields, emitting index entries at the
+// deepest level. Each recursion level iterates over one repeated field in the
+// ancestry chain.
+absl::Status ExpandNestedRepeated(const google::protobuf::Message& root, const RepeatedChainAnalysis& analysis,
+                                  const std::vector<IndexFieldInfo>& key_fields, const artifact_system::IndexDefinition& index_def,
+                                  const std::vector<IndexFieldInfo>& order_fields, uint64_t artifact_id, uint64_t index_def_id, int chain_depth,
+                                  ExpansionContext* ctx, std::vector<DerivedIndexEntry>* out) {
+  if (chain_depth == static_cast<int>(analysis.chain.size())) {
+    auto entry_or = EmitEntry(root, key_fields, index_def, order_fields, artifact_id, index_def_id, *ctx);
+    if (!entry_or.ok()) {
+      return entry_or.status();
+    }
+    if (entry_or->has_value()) {
+      out->push_back(std::move(entry_or->value()));
+    }
+    return absl::OkStatus();
+  }
+
+  auto count_or = GetChainFieldCount(root, analysis, chain_depth, *ctx);
+  if (!count_or.ok()) {
+    return count_or.status();
+  }
+  const int count = *count_or;
+
+  const auto& ancestor = analysis.chain[static_cast<size_t>(chain_depth)];
+  for (int i = 0; i < count; ++i) {
+    ctx->repeated_indices[ancestor.path_prefix] = i;
+    absl::Status status = ExpandNestedRepeated(root, analysis, key_fields, index_def, order_fields, artifact_id, index_def_id, chain_depth + 1, ctx, out);
+    if (!status.ok()) {
+      return status;
+    }
+  }
+  ctx->repeated_indices.erase(ancestor.path_prefix);
+  return absl::OkStatus();
+}
+
+// Deduplicate entries with identical encoded key and order values.
+void DeduplicateEntries(std::vector<DerivedIndexEntry>* entries) {
+  std::set<std::string> seen;
+  auto write = entries->begin();
+  for (auto read = entries->begin(); read != entries->end(); ++read) {
+    std::vector<uint8_t> fingerprint = read->encoded_key;
+    for (const auto& cell : read->order_values) {
+      // Errors in fingerprint encoding are not possible here since the cells
+      // were already validated during extraction.
+      EncodeIndexCell(cell, &fingerprint).IgnoreError();
+    }
+    std::string fp_str(reinterpret_cast<const char*>(fingerprint.data()), fingerprint.size());
+    if (seen.insert(std::move(fp_str)).second) {
+      if (write != read) {
+        *write = std::move(*read);
+      }
+      ++write;
+    }
+  }
+  entries->erase(write, entries->end());
 }
 
 } // namespace
@@ -338,86 +451,75 @@ absl::StatusOr<std::vector<DerivedIndexEntry>> DeriveIndexEntries(const google::
   std::vector<DerivedIndexEntry> out;
 
   for (int index_num = 0; index_num < options.ExtensionSize(artifact_system::indexes); ++index_num) {
-    const artifact_system::IndexDefinition& index_definition = options.GetExtension(artifact_system::indexes, index_num);
+    const artifact_system::IndexDefinition& index_def = options.GetExtension(artifact_system::indexes, index_num);
 
-    std::vector<ResolvedKeyField> key_fields;
-    key_fields.reserve(index_definition.key_size());
-    std::set<std::string> repeated_paths;
-    for (const std::string& key_field : index_definition.key()) {
-      auto resolved_or = ResolveFieldPath(descriptor, key_field);
+    // Resolve key fields.
+    std::vector<IndexFieldInfo> key_fields;
+    std::vector<std::string> key_paths;
+    key_fields.reserve(index_def.key_size());
+    key_paths.reserve(index_def.key_size());
+    for (const auto& key_path : index_def.key()) {
+      auto resolved_or = artifact::ResolveIndexFieldPath(descriptor, key_path);
       if (!resolved_or.ok()) {
         return resolved_or.status();
       }
-      if (resolved_or->back()->is_repeated()) {
-        repeated_paths.insert(key_field);
-      }
-      key_fields.push_back({key_field, *std::move(resolved_or)});
+      key_fields.push_back({key_path, *std::move(resolved_or)});
+      key_paths.push_back(key_path);
     }
-    for (const auto& order : index_definition.order()) {
+
+    // Resolve order fields. "artifact_id" gets a placeholder.
+    std::vector<IndexFieldInfo> order_fields;
+    std::vector<std::string> order_paths_for_analysis;
+    order_fields.reserve(index_def.order_size());
+    for (const auto& order : index_def.order()) {
       if (order.field() == "artifact_id") {
+        IndexFieldInfo info;
+        info.path = "artifact_id";
+        order_fields.push_back(std::move(info));
         continue;
       }
-      auto resolved_or = ResolveFieldPath(descriptor, order.field());
+      auto resolved_or = artifact::ResolveIndexFieldPath(descriptor, order.field());
       if (!resolved_or.ok()) {
         return resolved_or.status();
       }
-      if (resolved_or->back()->is_repeated()) {
-        repeated_paths.insert(order.field());
-      }
-    }
-    if (repeated_paths.size() > 1) {
-      return absl::InvalidArgumentError("INVALID_INDEX_DEFINITION: at most one repeated field is allowed per index");
+      order_fields.push_back({order.field(), *std::move(resolved_or)});
+      order_paths_for_analysis.push_back(order.field());
     }
 
-    std::vector<std::vector<IndexCell>> candidates_by_field;
-    candidates_by_field.reserve(key_fields.size());
-    bool skip_index = false;
-    for (const ResolvedKeyField& key_field : key_fields) {
-      auto candidates_or = ExtractKeyCandidates(artifact_message, key_field);
-      if (!candidates_or.ok()) {
-        return candidates_or.status();
-      }
-      if (candidates_or->empty()) {
-        skip_index = true;
-        break;
-      }
-      candidates_by_field.push_back(*std::move(candidates_or));
+    // Analyze repeated ancestry chain.
+    auto analysis_or = AnalyzeRepeatedChain(descriptor, key_paths, order_paths_for_analysis);
+    if (!analysis_or.ok()) {
+      return analysis_or.status();
     }
-    if (skip_index) {
-      continue;
+    const auto& analysis = *analysis_or;
+
+    uint64_t index_def_id = 0;
+    const auto id_it = index_def_ids_by_key_type.find(index_def.key_type());
+    if (id_it != index_def_ids_by_key_type.end()) {
+      index_def_id = id_it->second;
     }
 
-    std::vector<KeySelection> key_combinations;
-    KeySelection current;
-    BuildKeyCombinations(key_fields, candidates_by_field, 0, &current, &key_combinations);
-
-    for (const KeySelection& key_selection : key_combinations) {
-      auto order_values_or = ExtractOrderValues(index_definition, artifact_message, artifact_id, key_selection.by_path);
-      if (!order_values_or.ok()) {
-        return order_values_or.status();
+    if (analysis.chain.empty()) {
+      // No repeated fields: emit a single entry directly.
+      ExpansionContext ctx;
+      auto entry_or = EmitEntry(artifact_message, key_fields, index_def, order_fields, artifact_id, index_def_id, ctx);
+      if (!entry_or.ok()) {
+        return entry_or.status();
       }
-      if (!order_values_or->has_value()) {
-        continue;
+      if (entry_or->has_value()) {
+        out.push_back(std::move(entry_or->value()));
       }
-
-      std::vector<uint8_t> encoded_key;
-      for (const IndexCell& value : key_selection.ordered_values) {
-        absl::Status encode_status = EncodeIndexCell(value, &encoded_key);
-        if (!encode_status.ok()) {
-          return encode_status;
-        }
+    } else {
+      // Recursive expansion through nested repeated chain.
+      ExpansionContext ctx;
+      std::vector<DerivedIndexEntry> index_entries;
+      absl::Status status =
+          ExpandNestedRepeated(artifact_message, analysis, key_fields, index_def, order_fields, artifact_id, index_def_id, 0, &ctx, &index_entries);
+      if (!status.ok()) {
+        return status;
       }
-
-      DerivedIndexEntry entry;
-      const auto id_it = index_def_ids_by_key_type.find(index_definition.key_type());
-      if (id_it != index_def_ids_by_key_type.end()) {
-        entry.index_def_id = id_it->second;
-      }
-      entry.key_type = index_definition.key_type();
-      entry.encoded_key = std::move(encoded_key);
-      entry.order_values = std::move(order_values_or->value());
-      entry.key_values = key_selection.ordered_values;
-      out.push_back(std::move(entry));
+      DeduplicateEntries(&index_entries);
+      out.insert(out.end(), std::make_move_iterator(index_entries.begin()), std::make_move_iterator(index_entries.end()));
     }
   }
 
