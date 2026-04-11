@@ -245,5 +245,96 @@ TEST(IndexSchemaGeneratorTest, GeneratesMultiKeyAndMultiOrderSchema) {
   EXPECT_EQ(schema.value_fields[1], artifact_id_col);
 }
 
+TEST(IndexSchemaGeneratorTest, VirtualIndexOrderFieldGeneratesUint32) {
+  google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
+
+  google::protobuf::FileDescriptorProto file;
+  file.set_name("index_schema_generator_virtual_index.proto");
+  file.set_package("artifact_system.testing");
+  file.set_syntax("proto3");
+  file.add_dependency("artifact_options.proto");
+
+  auto* input_msg = file.add_message_type();
+  input_msg->set_name("SchemaInput");
+  auto* input_name = input_msg->add_field();
+  input_name->set_name("name");
+  input_name->set_number(1);
+  input_name->set_label(google::protobuf::FieldDescriptorProto::LABEL_OPTIONAL);
+  input_name->set_type(google::protobuf::FieldDescriptorProto::TYPE_STRING);
+  auto* input_types = input_msg->add_field();
+  input_types->set_name("types");
+  input_types->set_number(2);
+  input_types->set_label(google::protobuf::FieldDescriptorProto::LABEL_REPEATED);
+  input_types->set_type(google::protobuf::FieldDescriptorProto::TYPE_UINT64);
+
+  auto* message = file.add_message_type();
+  message->set_name("VirtualIndexSchemaArtifact");
+  auto* inputs = message->add_field();
+  inputs->set_name("inputs");
+  inputs->set_number(1);
+  inputs->set_label(google::protobuf::FieldDescriptorProto::LABEL_REPEATED);
+  inputs->set_type(google::protobuf::FieldDescriptorProto::TYPE_MESSAGE);
+  inputs->set_type_name("SchemaInput");
+
+  auto* index = message->mutable_options()->AddExtension(artifact_system::indexes);
+  index->set_key_type("by_type_virtual");
+  index->add_key("inputs.types");
+  auto* o1 = index->add_order();
+  o1->set_field("inputs._index");
+  o1->set_direction(artifact_system::OrderDefinition::ASCENDING);
+  auto* o2 = index->add_order();
+  o2->set_field("inputs.name");
+  o2->set_direction(artifact_system::OrderDefinition::ASCENDING);
+  auto* o3 = index->add_order();
+  o3->set_field("inputs.types._index");
+  o3->set_direction(artifact_system::OrderDefinition::ASCENDING);
+  auto* o4 = index->add_order();
+  o4->set_field("artifact_id");
+  o4->set_direction(artifact_system::OrderDefinition::ASCENDING);
+
+  const auto* built_file = pool.BuildFile(file);
+  ASSERT_NE(built_file, nullptr);
+  const auto* descriptor = built_file->FindMessageTypeByName("VirtualIndexSchemaArtifact");
+  ASSERT_NE(descriptor, nullptr);
+
+  const auto& opts = descriptor->options();
+  ASSERT_EQ(opts.ExtensionSize(artifact_system::indexes), 1);
+  const auto& def = opts.GetExtension(artifact_system::indexes, 0);
+
+  auto schema_or = index::GenerateIndexSchema(def, *descriptor);
+  ASSERT_TRUE(schema_or.ok()) << schema_or.status();
+  const index::GeneratedIndexSchema& schema = *schema_or;
+
+  // Key field: inputs.types should be uint64.
+  const auto* key1 = schema.key_descriptor->FindFieldByNumber(1);
+  ASSERT_NE(key1, nullptr);
+  EXPECT_EQ(key1->type(), google::protobuf::FieldDescriptor::TYPE_UINT64);
+
+  // Value fields: row_count(1), inputs._index(2), inputs.name(3),
+  //               inputs.types._index(4), artifact_id(5).
+  EXPECT_EQ(schema.value_descriptor->field_count(), 5);
+
+  // inputs._index -> TYPE_UINT32
+  const auto* vindex1 = schema.value_descriptor->FindFieldByNumber(2);
+  ASSERT_NE(vindex1, nullptr);
+  EXPECT_EQ(vindex1->type(), google::protobuf::FieldDescriptor::TYPE_UINT32);
+  EXPECT_TRUE(vindex1->is_repeated());
+
+  // inputs.name -> TYPE_STRING
+  const auto* name_col = schema.value_descriptor->FindFieldByNumber(3);
+  ASSERT_NE(name_col, nullptr);
+  EXPECT_EQ(name_col->type(), google::protobuf::FieldDescriptor::TYPE_STRING);
+
+  // inputs.types._index -> TYPE_UINT32
+  const auto* vindex2 = schema.value_descriptor->FindFieldByNumber(4);
+  ASSERT_NE(vindex2, nullptr);
+  EXPECT_EQ(vindex2->type(), google::protobuf::FieldDescriptor::TYPE_UINT32);
+
+  // artifact_id -> TYPE_UINT64
+  const auto* aid_col = schema.value_descriptor->FindFieldByNumber(5);
+  ASSERT_NE(aid_col, nullptr);
+  EXPECT_EQ(aid_col->type(), google::protobuf::FieldDescriptor::TYPE_UINT64);
+}
+
 } // namespace
 } // namespace artifact_system::testing
