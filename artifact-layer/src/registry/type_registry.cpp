@@ -13,12 +13,12 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
-#include "absl/strings/str_split.h"
 #include "google/protobuf/descriptor.h"
 #include "google/protobuf/descriptor.pb.h"
 #include "google/protobuf/dynamic_message.h"
 
 #include "artifact/artifact_store.h"
+#include "artifact/field_path.h"
 #include "artifact/proto_utils.h"
 #include "artifact_internal.pb.h"
 #include "artifact_options.pb.h"
@@ -76,72 +76,49 @@ std::vector<ExtractedReference> ExtractReferenceDeclarations(const google::proto
   return result;
 }
 
-// Resolve a potentially dotted field path on a descriptor, returning the leaf
-// FieldDescriptor or nullptr if any segment is not found.
-const google::protobuf::FieldDescriptor* ResolveFieldPath(const google::protobuf::Descriptor& root, const std::string& path) {
-  const google::protobuf::Descriptor* current = &root;
-  const google::protobuf::FieldDescriptor* resolved = nullptr;
-  for (const auto segment : absl::StrSplit(path, '.')) {
-    if (current == nullptr)
-      return nullptr;
-    resolved = current->FindFieldByName(segment);
-    if (resolved == nullptr)
-      return nullptr;
-    if (resolved->cpp_type() == google::protobuf::FieldDescriptor::CPPTYPE_MESSAGE) {
-      current = resolved->message_type();
-    } else {
-      current = nullptr;
-    }
-  }
-  return resolved;
-}
-
 // Validate a new index definition structurally.
 std::vector<TypeRegistrationViolation> ValidateNewIndexDefinition(const IndexDefinition& def, const google::protobuf::Descriptor& descriptor) {
   std::vector<TypeRegistrationViolation> violations;
+  const std::string subject = absl::StrCat("index: ", def.key_type());
 
   // Check ORDER_BY_UNSPECIFIED on order fields.
   for (const auto& order : def.order()) {
     if (order.direction() == OrderDefinition::ORDER_BY_UNSPECIFIED) {
       TypeRegistrationViolation v;
       v.set_category(TypeRegistrationViolation::INVALID_INDEX_DEFINITION);
-      v.set_subject(absl::StrCat("index: ", def.key_type()));
+      v.set_subject(subject);
       v.set_description(absl::StrCat("order field '", order.field(), "' has ORDER_BY_UNSPECIFIED direction"));
       violations.push_back(std::move(v));
     }
   }
 
-  // Validate key fields exist and check for repeated fields.
-  int repeated_count = 0;
-  for (const auto& key_field_name : def.key()) {
-    const auto* field = ResolveFieldPath(descriptor, key_field_name);
-    if (field == nullptr) {
+  // Validate that all indexed field paths resolve on the descriptor.
+  // Collects the resolved fields for the repeated-field check below.
+  auto validate_field = [&](const std::string& role, const std::string& field_path) -> const google::protobuf::FieldDescriptor* {
+    auto field_or = artifact::ResolveFieldPathLeaf(descriptor, field_path);
+    if (!field_or.ok()) {
       TypeRegistrationViolation v;
       v.set_category(TypeRegistrationViolation::INVALID_INDEX_DEFINITION);
-      v.set_subject(absl::StrCat("index: ", def.key_type()));
-      v.set_description(absl::StrCat("key field '", key_field_name, "' not found on message '", descriptor.full_name(), "'"));
+      v.set_subject(subject);
+      v.set_description(absl::StrCat("invalid ", role, " field '", field_path, "': ", field_or.status().message()));
       violations.push_back(std::move(v));
-      continue;
+      return nullptr;
     }
-    if (field->is_repeated()) {
+    return *field_or;
+  };
+
+  int repeated_count = 0;
+  for (const auto& key_field_name : def.key()) {
+    const auto* field = validate_field("key", key_field_name);
+    if (field != nullptr && field->is_repeated()) {
       ++repeated_count;
     }
   }
-
-  // Validate order fields exist and check for repeated fields.
   for (const auto& order : def.order()) {
     if (order.field() == "artifact_id")
       continue;
-    const auto* field = ResolveFieldPath(descriptor, order.field());
-    if (field == nullptr) {
-      TypeRegistrationViolation v;
-      v.set_category(TypeRegistrationViolation::INVALID_INDEX_DEFINITION);
-      v.set_subject(absl::StrCat("index: ", def.key_type()));
-      v.set_description(absl::StrCat("order field '", order.field(), "' not found on message '", descriptor.full_name(), "'"));
-      violations.push_back(std::move(v));
-      continue;
-    }
-    if (field->is_repeated()) {
+    const auto* field = validate_field("order", order.field());
+    if (field != nullptr && field->is_repeated()) {
       ++repeated_count;
     }
   }
@@ -149,7 +126,7 @@ std::vector<TypeRegistrationViolation> ValidateNewIndexDefinition(const IndexDef
   if (repeated_count > 1) {
     TypeRegistrationViolation v;
     v.set_category(TypeRegistrationViolation::INVALID_INDEX_DEFINITION);
-    v.set_subject(absl::StrCat("index: ", def.key_type()));
+    v.set_subject(subject);
     v.set_description("more than one repeated field referenced across key and order fields");
     violations.push_back(std::move(v));
   }

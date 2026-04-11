@@ -12,6 +12,8 @@
 #include "absl/strings/str_split.h"
 #include "google/protobuf/descriptor.pb.h"
 
+#include "artifact/field_path.h"
+
 namespace artifact_system::index {
 namespace {
 
@@ -45,42 +47,8 @@ std::string MakeUniqueFieldName(std::string base, std::set<std::string>* used_na
   }
 }
 
-absl::StatusOr<const google::protobuf::FieldDescriptor*> ResolveFieldPath(const google::protobuf::Descriptor& root, std::string_view path) {
-  if (path.empty()) {
-    return absl::InvalidArgumentError("field path cannot be empty");
-  }
-  const google::protobuf::Descriptor* current = &root;
-  const google::protobuf::FieldDescriptor* resolved = nullptr;
-  const std::vector<std::string_view> segments = absl::StrSplit(path, '.');
-  for (size_t i = 0; i < segments.size(); ++i) {
-    const std::string_view segment = segments[i];
-    if (segment.empty()) {
-      return absl::InvalidArgumentError(absl::StrCat("invalid field path: ", path));
-    }
-    resolved = current->FindFieldByName(segment);
-    if (resolved == nullptr) {
-      return absl::InvalidArgumentError(absl::StrCat("field not found in path '", path, "': ", segment));
-    }
-    if (resolved->cpp_type() == google::protobuf::FieldDescriptor::CPPTYPE_MESSAGE) {
-      if (resolved->is_repeated()) {
-        return absl::InvalidArgumentError(absl::StrCat("repeated message segments are not supported in field path: ", path));
-      }
-      current = resolved->message_type();
-      continue;
-    }
-
-    if (i + 1 < segments.size()) {
-      return absl::InvalidArgumentError(absl::StrCat("non-message intermediate segment in field path: ", path));
-    }
-  }
-  if (resolved == nullptr || resolved->cpp_type() == google::protobuf::FieldDescriptor::CPPTYPE_MESSAGE) {
-    return absl::InvalidArgumentError(absl::StrCat("field path must resolve to scalar/enum: ", path));
-  }
-  if (resolved->is_map()) {
-    return absl::InvalidArgumentError(absl::StrCat("map fields are not supported for indexes: ", path));
-  }
-  return resolved;
-}
+// Alias for the shared field path resolver.
+const auto& ResolveFieldPath = artifact::ResolveFieldPathLeaf;
 
 Type ToFieldType(const google::protobuf::FieldDescriptor& field) {
   return static_cast<Type>(field.type());

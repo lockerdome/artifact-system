@@ -13,6 +13,7 @@
 
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
+#include "artifact/field_path.h"
 #include "artifact_options.pb.h"
 #include "encoding/index_key_encoder.h"
 #include "google/protobuf/descriptor.h"
@@ -23,63 +24,8 @@
 namespace artifact_system::index {
 namespace {
 
-absl::StatusOr<std::vector<const google::protobuf::FieldDescriptor*>> ResolveFieldPath(const google::protobuf::Descriptor& descriptor,
-                                                                                       const std::string& path) {
-  if (path.empty()) {
-    return absl::InvalidArgumentError("field path cannot be empty");
-  }
-  if (!path.empty() && path.back() == '.') {
-    return absl::InvalidArgumentError(absl::StrCat("invalid field path: ", path));
-  }
-
-  const google::protobuf::Descriptor* current = &descriptor;
-  std::vector<const google::protobuf::FieldDescriptor*> resolved;
-
-  size_t start = 0;
-  std::vector<std::string> segments;
-  while (start < path.size()) {
-    size_t end = path.find('.', start);
-    if (end == std::string::npos) {
-      end = path.size();
-    }
-    segments.push_back(path.substr(start, end - start));
-    start = end + 1;
-  }
-
-  for (size_t segment_index = 0; segment_index < segments.size(); ++segment_index) {
-    const std::string& segment = segments[segment_index];
-    if (segment.empty()) {
-      return absl::InvalidArgumentError(absl::StrCat("invalid field path: ", path));
-    }
-
-    const auto* field = current->FindFieldByName(segment);
-    if (field == nullptr) {
-      return absl::InvalidArgumentError(absl::StrCat("field not found in path '", path, "': ", segment));
-    }
-    resolved.push_back(field);
-
-    if (field->cpp_type() == google::protobuf::FieldDescriptor::CPPTYPE_MESSAGE) {
-      if (field->is_repeated()) {
-        return absl::InvalidArgumentError(absl::StrCat("repeated message segments are not supported in field path: ", path));
-      }
-      current = field->message_type();
-      continue;
-    }
-
-    if (segment_index + 1 < segments.size()) {
-      return absl::InvalidArgumentError(absl::StrCat("non-message intermediate segment in field path: ", path));
-    }
-  }
-
-  if (resolved.back()->cpp_type() == google::protobuf::FieldDescriptor::CPPTYPE_MESSAGE) {
-    return absl::InvalidArgumentError(absl::StrCat("field path must resolve to scalar/enum: ", path));
-  }
-  if (resolved.back()->is_map()) {
-    return absl::InvalidArgumentError(absl::StrCat("map fields are not supported for indexes: ", path));
-  }
-
-  return resolved;
-}
+// Alias for the shared field path resolver.
+const auto& ResolveFieldPath = artifact::ResolveFieldPath;
 
 absl::StatusOr<const google::protobuf::Message*> ResolveLeafParentMessage(const google::protobuf::Message& root,
                                                                           const std::vector<const google::protobuf::FieldDescriptor*>& path) {
