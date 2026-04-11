@@ -405,7 +405,7 @@ TEST(IndexDerivationTest, RejectsNonMessageIntermediatePath) {
   EXPECT_EQ(derived_or.status().code(), absl::StatusCode::kInvalidArgument);
 }
 
-TEST(IndexDerivationTest, RejectsRepeatedMessageIntermediatePath) {
+TEST(IndexDerivationTest, RepeatedMessageIntermediatePathProducesEntries) {
   google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
   const auto* descriptor = BuildDescriptorWithRepeatedMessagePath(&pool);
   ASSERT_NE(descriptor, nullptr);
@@ -414,9 +414,41 @@ TEST(IndexDerivationTest, RejectsRepeatedMessageIntermediatePath) {
   std::unique_ptr<google::protobuf::Message> message = NewMessage(descriptor, &factory);
   ASSERT_NE(message, nullptr);
 
+  const auto* reflection = message->GetReflection();
+  const auto* items_fd = descriptor->FindFieldByName("items");
+  ASSERT_NE(items_fd, nullptr);
+
+  // Add two Child items with ids 100 and 200.
+  auto* item0 = reflection->AddMessage(message.get(), items_fd);
+  item0->GetReflection()->SetUInt64(item0, item0->GetDescriptor()->FindFieldByName("id"), 100);
+  auto* item1 = reflection->AddMessage(message.get(), items_fd);
+  item1->GetReflection()->SetUInt64(item1, item1->GetDescriptor()->FindFieldByName("id"), 200);
+
   auto derived_or = index::DeriveIndexEntries(*descriptor, *message, 7);
-  ASSERT_FALSE(derived_or.ok());
-  EXPECT_EQ(derived_or.status().code(), absl::StatusCode::kInvalidArgument);
+  ASSERT_TRUE(derived_or.ok()) << derived_or.status();
+  ASSERT_EQ(derived_or->size(), 2U);
+  EXPECT_EQ(derived_or->at(0).key_type, "bad_repeated");
+  EXPECT_EQ(derived_or->at(1).key_type, "bad_repeated");
+  // Verify key values correspond to the two item ids.
+  ASSERT_EQ(derived_or->at(0).key_values.size(), 1U);
+  ASSERT_EQ(derived_or->at(1).key_values.size(), 1U);
+  EXPECT_EQ(std::get<uint64_t>(derived_or->at(0).key_values[0]), 100U);
+  EXPECT_EQ(std::get<uint64_t>(derived_or->at(1).key_values[0]), 200U);
+}
+
+TEST(IndexDerivationTest, RepeatedMessageIntermediateEmptyProducesNoEntries) {
+  google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
+  const auto* descriptor = BuildDescriptorWithRepeatedMessagePath(&pool);
+  ASSERT_NE(descriptor, nullptr);
+
+  google::protobuf::DynamicMessageFactory factory;
+  std::unique_ptr<google::protobuf::Message> message = NewMessage(descriptor, &factory);
+  ASSERT_NE(message, nullptr);
+
+  // No items added -- empty repeated field.
+  auto derived_or = index::DeriveIndexEntries(*descriptor, *message, 7);
+  ASSERT_TRUE(derived_or.ok()) << derived_or.status();
+  EXPECT_EQ(derived_or->size(), 0U);
 }
 
 TEST(IndexDerivationTest, DerivesEntriesForAllScalarKeyTypes) {
@@ -664,6 +696,448 @@ TEST(IndexDerivationTest, AcceptsPayloadWithNonMinimalVarintOnIndexedFieldProduc
   // Verify the encoded key uses minimal varint: length=2 -> 0x02, then "hi".
   const std::vector<uint8_t> expected_key = {0x02, 'h', 'i'};
   EXPECT_EQ(canonical_or->at(0).encoded_key, expected_key);
+}
+
+// ---------------------------------------------------------------------------
+// Nested repeated field tests
+// ---------------------------------------------------------------------------
+
+const google::protobuf::Descriptor* BuildDescriptorWithNestedRepeated(google::protobuf::DescriptorPool* pool) {
+  google::protobuf::FileDescriptorProto file;
+  file.set_name("index_derivation_nested_repeated.proto");
+  file.set_syntax("proto3");
+  file.set_package("artifact_system.testing");
+  file.add_dependency("artifact_options.proto");
+
+  // message Input { string name = 1; bool required = 2; repeated uint64 types = 3; }
+  auto* input_msg = file.add_message_type();
+  input_msg->set_name("Input");
+  auto* input_name = input_msg->add_field();
+  input_name->set_name("name");
+  input_name->set_number(1);
+  input_name->set_label(google::protobuf::FieldDescriptorProto::LABEL_OPTIONAL);
+  input_name->set_type(google::protobuf::FieldDescriptorProto::TYPE_STRING);
+  auto* input_required = input_msg->add_field();
+  input_required->set_name("required");
+  input_required->set_number(2);
+  input_required->set_label(google::protobuf::FieldDescriptorProto::LABEL_OPTIONAL);
+  input_required->set_type(google::protobuf::FieldDescriptorProto::TYPE_BOOL);
+  auto* input_types = input_msg->add_field();
+  input_types->set_name("types");
+  input_types->set_number(3);
+  input_types->set_label(google::protobuf::FieldDescriptorProto::LABEL_REPEATED);
+  input_types->set_type(google::protobuf::FieldDescriptorProto::TYPE_UINT64);
+
+  // message NestedRepeatedArtifact { repeated Input inputs = 1; bool is_view_capability = 2; }
+  auto* message = file.add_message_type();
+  message->set_name("NestedRepeatedArtifact");
+
+  auto* inputs = message->add_field();
+  inputs->set_name("inputs");
+  inputs->set_number(1);
+  inputs->set_label(google::protobuf::FieldDescriptorProto::LABEL_REPEATED);
+  inputs->set_type(google::protobuf::FieldDescriptorProto::TYPE_MESSAGE);
+  inputs->set_type_name("Input");
+
+  auto* is_view = message->add_field();
+  is_view->set_name("is_view_capability");
+  is_view->set_number(2);
+  is_view->set_label(google::protobuf::FieldDescriptorProto::LABEL_OPTIONAL);
+  is_view->set_type(google::protobuf::FieldDescriptorProto::TYPE_BOOL);
+
+  // Index: key=["inputs.types", "is_view_capability"],
+  //        order=[inputs._index ASC, inputs.name ASC, inputs.required ASC, artifact_id ASC]
+  {
+    auto* index = message->mutable_options()->AddExtension(artifact_system::indexes);
+    index->set_key_type("by_input_type");
+    index->add_key("inputs.types");
+    index->add_key("is_view_capability");
+    auto* o1 = index->add_order();
+    o1->set_field("inputs._index");
+    o1->set_direction(artifact_system::OrderDefinition::ASCENDING);
+    auto* o2 = index->add_order();
+    o2->set_field("inputs.name");
+    o2->set_direction(artifact_system::OrderDefinition::ASCENDING);
+    auto* o3 = index->add_order();
+    o3->set_field("inputs.required");
+    o3->set_direction(artifact_system::OrderDefinition::ASCENDING);
+    auto* o4 = index->add_order();
+    o4->set_field("artifact_id");
+    o4->set_direction(artifact_system::OrderDefinition::ASCENDING);
+  }
+
+  // Index: key=["inputs.types"], order=[artifact_id ASC]
+  {
+    auto* index = message->mutable_options()->AddExtension(artifact_system::indexes);
+    index->set_key_type("by_input_type_ref");
+    index->add_key("inputs.types");
+    auto* o = index->add_order();
+    o->set_field("artifact_id");
+    o->set_direction(artifact_system::OrderDefinition::ASCENDING);
+  }
+
+  const google::protobuf::FileDescriptor* built = pool->BuildFile(file);
+  if (built == nullptr) {
+    return nullptr;
+  }
+  return built->FindMessageTypeByName("NestedRepeatedArtifact");
+}
+
+// Helper: add an Input element to a NestedRepeatedArtifact message.
+void AddInput(google::protobuf::Message* message, const google::protobuf::Descriptor* desc, const std::string& name, bool required,
+              const std::vector<uint64_t>& types) {
+  const auto* inputs_fd = desc->FindFieldByName("inputs");
+  auto* input = message->GetReflection()->AddMessage(message, inputs_fd);
+  const auto* input_desc = input->GetDescriptor();
+  const auto* input_refl = input->GetReflection();
+  input_refl->SetString(input, input_desc->FindFieldByName("name"), name);
+  input_refl->SetBool(input, input_desc->FindFieldByName("required"), required);
+  for (uint64_t t : types) {
+    input_refl->AddUInt64(input, input_desc->FindFieldByName("types"), t);
+  }
+}
+
+TEST(IndexDerivationTest, NestedRepeatedProducesCorrelatedRows) {
+  google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
+  const auto* descriptor = BuildDescriptorWithNestedRepeated(&pool);
+  ASSERT_NE(descriptor, nullptr);
+
+  google::protobuf::DynamicMessageFactory factory;
+  auto message = NewMessage(descriptor, &factory);
+  ASSERT_NE(message, nullptr);
+
+  message->GetReflection()->SetBool(message.get(), descriptor->FindFieldByName("is_view_capability"), true);
+  AddInput(message.get(), descriptor, "in1", true, {100, 200});
+  AddInput(message.get(), descriptor, "in2", false, {300});
+
+  auto derived_or = index::DeriveIndexEntries(*descriptor, *message, 42);
+  ASSERT_TRUE(derived_or.ok()) << derived_or.status();
+
+  // Filter to "by_input_type" index.
+  std::vector<const index::DerivedIndexEntry*> entries;
+  for (const auto& e : *derived_or) {
+    if (e.key_type == "by_input_type") {
+      entries.push_back(&e);
+    }
+  }
+  // 3 rows: inputs[0].types[0]=100, inputs[0].types[1]=200, inputs[1].types[0]=300
+  ASSERT_EQ(entries.size(), 3U);
+
+  // Entry 0: key=(100, true), order=(0, "in1", true, 42)
+  EXPECT_EQ(std::get<uint64_t>(entries[0]->key_values[0]), 100U);
+  EXPECT_EQ(std::get<bool>(entries[0]->key_values[1]), true);
+  EXPECT_EQ(std::get<uint32_t>(entries[0]->order_values[0]), 0U);  // inputs._index
+  EXPECT_EQ(std::get<std::string>(entries[0]->order_values[1]), "in1");
+  EXPECT_EQ(std::get<bool>(entries[0]->order_values[2]), true);
+  EXPECT_EQ(std::get<uint64_t>(entries[0]->order_values[3]), 42U);
+
+  // Entry 1: key=(200, true), order=(0, "in1", true, 42)
+  EXPECT_EQ(std::get<uint64_t>(entries[1]->key_values[0]), 200U);
+  EXPECT_EQ(std::get<uint32_t>(entries[1]->order_values[0]), 0U);
+
+  // Entry 2: key=(300, true), order=(1, "in2", false, 42)
+  EXPECT_EQ(std::get<uint64_t>(entries[2]->key_values[0]), 300U);
+  EXPECT_EQ(std::get<uint32_t>(entries[2]->order_values[0]), 1U);
+  EXPECT_EQ(std::get<std::string>(entries[2]->order_values[1]), "in2");
+  EXPECT_EQ(std::get<bool>(entries[2]->order_values[2]), false);
+}
+
+TEST(IndexDerivationTest, NestedRepeatedEmptyOuterArrayProducesNoEntries) {
+  google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
+  const auto* descriptor = BuildDescriptorWithNestedRepeated(&pool);
+  ASSERT_NE(descriptor, nullptr);
+
+  google::protobuf::DynamicMessageFactory factory;
+  auto message = NewMessage(descriptor, &factory);
+  ASSERT_NE(message, nullptr);
+  message->GetReflection()->SetBool(message.get(), descriptor->FindFieldByName("is_view_capability"), true);
+  // No inputs added.
+
+  auto derived_or = index::DeriveIndexEntries(*descriptor, *message, 42);
+  ASSERT_TRUE(derived_or.ok()) << derived_or.status();
+  EXPECT_EQ(derived_or->size(), 0U);
+}
+
+TEST(IndexDerivationTest, NestedRepeatedEmptyInnerArraySkipsElement) {
+  google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
+  const auto* descriptor = BuildDescriptorWithNestedRepeated(&pool);
+  ASSERT_NE(descriptor, nullptr);
+
+  google::protobuf::DynamicMessageFactory factory;
+  auto message = NewMessage(descriptor, &factory);
+  ASSERT_NE(message, nullptr);
+  message->GetReflection()->SetBool(message.get(), descriptor->FindFieldByName("is_view_capability"), true);
+  AddInput(message.get(), descriptor, "empty_input", true, {});     // no types
+  AddInput(message.get(), descriptor, "has_type", false, {500});
+
+  auto derived_or = index::DeriveIndexEntries(*descriptor, *message, 42);
+  ASSERT_TRUE(derived_or.ok()) << derived_or.status();
+
+  std::vector<const index::DerivedIndexEntry*> entries;
+  for (const auto& e : *derived_or) {
+    if (e.key_type == "by_input_type") {
+      entries.push_back(&e);
+    }
+  }
+  // Only 1 row from the second input (first has empty types).
+  ASSERT_EQ(entries.size(), 1U);
+  EXPECT_EQ(std::get<uint64_t>(entries[0]->key_values[0]), 500U);
+  EXPECT_EQ(std::get<uint32_t>(entries[0]->order_values[0]), 1U);  // inputs._index = 1
+}
+
+TEST(IndexDerivationTest, NestedRepeatedSingleElement) {
+  google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
+  const auto* descriptor = BuildDescriptorWithNestedRepeated(&pool);
+  ASSERT_NE(descriptor, nullptr);
+
+  google::protobuf::DynamicMessageFactory factory;
+  auto message = NewMessage(descriptor, &factory);
+  ASSERT_NE(message, nullptr);
+  message->GetReflection()->SetBool(message.get(), descriptor->FindFieldByName("is_view_capability"), false);
+  AddInput(message.get(), descriptor, "only", true, {999});
+
+  auto derived_or = index::DeriveIndexEntries(*descriptor, *message, 1);
+  ASSERT_TRUE(derived_or.ok()) << derived_or.status();
+
+  std::vector<const index::DerivedIndexEntry*> entries;
+  for (const auto& e : *derived_or) {
+    if (e.key_type == "by_input_type") {
+      entries.push_back(&e);
+    }
+  }
+  ASSERT_EQ(entries.size(), 1U);
+  EXPECT_EQ(std::get<uint64_t>(entries[0]->key_values[0]), 999U);
+  EXPECT_EQ(std::get<bool>(entries[0]->key_values[1]), false);
+  EXPECT_EQ(std::get<uint32_t>(entries[0]->order_values[0]), 0U);
+  EXPECT_EQ(std::get<std::string>(entries[0]->order_values[1]), "only");
+}
+
+TEST(IndexDerivationTest, NestedRepeatedCoveringRefIndex) {
+  // The by_input_type_ref index has just key=["inputs.types"] and order=[artifact_id].
+  // It should produce one row per distinct (input, type) pair.
+  google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
+  const auto* descriptor = BuildDescriptorWithNestedRepeated(&pool);
+  ASSERT_NE(descriptor, nullptr);
+
+  google::protobuf::DynamicMessageFactory factory;
+  auto message = NewMessage(descriptor, &factory);
+  ASSERT_NE(message, nullptr);
+  message->GetReflection()->SetBool(message.get(), descriptor->FindFieldByName("is_view_capability"), true);
+  AddInput(message.get(), descriptor, "a", true, {10, 20});
+  AddInput(message.get(), descriptor, "b", false, {30});
+
+  auto derived_or = index::DeriveIndexEntries(*descriptor, *message, 5);
+  ASSERT_TRUE(derived_or.ok()) << derived_or.status();
+
+  std::vector<const index::DerivedIndexEntry*> ref_entries;
+  for (const auto& e : *derived_or) {
+    if (e.key_type == "by_input_type_ref") {
+      ref_entries.push_back(&e);
+    }
+  }
+  ASSERT_EQ(ref_entries.size(), 3U);
+  EXPECT_EQ(std::get<uint64_t>(ref_entries[0]->key_values[0]), 10U);
+  EXPECT_EQ(std::get<uint64_t>(ref_entries[1]->key_values[0]), 20U);
+  EXPECT_EQ(std::get<uint64_t>(ref_entries[2]->key_values[0]), 30U);
+}
+
+TEST(IndexDerivationTest, NestedRepeatedDeduplicatesSameKeyAndOrder) {
+  // If two inner elements produce the same key value and the index has no
+  // _index in order, duplicates should be collapsed.
+  google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
+  const auto* descriptor = BuildDescriptorWithNestedRepeated(&pool);
+  ASSERT_NE(descriptor, nullptr);
+
+  google::protobuf::DynamicMessageFactory factory;
+  auto message = NewMessage(descriptor, &factory);
+  ASSERT_NE(message, nullptr);
+  message->GetReflection()->SetBool(message.get(), descriptor->FindFieldByName("is_view_capability"), true);
+  // Same type value twice within the same input.
+  AddInput(message.get(), descriptor, "dup", true, {100, 100});
+
+  auto derived_or = index::DeriveIndexEntries(*descriptor, *message, 1);
+  ASSERT_TRUE(derived_or.ok()) << derived_or.status();
+
+  // by_input_type has inputs._index in order, so both positions are distinct
+  // (different order values: _index differs even though key is the same).
+  // Actually _index is for inputs, not inputs.types, so both have _index=0.
+  // But the by_input_type_ref index has only artifact_id in order, so both
+  // produce key=100, order=[1] -- they are true duplicates.
+  int ref_count = 0;
+  for (const auto& e : *derived_or) {
+    if (e.key_type == "by_input_type_ref") {
+      ++ref_count;
+    }
+  }
+  EXPECT_EQ(ref_count, 1);
+
+  // For by_input_type, both entries have key=(100, true), order=(0, "dup", true, 1).
+  // inputs._index=0 for both (same input element), so they are identical -> deduped.
+  int type_count = 0;
+  for (const auto& e : *derived_or) {
+    if (e.key_type == "by_input_type") {
+      ++type_count;
+    }
+  }
+  EXPECT_EQ(type_count, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Validation tests for repeated chain constraints
+// ---------------------------------------------------------------------------
+
+const google::protobuf::Descriptor* BuildDescriptorWithBranchingRepeated(google::protobuf::DescriptorPool* pool) {
+  google::protobuf::FileDescriptorProto file;
+  file.set_name("index_derivation_branching.proto");
+  file.set_syntax("proto3");
+  file.set_package("artifact_system.testing");
+  file.add_dependency("artifact_options.proto");
+
+  auto* input_msg = file.add_message_type();
+  input_msg->set_name("BranchInput");
+  auto* input_name = input_msg->add_field();
+  input_name->set_name("name");
+  input_name->set_number(1);
+  input_name->set_label(google::protobuf::FieldDescriptorProto::LABEL_OPTIONAL);
+  input_name->set_type(google::protobuf::FieldDescriptorProto::TYPE_STRING);
+
+  auto* output_msg = file.add_message_type();
+  output_msg->set_name("BranchOutput");
+  auto* output_type = output_msg->add_field();
+  output_type->set_name("type_ref");
+  output_type->set_number(1);
+  output_type->set_label(google::protobuf::FieldDescriptorProto::LABEL_OPTIONAL);
+  output_type->set_type(google::protobuf::FieldDescriptorProto::TYPE_UINT64);
+
+  auto* message = file.add_message_type();
+  message->set_name("BranchingArtifact");
+
+  auto* inputs = message->add_field();
+  inputs->set_name("inputs");
+  inputs->set_number(1);
+  inputs->set_label(google::protobuf::FieldDescriptorProto::LABEL_REPEATED);
+  inputs->set_type(google::protobuf::FieldDescriptorProto::TYPE_MESSAGE);
+  inputs->set_type_name("BranchInput");
+
+  auto* outputs = message->add_field();
+  outputs->set_name("outputs");
+  outputs->set_number(2);
+  outputs->set_label(google::protobuf::FieldDescriptorProto::LABEL_REPEATED);
+  outputs->set_type(google::protobuf::FieldDescriptorProto::TYPE_MESSAGE);
+  outputs->set_type_name("BranchOutput");
+
+  // Index with branching repeated paths: inputs.name + outputs.type_ref
+  auto* index = message->mutable_options()->AddExtension(artifact_system::indexes);
+  index->set_key_type("branching");
+  index->add_key("inputs.name");
+  index->add_key("outputs.type_ref");
+  auto* order = index->add_order();
+  order->set_field("artifact_id");
+  order->set_direction(artifact_system::OrderDefinition::ASCENDING);
+
+  const auto* built = pool->BuildFile(file);
+  if (built == nullptr) {
+    return nullptr;
+  }
+  return built->FindMessageTypeByName("BranchingArtifact");
+}
+
+TEST(IndexDerivationTest, RejectsBranchingRepeatedPaths) {
+  google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
+  const auto* descriptor = BuildDescriptorWithBranchingRepeated(&pool);
+  ASSERT_NE(descriptor, nullptr);
+
+  google::protobuf::DynamicMessageFactory factory;
+  auto message = NewMessage(descriptor, &factory);
+  ASSERT_NE(message, nullptr);
+
+  auto derived_or = index::DeriveIndexEntries(*descriptor, *message, 1);
+  ASSERT_FALSE(derived_or.ok());
+  EXPECT_EQ(derived_or.status().code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_NE(std::string(derived_or.status().message()).find("INVALID_INDEX_DEFINITION"), std::string::npos);
+}
+
+const google::protobuf::Descriptor* BuildDescriptorWithVirtualIndexDeep(google::protobuf::DescriptorPool* pool) {
+  google::protobuf::FileDescriptorProto file;
+  file.set_name("index_derivation_virtual_deep.proto");
+  file.set_syntax("proto3");
+  file.set_package("artifact_system.testing");
+  file.add_dependency("artifact_options.proto");
+
+  auto* input_msg = file.add_message_type();
+  input_msg->set_name("DeepInput");
+  auto* input_types = input_msg->add_field();
+  input_types->set_name("types");
+  input_types->set_number(1);
+  input_types->set_label(google::protobuf::FieldDescriptorProto::LABEL_REPEATED);
+  input_types->set_type(google::protobuf::FieldDescriptorProto::TYPE_UINT64);
+
+  auto* message = file.add_message_type();
+  message->set_name("VirtualDeepArtifact");
+
+  auto* inputs = message->add_field();
+  inputs->set_name("inputs");
+  inputs->set_number(1);
+  inputs->set_label(google::protobuf::FieldDescriptorProto::LABEL_REPEATED);
+  inputs->set_type(google::protobuf::FieldDescriptorProto::TYPE_MESSAGE);
+  inputs->set_type_name("DeepInput");
+
+  // Index with inputs.types._index in order.
+  auto* index = message->mutable_options()->AddExtension(artifact_system::indexes);
+  index->set_key_type("by_type_with_deep_index");
+  index->add_key("inputs.types");
+  auto* o1 = index->add_order();
+  o1->set_field("inputs._index");
+  o1->set_direction(artifact_system::OrderDefinition::ASCENDING);
+  auto* o2 = index->add_order();
+  o2->set_field("inputs.types._index");
+  o2->set_direction(artifact_system::OrderDefinition::ASCENDING);
+  auto* o3 = index->add_order();
+  o3->set_field("artifact_id");
+  o3->set_direction(artifact_system::OrderDefinition::ASCENDING);
+
+  const auto* built = pool->BuildFile(file);
+  if (built == nullptr) {
+    return nullptr;
+  }
+  return built->FindMessageTypeByName("VirtualDeepArtifact");
+}
+
+TEST(IndexDerivationTest, VirtualIndexDeepField) {
+  google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
+  const auto* descriptor = BuildDescriptorWithVirtualIndexDeep(&pool);
+  ASSERT_NE(descriptor, nullptr);
+
+  google::protobuf::DynamicMessageFactory factory;
+  auto message = NewMessage(descriptor, &factory);
+  ASSERT_NE(message, nullptr);
+
+  const auto* inputs_fd = descriptor->FindFieldByName("inputs");
+  const auto* refl = message->GetReflection();
+  auto* in0 = refl->AddMessage(message.get(), inputs_fd);
+  in0->GetReflection()->AddUInt64(in0, in0->GetDescriptor()->FindFieldByName("types"), 10);
+  in0->GetReflection()->AddUInt64(in0, in0->GetDescriptor()->FindFieldByName("types"), 20);
+  auto* in1 = refl->AddMessage(message.get(), inputs_fd);
+  in1->GetReflection()->AddUInt64(in1, in1->GetDescriptor()->FindFieldByName("types"), 30);
+
+  auto derived_or = index::DeriveIndexEntries(*descriptor, *message, 99);
+  ASSERT_TRUE(derived_or.ok()) << derived_or.status();
+  ASSERT_EQ(derived_or->size(), 3U);
+
+  // Entry 0: key=10, order=(inputs._index=0, types._index=0, aid=99)
+  EXPECT_EQ(std::get<uint64_t>(derived_or->at(0).key_values[0]), 10U);
+  EXPECT_EQ(std::get<uint32_t>(derived_or->at(0).order_values[0]), 0U);  // inputs._index
+  EXPECT_EQ(std::get<uint32_t>(derived_or->at(0).order_values[1]), 0U);  // types._index
+
+  // Entry 1: key=20, order=(inputs._index=0, types._index=1, aid=99)
+  EXPECT_EQ(std::get<uint64_t>(derived_or->at(1).key_values[0]), 20U);
+  EXPECT_EQ(std::get<uint32_t>(derived_or->at(1).order_values[0]), 0U);
+  EXPECT_EQ(std::get<uint32_t>(derived_or->at(1).order_values[1]), 1U);
+
+  // Entry 2: key=30, order=(inputs._index=1, types._index=0, aid=99)
+  EXPECT_EQ(std::get<uint64_t>(derived_or->at(2).key_values[0]), 30U);
+  EXPECT_EQ(std::get<uint32_t>(derived_or->at(2).order_values[0]), 1U);
+  EXPECT_EQ(std::get<uint32_t>(derived_or->at(2).order_values[1]), 0U);
 }
 
 } // namespace artifact_system::testing
