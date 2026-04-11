@@ -89,12 +89,65 @@ message TodoList {
 
 - The special field name `"artifact_id"` in order fields refers to the artifact's system-assigned ID.
 - All key and order fields must be scalar or enum types (not messages or maps).
-- At most one `repeated` field is allowed across all key and order fields per index.
 - `optional` fields: if unset, the artifact produces no index entry for that index.
 - Implicit-presence scalars: default values are indexed (e.g., `0` for integers, `""` for strings).
 - `float`/`double` key fields: NaN values are rejected; negative zero is normalized to positive zero.
 - Dotted field paths (e.g., `"nested.field"`) are supported for nested message fields.
 - A type can have multiple indexes.
+
+### Repeated Field Indexing
+
+Key fields may reference repeated scalar fields and fields nested within repeated messages. Repeated fields in an index must form a single linear ancestry chain — not a cartesian product across independent repeated paths.
+
+**Supported patterns:**
+
+| Pattern | Example | Rows produced |
+|---------|---------|---------------|
+| Repeated scalar leaf | `key: ["tags"]` | One row per tag value |
+| Scalar within repeated message | `key: ["outputs.type_ref"]` | One row per output element |
+| Nested repeated (repeated within repeated) | `key: ["inputs.types"]` | One row per type, per input element |
+
+**Ancestry chain constraint:** All repeated fields across all key fields in an index must lie on a single root-to-leaf path. For example, `inputs` and `inputs.types` share the `inputs` ancestor and are valid together. But `inputs.name` and `outputs.type_ref` traverse different repeated messages and cannot appear as key fields in the same index.
+
+**Path-correlated expansion:** Sibling fields within the same repeated message are correlated, not crossed. For the index `key: ["inputs.types", "is_view_capability"]` with order fields `inputs.name` and `inputs.required`, each emitted row binds `inputs.name` and `inputs.required` to the same `inputs` element that produced the `types` value.
+
+**Virtual `_index` fields:** For any repeated field in the ancestry chain, `<path>._index` can be used in order fields to expose the 0-based position of the element in its parent array. For example, `inputs._index` gives the position in the `inputs` array, and `inputs.types._index` gives the position in the `types` array within each input.
+
+**Order field constraints:** Order fields may reference sibling scalars at any repeated depth already expanded by key fields, `_index` for any repeated in the chain, root-level scalars, or `artifact_id`. Order fields **cannot** introduce new repeated paths not already expanded by key fields.
+
+**Deduplication:** If multiple iterations produce identical key and order value tuples, duplicates are collapsed to a single entry.
+
+**Example:**
+
+```proto
+message Input {
+  string name = 1;
+  bool required = 2;
+  repeated uint64 types = 3;
+}
+
+message Action {
+  option (artifact_system.indexes) = {
+    key_type: "actions_by_input_type"
+    key: ["inputs.types", "is_view_capability"]
+    order: { field: "inputs._index" direction: ASCENDING }
+    order: { field: "inputs.name" direction: ASCENDING }
+    order: { field: "inputs.required" direction: ASCENDING }
+    order: { field: "artifact_id" direction: ASCENDING }
+  };
+
+  repeated Input inputs = 1;
+  bool is_view_capability = 2;
+}
+```
+
+Given `inputs = [{name: "in1", required: true, types: [100, 200]}, {name: "in2", required: false, types: [300]}]` and `is_view_capability = true`, this produces three index rows:
+
+| key (types, is_view) | order (_index, name, required, artifact_id) |
+|---|---|
+| (100, true) | (0, "in1", true, *aid*) |
+| (200, true) | (0, "in1", true, *aid*) |
+| (300, true) | (1, "in2", false, *aid*) |
 
 ## Defining References
 
