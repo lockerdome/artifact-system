@@ -47,21 +47,6 @@ std::string MakeUniqueFieldName(std::string base, std::set<std::string>* used_na
   }
 }
 
-// Check if a field path ends with the virtual _index segment.
-bool IsVirtualIndexPath(std::string_view path) {
-  return path.size() >= 6 && path.substr(path.size() - 6) == "_index" && (path.size() == 6 || path[path.size() - 7] == '.');
-}
-
-// Resolve a field path for index schema generation. Returns the leaf
-// FieldDescriptor, or nullptr for virtual _index paths.
-absl::StatusOr<const google::protobuf::FieldDescriptor*> ResolveIndexFieldLeaf(const google::protobuf::Descriptor& root, std::string_view path) {
-  auto resolved_or = artifact::ResolveIndexFieldPath(root, path);
-  if (!resolved_or.ok()) {
-    return resolved_or.status();
-  }
-  return artifact::IndexFieldPathLeaf(*resolved_or);
-}
-
 Type ToFieldType(const google::protobuf::FieldDescriptor& field) {
   return static_cast<Type>(field.type());
 }
@@ -134,7 +119,11 @@ absl::StatusOr<GeneratedIndexSchema> GenerateIndexSchema(const artifact_system::
     auto* oneof = key_message->add_oneof_decl();
     oneof->set_name(absl::StrCat("_", field_name));
 
-    if (IsVirtualIndexPath(key_path)) {
+    auto resolved_or = artifact::ResolveIndexFieldPath(parent_descriptor, key_path);
+    if (!resolved_or.ok()) {
+      return resolved_or.status();
+    }
+    if (resolved_or->leaf_is_virtual_index) {
       auto* field = key_message->add_field();
       field->set_name(field_name);
       field->set_number(i + 1);
@@ -144,12 +133,7 @@ absl::StatusOr<GeneratedIndexSchema> GenerateIndexSchema(const artifact_system::
       field->set_oneof_index(key_message->oneof_decl_size() - 1);
       continue;
     }
-
-    auto field_or = ResolveIndexFieldLeaf(parent_descriptor, key_path);
-    if (!field_or.ok()) {
-      return field_or.status();
-    }
-    const google::protobuf::FieldDescriptor* source = *field_or;
+    const google::protobuf::FieldDescriptor* source = artifact::IndexFieldPathLeaf(*resolved_or);
     dependency_names.insert(std::string(source->file()->name()));
     if (source->type() == google::protobuf::FieldDescriptor::TYPE_ENUM) {
       dependency_names.insert(std::string(source->enum_type()->file()->name()));
@@ -177,15 +161,15 @@ absl::StatusOr<GeneratedIndexSchema> GenerateIndexSchema(const artifact_system::
       field->set_type(Type::FieldDescriptorProto_Type_TYPE_UINT64);
       continue;
     }
-    if (IsVirtualIndexPath(field_path)) {
+    auto resolved_or = artifact::ResolveIndexFieldPath(parent_descriptor, field_path);
+    if (!resolved_or.ok()) {
+      return resolved_or.status();
+    }
+    if (resolved_or->leaf_is_virtual_index) {
       field->set_type(Type::FieldDescriptorProto_Type_TYPE_UINT32);
       continue;
     }
-    auto source_field_or = ResolveIndexFieldLeaf(parent_descriptor, field_path);
-    if (!source_field_or.ok()) {
-      return source_field_or.status();
-    }
-    const auto* source_field = *source_field_or;
+    const auto* source_field = artifact::IndexFieldPathLeaf(*resolved_or);
     dependency_names.insert(std::string(source_field->file()->name()));
     field->set_type(ToFieldType(*source_field));
     if (source_field->type() == google::protobuf::FieldDescriptor::TYPE_ENUM) {
