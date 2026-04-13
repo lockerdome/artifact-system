@@ -65,15 +65,27 @@ struct ExtractedReference {
   const google::protobuf::FieldDescriptor* field_descriptor;
 };
 
-std::vector<ExtractedReference> ExtractReferenceDeclarations(const google::protobuf::Descriptor& descriptor) {
-  std::vector<ExtractedReference> result;
+// Recursively extract reference declarations from a descriptor, building
+// dotted field paths for nested message fields.
+void ExtractReferenceDeclarationsRecursive(const google::protobuf::Descriptor& descriptor, const std::string& path_prefix,
+                                           std::vector<ExtractedReference>& result) {
   for (int i = 0; i < descriptor.field_count(); ++i) {
     const auto* field = descriptor.field(i);
+    const std::string field_path = path_prefix.empty() ? std::string(field->name()) : absl::StrCat(path_prefix, ".", field->name());
+
     if (field->options().HasExtension(artifact_system::references)) {
       const auto& ref_opt = field->options().GetExtension(artifact_system::references);
-      result.push_back({std::string(field->name()), ref_opt, field});
+      result.push_back({field_path, ref_opt, field});
+    } else if (field->message_type() != nullptr && field->type() == google::protobuf::FieldDescriptor::TYPE_MESSAGE) {
+      // Recurse into nested message types to find deeply-nested references.
+      ExtractReferenceDeclarationsRecursive(*field->message_type(), field_path, result);
     }
   }
+}
+
+std::vector<ExtractedReference> ExtractReferenceDeclarations(const google::protobuf::Descriptor& descriptor) {
+  std::vector<ExtractedReference> result;
+  ExtractReferenceDeclarationsRecursive(descriptor, "", result);
   return result;
 }
 

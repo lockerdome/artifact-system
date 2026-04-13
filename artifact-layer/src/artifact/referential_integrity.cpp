@@ -224,6 +224,96 @@ absl::StatusOr<std::vector<uint64_t>> FindActiveReferencingArtifacts(uint64_t ar
 
 } // namespace
 
+// Validate reference fields on a single message level (non-recursive).
+// Appends violations to `violations`. `field_path_prefix` is the dotted path
+// from the root message to the current message (empty for the root itself).
+void ValidateReferencesOnFields(const google::protobuf::Message& message, const google::protobuf::Descriptor& descriptor, const RefIntegrityContext& ctx,
+                                const std::string& field_path_prefix, std::vector<ArtifactWriteViolation>& violations, absl::Status& out_status) {
+  const auto* reflection = message.GetReflection();
+
+  for (int i = 0; i < descriptor.field_count(); ++i) {
+    const auto* field = descriptor.field(i);
+    const std::string field_path = field_path_prefix.empty() ? std::string(field->name()) : absl::StrCat(field_path_prefix, ".", field->name());
+
+    if (field->options().HasExtension(artifact_system::references)) {
+      const ReferenceOption& ref_opt = field->options().GetExtension(artifact_system::references);
+      const std::string& target_type_name = ref_opt.target_type_name();
+
+      // Reference fields must be uint64.
+      if (field->type() != google::protobuf::FieldDescriptor::TYPE_UINT64) {
+        continue;
+      }
+
+      if (field->is_repeated()) {
+        // Repeated uint64 reference field.
+        const int count = reflection->FieldSize(message, field);
+
+        // Check for duplicates first.
+        std::unordered_set<uint64_t> seen;
+        seen.reserve(static_cast<size_t>(count));
+        for (int j = 0; j < count; ++j) {
+          const uint64_t ref_id = reflection->GetRepeatedUInt64(message, field, j);
+          if (!seen.insert(ref_id).second) {
+            violations.push_back(MakeViolation(ArtifactWriteViolation::REFERENCE_DUPLICATE_VALUE, absl::StrCat("field: ", field_path),
+                                               absl::StrCat("repeated reference field '", field_path, "' contains duplicate artifact_id ", ref_id)));
+          }
+        }
+
+        // Validate each value.
+        std::unordered_set<uint64_t> validated;
+        validated.reserve(static_cast<size_t>(count));
+        for (int j = 0; j < count; ++j) {
+          const uint64_t ref_id = reflection->GetRepeatedUInt64(message, field, j);
+          if (!validated.insert(ref_id).second) {
+            continue;
+          }
+          auto result_or = ValidateSingleReference(ref_id, field_path, target_type_name, ctx);
+          if (!result_or.ok()) {
+            out_status = result_or.status();
+            return;
+          }
+          if (result_or->has_value()) {
+            violations.push_back(result_or->value());
+          }
+        }
+      } else {
+        // Scalar uint64 reference field.
+        if (field->has_presence() && !reflection->HasField(message, field)) {
+          continue;
+        }
+        const uint64_t ref_id = reflection->GetUInt64(message, field);
+        auto result_or = ValidateSingleReference(ref_id, field_path, target_type_name, ctx);
+        if (!result_or.ok()) {
+          out_status = result_or.status();
+          return;
+        }
+        if (result_or->has_value()) {
+          violations.push_back(result_or->value());
+        }
+      }
+    } else if (field->message_type() != nullptr && field->type() == google::protobuf::FieldDescriptor::TYPE_MESSAGE) {
+      // Recurse into nested message fields to find nested reference annotations.
+      if (field->is_repeated()) {
+        const int count = reflection->FieldSize(message, field);
+        for (int j = 0; j < count; ++j) {
+          const auto& sub_msg = reflection->GetRepeatedMessage(message, field, j);
+          ValidateReferencesOnFields(sub_msg, *field->message_type(), ctx, field_path, violations, out_status);
+          if (!out_status.ok())
+            return;
+        }
+      } else {
+        if (field->has_presence() && !reflection->HasField(message, field)) {
+          continue;
+        }
+        const auto& sub_msg = reflection->GetMessage(message, field);
+        ValidateReferencesOnFields(sub_msg, *field->message_type(), ctx, field_path, violations, out_status);
+        if (!out_status.ok())
+          return;
+      }
+    }
+  }
+}
+
 absl::StatusOr<std::vector<ArtifactWriteViolation>> ValidateReferences(const google::protobuf::Message& message, const google::protobuf::Descriptor& descriptor,
                                                                        const RefIntegrityContext& ctx) {
   if (message.GetDescriptor() != &descriptor) {
@@ -231,74 +321,10 @@ absl::StatusOr<std::vector<ArtifactWriteViolation>> ValidateReferences(const goo
   }
 
   std::vector<ArtifactWriteViolation> violations;
-
-  for (int i = 0; i < descriptor.field_count(); ++i) {
-    const auto* field = descriptor.field(i);
-
-    // Check for the references extension option.
-    if (!field->options().HasExtension(artifact_system::references)) {
-      continue;
-    }
-    const ReferenceOption& ref_opt = field->options().GetExtension(artifact_system::references);
-    const std::string& target_type_name = ref_opt.target_type_name();
-
-    // Reference fields must be uint64.
-    if (field->type() != google::protobuf::FieldDescriptor::TYPE_UINT64) {
-      continue;
-    }
-
-    const auto* reflection = message.GetReflection();
-
-    if (field->is_repeated()) {
-      // Repeated uint64 reference field.
-      const int count = reflection->FieldSize(message, field);
-
-      // Check for duplicates first.
-      std::unordered_set<uint64_t> seen;
-      seen.reserve(static_cast<size_t>(count));
-      for (int j = 0; j < count; ++j) {
-        const uint64_t ref_id = reflection->GetRepeatedUInt64(message, field, j);
-        if (!seen.insert(ref_id).second) {
-          violations.push_back(MakeViolation(ArtifactWriteViolation::REFERENCE_DUPLICATE_VALUE, absl::StrCat("field: ", field->name()),
-                                             absl::StrCat("repeated reference field '", field->name(), "' contains duplicate artifact_id ", ref_id)));
-        }
-      }
-
-      // Validate each value.
-      std::unordered_set<uint64_t> validated;
-      validated.reserve(static_cast<size_t>(count));
-      for (int j = 0; j < count; ++j) {
-        const uint64_t ref_id = reflection->GetRepeatedUInt64(message, field, j);
-        if (!validated.insert(ref_id).second) {
-          continue; // already validated this ID
-        }
-        auto result_or = ValidateSingleReference(ref_id, std::string(field->name()), target_type_name, ctx);
-        if (!result_or.ok()) {
-          return result_or.status();
-        }
-        if (result_or->has_value()) {
-          violations.push_back(result_or->value());
-        }
-      }
-    } else {
-      // Scalar uint64 reference field.
-      // For optional (has_presence), skip if not set.
-      if (field->has_presence() && !reflection->HasField(message, field)) {
-        continue;
-      }
-
-      // For implicit-presence scalar, always validate (including default 0).
-      const uint64_t ref_id = reflection->GetUInt64(message, field);
-      auto result_or = ValidateSingleReference(ref_id, std::string(field->name()), target_type_name, ctx);
-      if (!result_or.ok()) {
-        return result_or.status();
-      }
-      if (result_or->has_value()) {
-        violations.push_back(result_or->value());
-      }
-    }
-  }
-
+  absl::Status status = absl::OkStatus();
+  ValidateReferencesOnFields(message, descriptor, ctx, "", violations, status);
+  if (!status.ok())
+    return status;
   return violations;
 }
 
