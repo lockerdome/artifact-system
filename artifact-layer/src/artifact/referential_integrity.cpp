@@ -291,8 +291,10 @@ void ValidateReferencesOnFields(const google::protobuf::Message& message, const 
           violations.push_back(result_or->value());
         }
       }
-    } else if (field->message_type() != nullptr && field->type() == google::protobuf::FieldDescriptor::TYPE_MESSAGE) {
+    } else if (field->message_type() != nullptr && field->type() == google::protobuf::FieldDescriptor::TYPE_MESSAGE && !field->is_map()) {
       // Recurse into nested message fields to find nested reference annotations.
+      // Skip map fields: their synthetic MapEntry messages can't carry reference annotations,
+      // and descending into every map entry would be wasteful.
       if (field->is_repeated()) {
         const int count = reflection->FieldSize(message, field);
         for (int j = 0; j < count; ++j) {

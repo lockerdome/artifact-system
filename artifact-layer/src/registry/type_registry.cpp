@@ -6,6 +6,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -66,9 +67,12 @@ struct ExtractedReference {
 };
 
 // Recursively extract reference declarations from a descriptor, building
-// dotted field paths for nested message fields.
+// dotted field paths for nested message fields.  `in_chain` tracks descriptors
+// on the current recursion path to prevent infinite recursion on self-
+// referential proto definitions (e.g. `message Node { Node child = 1; }`).
 void ExtractReferenceDeclarationsRecursive(const google::protobuf::Descriptor& descriptor, const std::string& path_prefix,
-                                           std::vector<ExtractedReference>& result) {
+                                           std::vector<ExtractedReference>& result,
+                                           std::unordered_set<const google::protobuf::Descriptor*>& in_chain) {
   for (int i = 0; i < descriptor.field_count(); ++i) {
     const auto* field = descriptor.field(i);
     const std::string field_path = path_prefix.empty() ? std::string(field->name()) : absl::StrCat(path_prefix, ".", field->name());
@@ -76,16 +80,24 @@ void ExtractReferenceDeclarationsRecursive(const google::protobuf::Descriptor& d
     if (field->options().HasExtension(artifact_system::references)) {
       const auto& ref_opt = field->options().GetExtension(artifact_system::references);
       result.push_back({field_path, ref_opt, field});
-    } else if (field->message_type() != nullptr && field->type() == google::protobuf::FieldDescriptor::TYPE_MESSAGE) {
+    } else if (field->message_type() != nullptr && field->type() == google::protobuf::FieldDescriptor::TYPE_MESSAGE && !field->is_map()) {
       // Recurse into nested message types to find deeply-nested references.
-      ExtractReferenceDeclarationsRecursive(*field->message_type(), field_path, result);
+      // Skip map fields: their synthetic MapEntry messages can't carry reference annotations.
+      const auto* sub_desc = field->message_type();
+      if (in_chain.count(sub_desc) > 0) {
+        continue;
+      }
+      in_chain.insert(sub_desc);
+      ExtractReferenceDeclarationsRecursive(*sub_desc, field_path, result, in_chain);
+      in_chain.erase(sub_desc);
     }
   }
 }
 
 std::vector<ExtractedReference> ExtractReferenceDeclarations(const google::protobuf::Descriptor& descriptor) {
   std::vector<ExtractedReference> result;
-  ExtractReferenceDeclarationsRecursive(descriptor, "", result);
+  std::unordered_set<const google::protobuf::Descriptor*> in_chain = {&descriptor};
+  ExtractReferenceDeclarationsRecursive(descriptor, "", result, in_chain);
   return result;
 }
 
