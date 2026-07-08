@@ -177,3 +177,29 @@ make lakefs-bootstrap   # initialize repository
 make lakefs-status      # check status
 make lakefs-down        # tear down
 ```
+
+## Running the server
+
+`artifact_layer_service` is configured entirely through environment variables:
+
+| Variable | Meaning | Default |
+|----------|---------|---------|
+| `ARTIFACT_LAYER_LISTEN_ADDRESS` | gRPC listen address | `0.0.0.0:50051` |
+| `ARTIFACT_LAYER_STORAGE_TYPE` | Storage backend: `memory` or `lakefs` | `memory` |
+| `LAKEFS_ENDPOINT` | LakeFS API endpoint URL | required for `lakefs` |
+| `LAKEFS_ACCESS_KEY_ID` | LakeFS access key ID | required for `lakefs` |
+| `LAKEFS_SECRET_ACCESS_KEY` | LakeFS secret access key (injected from Secret Manager in production) | required for `lakefs` |
+| `LAKEFS_REPOSITORY` | LakeFS repository name | required for `lakefs` |
+| `LAKEFS_CANONICAL_BRANCH` | Canonical branch name | `main` |
+| `ARTIFACT_LAYER_ID_ALLOCATOR_ADDRESS` | id-allocator service address | mock allocator when unset |
+| `ARTIFACT_LAYER_ID_ALLOCATOR_PARTITION_ID` | id-allocator partition ID | required with the address |
+| `ARTIFACT_LAYER_ID_ALLOCATOR_HIGH_WATER_MARK` | Pre-allocation refill threshold | `1000` |
+
+`lakefs` storage requires the production ID allocator: persistent storage with
+the mock allocator would re-issue IDs already present in storage after a
+restart. `memory` storage may be combined with either allocator.
+
+Genesis runs at startup against the configured backend and is idempotent, so
+restarting against an already-initialized LakeFS repository is safe. The
+canonical branch must already exist in the repository — genesis initializes
+its contents but does not create the branch.

@@ -131,6 +131,7 @@ add_library(artifact_layer_lib
   src/service/type_registry_service_impl.cpp
   src/id/id_allocator.cpp
   src/service/server.cpp
+  src/service/env_config.cpp
 )
 target_include_directories(artifact_layer_lib PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(artifact_layer_lib

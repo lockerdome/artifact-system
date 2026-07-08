@@ -13,7 +13,9 @@
 #include "service/index_service_impl.h"
 #include "service/snapshot_transaction_service_impl.h"
 #include "service/type_registry_service_impl.h"
+#include "storage/lakefs_storage.h"
 #include "storage/memory_storage.h"
+#include "storage/storage_interface.h"
 #include "transaction/transaction_manager.h"
 
 namespace artifact_system::service {
@@ -21,7 +23,7 @@ namespace artifact_system::service {
 struct ArtifactLayerServer::Impl {
   ServerConfig config;
 
-  std::unique_ptr<MemoryStorage> storage;
+  std::unique_ptr<StorageInterface> storage;
   std::unique_ptr<IdAllocatorInterface> id_allocator;
   std::unique_ptr<transaction::TransactionManager> txn_manager;
   std::unique_ptr<artifact::ArtifactStore> artifact_store;
@@ -43,7 +45,11 @@ ArtifactLayerServer::ArtifactLayerServer(const ServerConfig& config) : impl_(std
 ArtifactLayerServer::~ArtifactLayerServer() = default;
 
 absl::Status ArtifactLayerServer::Initialize() {
-  impl_->storage = std::make_unique<MemoryStorage>();
+  if (impl_->config.lakefs.has_value()) {
+    impl_->storage = std::make_unique<LakeFSStorage>(impl_->config.lakefs.value());
+  } else {
+    impl_->storage = std::make_unique<MemoryStorage>();
+  }
 
   auto genesis_result = bootstrap::RunGenesis(impl_->storage.get());
   if (!genesis_result.ok()) {
