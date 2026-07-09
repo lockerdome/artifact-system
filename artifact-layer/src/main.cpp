@@ -1,9 +1,9 @@
 #include "absl/status/status.h"
+#include "service/env_config.h"
 #include "service/server.h"
 #include <atomic>
 #include <chrono>
 #include <csignal>
-#include <cstdlib>
 #include <print>
 #include <thread>
 
@@ -16,14 +16,26 @@ void SignalHandler(int) {
 } // namespace
 
 int main() {
-  artifact_system::service::ServerConfig config;
-
-  const char* listen_address = std::getenv("ARTIFACT_LAYER_LISTEN_ADDRESS");
-  if (listen_address && listen_address[0] != '\0') {
-    config.listen_address = listen_address;
+  auto config = artifact_system::service::LoadServerConfigFromEnv();
+  if (!config.ok()) {
+    std::println(stderr, "Invalid server configuration: {}", std::string(config.status().message()));
+    return 1;
   }
 
-  artifact_system::service::ArtifactLayerServer server(config);
+  if (config->lakefs.has_value()) {
+    std::println("Using LakeFS storage (endpoint={}, repository={}, branch={})", config->lakefs->endpoint,
+                 config->lakefs->repository, config->lakefs->canonical_branch);
+  } else {
+    std::println("Using in-memory storage");
+  }
+  if (config->id_allocator.has_value()) {
+    std::println("Using production ID allocator (address={}, partition={})", config->id_allocator->service_address,
+                 config->id_allocator->partition_id);
+  } else {
+    std::println("Using mock ID allocator");
+  }
+
+  artifact_system::service::ArtifactLayerServer server(config.value());
 
   auto status = server.Initialize();
   if (!status.ok()) {

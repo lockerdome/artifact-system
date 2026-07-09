@@ -2,6 +2,7 @@
 #include "absl/status/status.h"
 #include "grpcpp/server.h"
 #include "id/id_allocator.h"
+#include "storage/lakefs_config.h"
 #include <memory>
 #include <optional>
 #include <string>
@@ -11,13 +12,16 @@ namespace artifact_system::service {
 struct ServerConfig {
   std::string listen_address = "0.0.0.0:50051";
 
+  // When set, use LakeFS-backed storage connecting to this instance.
+  // When empty, use MemoryStorage (for tests; all data is lost on shutdown).
+  std::optional<LakeFSConfig> lakefs;
+
   // When set, use the production ID allocator connecting to this service.
   // When empty, use MockIdAllocator (for tests).
   std::optional<IdAllocatorConfig> id_allocator;
 };
 
 // Owns the gRPC server and all service dependencies.
-// Uses MemoryStorage for now (P10 adds LakeFS option).
 class ArtifactLayerServer {
 public:
   explicit ArtifactLayerServer(const ServerConfig& config = {});
