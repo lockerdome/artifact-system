@@ -64,13 +64,20 @@ struct ExtractedReference {
   std::string field_name;
   ReferenceOption option;
   const google::protobuf::FieldDescriptor* field_descriptor;
+  // True when the field lives under a map field. Such references can never be
+  // enforced (index paths cannot traverse maps) and are rejected during
+  // declaration validation.
+  bool under_map = false;
 };
 
 // Recursively extract reference declarations from a descriptor, building
 // dotted field paths for nested message fields.  `in_chain` tracks descriptors
 // on the current recursion path to prevent infinite recursion on self-
 // referential proto definitions (e.g. `message Node { Node child = 1; }`).
-void ExtractReferenceDeclarationsRecursive(const google::protobuf::Descriptor& descriptor, const std::string& path_prefix,
+// `under_map` is set once the traversal passes through a map field, so
+// annotations under map values are still found and can be rejected during
+// declaration validation instead of being silently ignored.
+void ExtractReferenceDeclarationsRecursive(const google::protobuf::Descriptor& descriptor, const std::string& path_prefix, bool under_map,
                                            std::vector<ExtractedReference>& result,
                                            std::unordered_set<const google::protobuf::Descriptor*>& in_chain) {
   for (int i = 0; i < descriptor.field_count(); ++i) {
@@ -79,16 +86,17 @@ void ExtractReferenceDeclarationsRecursive(const google::protobuf::Descriptor& d
 
     if (field->options().HasExtension(artifact_system::references)) {
       const auto& ref_opt = field->options().GetExtension(artifact_system::references);
-      result.push_back({field_path, ref_opt, field});
-    } else if (field->message_type() != nullptr && field->type() == google::protobuf::FieldDescriptor::TYPE_MESSAGE && !field->is_map()) {
+      result.push_back({field_path, ref_opt, field, under_map});
+    } else if (field->message_type() != nullptr && field->type() == google::protobuf::FieldDescriptor::TYPE_MESSAGE) {
       // Recurse into nested message types to find deeply-nested references.
-      // Skip map fields: their synthetic MapEntry messages can't carry reference annotations.
+      // Map fields are traversed through their synthetic MapEntry message so
+      // annotations under map values surface as under_map references.
       const auto* sub_desc = field->message_type();
       if (in_chain.count(sub_desc) > 0) {
         continue;
       }
       in_chain.insert(sub_desc);
-      ExtractReferenceDeclarationsRecursive(*sub_desc, field_path, result, in_chain);
+      ExtractReferenceDeclarationsRecursive(*sub_desc, field_path, under_map || field->is_map(), result, in_chain);
       in_chain.erase(sub_desc);
     }
   }
@@ -97,7 +105,7 @@ void ExtractReferenceDeclarationsRecursive(const google::protobuf::Descriptor& d
 std::vector<ExtractedReference> ExtractReferenceDeclarations(const google::protobuf::Descriptor& descriptor) {
   std::vector<ExtractedReference> result;
   std::unordered_set<const google::protobuf::Descriptor*> in_chain = {&descriptor};
-  ExtractReferenceDeclarationsRecursive(descriptor, "", result, in_chain);
+  ExtractReferenceDeclarationsRecursive(descriptor, "", /*under_map=*/false, result, in_chain);
   return result;
 }
 
@@ -210,6 +218,17 @@ std::vector<TypeRegistrationViolation> ValidateNewReferenceDeclaration(const Ext
                                                                        const std::function<bool(const std::string&)>& type_exists) {
   std::vector<TypeRegistrationViolation> violations;
   const std::string subject = absl::StrCat("reference: ", descriptor.full_name(), ".", ref.field_name);
+
+  // Reject references under map fields outright: covering index paths cannot
+  // traverse maps, so such a reference could never be enforced.
+  if (ref.under_map) {
+    TypeRegistrationViolation v;
+    v.set_category(TypeRegistrationViolation::INVALID_REFERENCE_DECLARATION);
+    v.set_subject(subject);
+    v.set_description(absl::StrCat("references option on '", ref.field_name, "' is inside a map value; map fields cannot be indexed"));
+    violations.push_back(std::move(v));
+    return violations;
+  }
 
   // Check field type is uint64, optional uint64, or repeated uint64.
   const auto* field = ref.field_descriptor;

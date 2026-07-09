@@ -1113,7 +1113,9 @@ TEST(ReferentialIntegrityTest, ValidateReferencesUnsetNestedMessageSkipped) {
 
 TEST(ReferentialIntegrityTest, ValidateReferencesMapFieldSkipped) {
   // Map fields are not descended into, even when the map value message type
-  // carries a reference annotation with a dangling value.
+  // carries a reference annotation with a dangling value. Type registration
+  // rejects such schemas outright; the write-time skip is defense in depth
+  // for descriptors that never went through registration.
   MemoryStorage storage;
 
   google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());

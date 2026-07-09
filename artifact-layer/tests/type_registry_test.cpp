@@ -1030,9 +1030,10 @@ TEST_F(TypeRegistryTest, SelfReferentialProtoCycleGuard) {
   ASSERT_TRUE(tree_or.ok()) << tree_or.status();
 }
 
-TEST_F(TypeRegistryTest, MapFieldReferenceNotExtracted) {
-  // References inside map value messages are not extracted: registration
-  // succeeds even though no covering index exists for the map entry field.
+TEST_F(TypeRegistryTest, MapValueReferenceRejected) {
+  // A reference annotation under a map field can never be enforced (covering
+  // index paths cannot traverse maps), so registration rejects it rather than
+  // silently ignoring the declared intent.
   const char* source = R"(
     syntax = "proto3";
     package test;
@@ -1059,7 +1060,35 @@ TEST_F(TypeRegistryTest, MapFieldReferenceNotExtracted) {
   ASSERT_TRUE(simple_or.ok()) << simple_or.status();
 
   auto map_or = registry_->RegisterTypeVersion("test.MapRefArtifact", source);
-  ASSERT_TRUE(map_or.ok()) << map_or.status();
+  ASSERT_FALSE(map_or.ok());
+  ExpectViolationCategory(map_or.status(), TypeRegistrationViolation::INVALID_REFERENCE_DECLARATION);
+}
+
+TEST_F(TypeRegistryTest, MapWithoutReferencesRegisters) {
+  // Maps whose value types carry no reference annotations are unaffected by
+  // the under-map rejection.
+  const char* source = R"(
+    syntax = "proto3";
+    package test;
+    import "artifact_options.proto";
+    message MapNoRefArtifact {
+      option (artifact_system.indexes) = {
+        key_type: "map_no_ref_by_name"
+        key: ["name"]
+        order: { field: "artifact_id" direction: ASCENDING }
+        unique: true
+      };
+      string name = 1;
+      message Entry {
+        uint64 plain_id = 1;
+      }
+      map<string, string> labels = 2;
+      map<string, Entry> entries = 3;
+    }
+  )";
+
+  auto result_or = registry_->RegisterTypeVersion("test.MapNoRefArtifact", source);
+  ASSERT_TRUE(result_or.ok()) << result_or.status();
 }
 
 TEST_F(TypeRegistryTest, MultipleViolationsCollected) {
