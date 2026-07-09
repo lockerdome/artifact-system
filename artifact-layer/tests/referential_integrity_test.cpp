@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "absl/status/statusor.h"
+#include "artifact/proto_utils.h"
 #include "artifact_internal.pb.h"
 #include "artifact_options.pb.h"
 #include "artifact_service.pb.h"
@@ -17,8 +18,10 @@
 #include "encoding/index_key_encoder.h"
 #include "google/protobuf/descriptor.pb.h"
 #include "google/protobuf/dynamic_message.h"
+#include "google/protobuf/text_format.h"
 #include "index/index_object.h"
 #include "index/index_schema_generator.h"
+#include "registry/proto_compiler.h"
 #include "storage/memory_storage.h"
 #include "gtest/gtest.h"
 
@@ -194,6 +197,47 @@ google::protobuf::FileDescriptorSet BuildDescriptorSet(const google::protobuf::D
   add_file(desc->file());
   return fds;
 }
+
+// Compile a .proto source string and return the descriptor for `type_name`.
+// The returned descriptor is owned by `pool`, which must be backed by the
+// generated pool so artifact_options.proto extensions resolve.
+const google::protobuf::Descriptor* CompileProtoSource(const std::string& proto_source, const std::string& type_name, google::protobuf::DescriptorPool& pool) {
+  registry::ProtoCompiler compiler;
+  auto result = compiler.Compile(proto_source, type_name);
+  if (std::holds_alternative<registry::CompilationError>(result)) {
+    ADD_FAILURE() << "proto compilation failed: " << std::get<registry::CompilationError>(result).description;
+    return nullptr;
+  }
+  return artifact::BuildPoolAndFindMessage(std::get<registry::CompilationResult>(result).descriptor_set, type_name, &pool);
+}
+
+// Proto with reference annotations on nested message fields, for exercising
+// recursive reference validation. Inner.target_id is implicit-presence, so a
+// buggy descent into an unset parent message would validate the default 0 and
+// surface as a REFERENCE_TARGET_NOT_FOUND violation.
+constexpr const char* kNestedRefProtoSource = R"(
+syntax = "proto3";
+package artifact_system.testing;
+import "artifact_options.proto";
+
+message NestedRefHolder {
+  message Inner {
+    uint64 target_id = 1 [(artifact_system.references) = {
+      target_type_name: "TypeDefinition"
+      on_delete: RESTRICT
+    }];
+  }
+
+  message Outer {
+    Inner inner = 1;
+  }
+
+  Inner nested = 1;
+  repeated Inner items = 2;
+  Outer outer = 3;
+  map<string, Inner> entries = 4;
+}
+)";
 
 // Write a "references_by_target_type" index object to storage.
 void WriteReferencesByTargetTypeIndex(MemoryStorage& storage, uint64_t index_def_id, const std::string& target_type_name,
@@ -952,6 +996,139 @@ TEST(ReferentialIntegrityTest, ValidateReferencesRepeatedDuplicateValue) {
     }
   }
   EXPECT_TRUE(found_duplicate) << "Expected REFERENCE_DUPLICATE_VALUE violation";
+}
+
+// ===========================================================================
+// ValidateReferences nested-message tests
+// ===========================================================================
+
+// Build a NestedRefHolder dynamic message from text format.
+std::unique_ptr<google::protobuf::Message> MakeNestedRefMessage(const google::protobuf::Descriptor* descriptor,
+                                                                google::protobuf::DynamicMessageFactory& factory, const std::string& text_proto) {
+  std::unique_ptr<google::protobuf::Message> msg(factory.GetPrototype(descriptor)->New());
+  EXPECT_TRUE(google::protobuf::TextFormat::ParseFromString(text_proto, msg.get()));
+  return msg;
+}
+
+TEST(ReferentialIntegrityTest, ValidateReferencesNestedMessageFieldValid) {
+  MemoryStorage storage;
+
+  TypeDefinition td;
+  td.set_type_name("SomeType");
+  WriteArtifact(storage, /*id=*/100, "TypeDefinition", /*version_id=*/1, td.SerializeAsString());
+
+  google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
+  const auto* descriptor = CompileProtoSource(kNestedRefProtoSource, "artifact_system.testing.NestedRefHolder", pool);
+  ASSERT_NE(descriptor, nullptr);
+
+  google::protobuf::DynamicMessageFactory factory;
+  auto msg = MakeNestedRefMessage(descriptor, factory, "nested { target_id: 100 }");
+
+  auto ctx = MakeContext(storage);
+  auto result_or = ValidateReferences(*msg, *descriptor, ctx);
+  ASSERT_TRUE(result_or.ok()) << result_or.status();
+  EXPECT_TRUE(result_or->empty());
+}
+
+TEST(ReferentialIntegrityTest, ValidateReferencesNestedMessageFieldNotFound) {
+  // A dangling reference on a nested message field is reported with the
+  // dotted field path.
+  MemoryStorage storage;
+
+  google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
+  const auto* descriptor = CompileProtoSource(kNestedRefProtoSource, "artifact_system.testing.NestedRefHolder", pool);
+  ASSERT_NE(descriptor, nullptr);
+
+  google::protobuf::DynamicMessageFactory factory;
+  auto msg = MakeNestedRefMessage(descriptor, factory, "nested { target_id: 999 }");
+
+  auto ctx = MakeContext(storage);
+  auto result_or = ValidateReferences(*msg, *descriptor, ctx);
+  ASSERT_TRUE(result_or.ok()) << result_or.status();
+  ASSERT_EQ(result_or->size(), 1);
+  EXPECT_EQ((*result_or)[0].category(), ArtifactWriteViolation::REFERENCE_TARGET_NOT_FOUND);
+  EXPECT_EQ((*result_or)[0].subject(), "field: nested.target_id");
+}
+
+TEST(ReferentialIntegrityTest, ValidateReferencesRepeatedNestedMessages) {
+  // Each element of a repeated nested message field is validated.
+  MemoryStorage storage;
+
+  TypeDefinition td;
+  td.set_type_name("SomeType");
+  WriteArtifact(storage, /*id=*/100, "TypeDefinition", /*version_id=*/1, td.SerializeAsString());
+
+  google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
+  const auto* descriptor = CompileProtoSource(kNestedRefProtoSource, "artifact_system.testing.NestedRefHolder", pool);
+  ASSERT_NE(descriptor, nullptr);
+
+  google::protobuf::DynamicMessageFactory factory;
+  auto msg = MakeNestedRefMessage(descriptor, factory, "items { target_id: 100 } items { target_id: 999 }");
+
+  auto ctx = MakeContext(storage);
+  auto result_or = ValidateReferences(*msg, *descriptor, ctx);
+  ASSERT_TRUE(result_or.ok()) << result_or.status();
+  ASSERT_EQ(result_or->size(), 1);
+  EXPECT_EQ((*result_or)[0].category(), ArtifactWriteViolation::REFERENCE_TARGET_NOT_FOUND);
+  EXPECT_EQ((*result_or)[0].subject(), "field: items.target_id");
+}
+
+TEST(ReferentialIntegrityTest, ValidateReferencesDeeplyNestedField) {
+  // Violations two message levels down carry the full dotted path.
+  MemoryStorage storage;
+
+  google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
+  const auto* descriptor = CompileProtoSource(kNestedRefProtoSource, "artifact_system.testing.NestedRefHolder", pool);
+  ASSERT_NE(descriptor, nullptr);
+
+  google::protobuf::DynamicMessageFactory factory;
+  auto msg = MakeNestedRefMessage(descriptor, factory, "outer { inner { target_id: 999 } }");
+
+  auto ctx = MakeContext(storage);
+  auto result_or = ValidateReferences(*msg, *descriptor, ctx);
+  ASSERT_TRUE(result_or.ok()) << result_or.status();
+  ASSERT_EQ(result_or->size(), 1);
+  EXPECT_EQ((*result_or)[0].category(), ArtifactWriteViolation::REFERENCE_TARGET_NOT_FOUND);
+  EXPECT_EQ((*result_or)[0].subject(), "field: outer.inner.target_id");
+}
+
+TEST(ReferentialIntegrityTest, ValidateReferencesUnsetNestedMessageSkipped) {
+  // Unset singular nested message fields are not descended into. Inner's
+  // target_id is implicit-presence, so descending into the default instance
+  // would validate 0 and produce a NOT_FOUND violation.
+  MemoryStorage storage;
+
+  google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
+  const auto* descriptor = CompileProtoSource(kNestedRefProtoSource, "artifact_system.testing.NestedRefHolder", pool);
+  ASSERT_NE(descriptor, nullptr);
+
+  google::protobuf::DynamicMessageFactory factory;
+  auto msg = MakeNestedRefMessage(descriptor, factory, "");
+
+  auto ctx = MakeContext(storage);
+  auto result_or = ValidateReferences(*msg, *descriptor, ctx);
+  ASSERT_TRUE(result_or.ok()) << result_or.status();
+  EXPECT_TRUE(result_or->empty());
+}
+
+TEST(ReferentialIntegrityTest, ValidateReferencesMapFieldSkipped) {
+  // Map fields are not descended into, even when the map value message type
+  // carries a reference annotation with a dangling value. Type registration
+  // rejects such schemas outright; the write-time skip is defense in depth
+  // for descriptors that never went through registration.
+  MemoryStorage storage;
+
+  google::protobuf::DescriptorPool pool(google::protobuf::DescriptorPool::generated_pool());
+  const auto* descriptor = CompileProtoSource(kNestedRefProtoSource, "artifact_system.testing.NestedRefHolder", pool);
+  ASSERT_NE(descriptor, nullptr);
+
+  google::protobuf::DynamicMessageFactory factory;
+  auto msg = MakeNestedRefMessage(descriptor, factory, R"(entries { key: "a" value { target_id: 999 } })");
+
+  auto ctx = MakeContext(storage);
+  auto result_or = ValidateReferences(*msg, *descriptor, ctx);
+  ASSERT_TRUE(result_or.ok()) << result_or.status();
+  EXPECT_TRUE(result_or->empty());
 }
 
 } // namespace
