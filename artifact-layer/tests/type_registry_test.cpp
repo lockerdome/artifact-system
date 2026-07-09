@@ -388,6 +388,31 @@ message RefArtifact {
 }
 )";
 
+// Proto with a reference field on a nested message (dotted field path).
+constexpr const char* kNestedRefProtoSource = R"(
+syntax = "proto3";
+package test;
+import "artifact_options.proto";
+
+message NestedRefArtifact {
+  option (artifact_system.indexes) = {
+    key_type: "nested_ref_by_target"
+    key: ["inputs.target_ids"]
+    order: { field: "artifact_id" direction: ASCENDING }
+  };
+
+  message Input {
+    string name = 1;
+    repeated uint64 target_ids = 2 [(artifact_system.references) = {
+      target_type_name: "test.SimpleArtifact"
+      on_delete: RESTRICT
+    }];
+  }
+
+  repeated Input inputs = 1;
+}
+)";
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -905,6 +930,136 @@ TEST_F(TypeRegistryTest, ReferenceIncompatibility_Removed) {
   auto v2_or = registry_->RegisterTypeVersion("test.RefArtifact", v2_source);
   ASSERT_FALSE(v2_or.ok());
   ExpectViolationCategory(v2_or.status(), TypeRegistrationViolation::REFERENCE_INCOMPATIBILITY);
+}
+
+TEST_F(TypeRegistryTest, NestedReferenceRegistration) {
+  // A reference annotation on a nested message field is extracted with its
+  // dotted path and satisfied by a covering index keyed on that path.
+  auto simple_or = registry_->RegisterTypeVersion("test.SimpleArtifact", kSimpleProtoSource);
+  ASSERT_TRUE(simple_or.ok()) << simple_or.status();
+
+  auto ref_or = registry_->RegisterTypeVersion("test.NestedRefArtifact", kNestedRefProtoSource);
+  ASSERT_TRUE(ref_or.ok()) << ref_or.status();
+  EXPECT_GT(ref_or->version_id, 0U);
+}
+
+TEST_F(TypeRegistryTest, NestedReferenceIncompatibility_Removed) {
+  // The nested reference is persisted as a ReferenceDefinition keyed by its
+  // dotted path, so removing the annotation in v2 is a reference removal.
+  auto simple_or = registry_->RegisterTypeVersion("test.SimpleArtifact", kSimpleProtoSource);
+  ASSERT_TRUE(simple_or.ok()) << simple_or.status();
+
+  auto v1_or = registry_->RegisterTypeVersion("test.NestedRefArtifact", kNestedRefProtoSource);
+  ASSERT_TRUE(v1_or.ok()) << v1_or.status();
+
+  const char* v2_source = R"(
+    syntax = "proto3";
+    package test;
+    import "artifact_options.proto";
+    message NestedRefArtifact {
+      option (artifact_system.indexes) = {
+        key_type: "nested_ref_by_target"
+        key: ["inputs.target_ids"]
+        order: { field: "artifact_id" direction: ASCENDING }
+      };
+      message Input {
+        string name = 1;
+        repeated uint64 target_ids = 2;
+      }
+      repeated Input inputs = 1;
+      string extra = 2;
+    }
+  )";
+  auto v2_or = registry_->RegisterTypeVersion("test.NestedRefArtifact", v2_source);
+  ASSERT_FALSE(v2_or.ok());
+  ExpectViolationCategory(v2_or.status(), TypeRegistrationViolation::REFERENCE_INCOMPATIBILITY);
+}
+
+TEST_F(TypeRegistryTest, InvalidReferenceDeclaration_NestedTargetNotFound) {
+  // Declaration validation applies to references found on nested messages.
+  const char* source = R"(
+    syntax = "proto3";
+    package test;
+    import "artifact_options.proto";
+    message NestedRefToNowhere {
+      option (artifact_system.indexes) = {
+        key_type: "nested_nowhere_by_target"
+        key: ["input.target_id"]
+        order: { field: "artifact_id" direction: ASCENDING }
+      };
+      message Input {
+        optional uint64 target_id = 1 [(artifact_system.references) = {
+          target_type_name: "test.NonExistent"
+          on_delete: RESTRICT
+        }];
+      }
+      Input input = 1;
+    }
+  )";
+  auto result_or = registry_->RegisterTypeVersion("test.NestedRefToNowhere", source);
+  ASSERT_FALSE(result_or.ok());
+  ExpectViolationCategory(result_or.status(), TypeRegistrationViolation::INVALID_REFERENCE_DECLARATION);
+}
+
+TEST_F(TypeRegistryTest, SelfReferentialProtoCycleGuard) {
+  // A message containing a field of its own type must not send reference
+  // extraction into infinite recursion. The root-level reference is still
+  // extracted.
+  const char* source = R"(
+    syntax = "proto3";
+    package test;
+    import "artifact_options.proto";
+    message TreeArtifact {
+      option (artifact_system.indexes) = {
+        key_type: "tree_by_target"
+        key: ["target_id"]
+        order: { field: "artifact_id" direction: ASCENDING }
+      };
+      optional uint64 target_id = 1 [(artifact_system.references) = {
+        target_type_name: "test.SimpleArtifact"
+        on_delete: RESTRICT
+      }];
+      TreeArtifact child = 2;
+    }
+  )";
+
+  auto simple_or = registry_->RegisterTypeVersion("test.SimpleArtifact", kSimpleProtoSource);
+  ASSERT_TRUE(simple_or.ok()) << simple_or.status();
+
+  auto tree_or = registry_->RegisterTypeVersion("test.TreeArtifact", source);
+  ASSERT_TRUE(tree_or.ok()) << tree_or.status();
+}
+
+TEST_F(TypeRegistryTest, MapFieldReferenceNotExtracted) {
+  // References inside map value messages are not extracted: registration
+  // succeeds even though no covering index exists for the map entry field.
+  const char* source = R"(
+    syntax = "proto3";
+    package test;
+    import "artifact_options.proto";
+    message MapRefArtifact {
+      option (artifact_system.indexes) = {
+        key_type: "map_ref_by_name"
+        key: ["name"]
+        order: { field: "artifact_id" direction: ASCENDING }
+        unique: true
+      };
+      string name = 1;
+      message Entry {
+        uint64 target_id = 1 [(artifact_system.references) = {
+          target_type_name: "test.SimpleArtifact"
+          on_delete: RESTRICT
+        }];
+      }
+      map<string, Entry> entries = 2;
+    }
+  )";
+
+  auto simple_or = registry_->RegisterTypeVersion("test.SimpleArtifact", kSimpleProtoSource);
+  ASSERT_TRUE(simple_or.ok()) << simple_or.status();
+
+  auto map_or = registry_->RegisterTypeVersion("test.MapRefArtifact", source);
+  ASSERT_TRUE(map_or.ok()) << map_or.status();
 }
 
 TEST_F(TypeRegistryTest, MultipleViolationsCollected) {
