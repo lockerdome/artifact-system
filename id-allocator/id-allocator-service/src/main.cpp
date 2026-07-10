@@ -32,9 +32,24 @@ std::string env_or(const char* name, std::string fallback) {
   return fallback;
 }
 
+/// Resolve the gRPC listen address.
+///
+/// Cloud Run injects PORT to tell the container which port to serve on. When it
+/// is set we bind 0.0.0.0:$PORT so deploys work without any extra address
+/// configuration. Otherwise we fall back to ID_ALLOCATOR_LISTEN_ADDRESS, which
+/// still lets local/dev runs control the full host:port (default
+/// 0.0.0.0:50051).
+std::string resolve_listen_address() {
+  const char* port = std::getenv("PORT");
+  if (port != nullptr && port[0] != '\0') {
+    return "0.0.0.0:" + std::string(port);
+  }
+  return env_or("ID_ALLOCATOR_LISTEN_ADDRESS", "0.0.0.0:50051");
+}
+
 id_allocator::ServerConfig load_config() {
   return {
-      .listen_address = env_or("ID_ALLOCATOR_LISTEN_ADDRESS", "0.0.0.0:50051"),
+      .listen_address = resolve_listen_address(),
       .store_type = env_or("ID_ALLOCATOR_STORE_TYPE", "memory"),
       .gcp_project_id = env_or("ID_ALLOCATOR_GCP_PROJECT_ID", ""),
       .datastore_endpoint = env_or("ID_ALLOCATOR_DATASTORE_ENDPOINT", ""),
