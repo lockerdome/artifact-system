@@ -1,0 +1,13 @@
+# Minimal CMake project used only by the Dockerfile's deps stage. Its sole job
+# is to pull in cmake/dependencies.cmake so the third-party gRPC stack builds
+# into build/release, where the build stage reuses it. It mirrors the globals
+# of id-allocator-service/CMakeLists.txt so the configured cache matches and
+# gRPC is not rebuilt when the real sources are overlaid.
+cmake_minimum_required(VERSION 3.24)
+project(id_allocator_service LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+find_package(Threads REQUIRED)
+include(cmake/dependencies.cmake)

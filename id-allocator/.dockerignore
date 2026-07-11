@@ -1,0 +1,9 @@
+# Keep the build context small and prevent local build trees from being copied
+# into the image (which would clobber the cached gRPC build in build/release).
+**/build/
+**/.git/
+
+# Not needed to build the service image.
+PRD.md
+id-allocator-client/
+id-allocator-client-cpp/
