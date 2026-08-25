@@ -10,7 +10,7 @@ The setup is intentionally ephemeral for test runs.
 
 ## Start and bootstrap
 
-From `artifact-system/artifact-layer`:
+From `artifact-layer`:
 
 ```bash
 make -C dev/lakefs-local up
@@ -34,7 +34,7 @@ make -C dev/lakefs-local \
   up
 ```
 
-If you prefer running from `artifact-system/artifact-layer`, shortcuts are
+If you prefer running from `artifact-layer`, shortcuts are
 available:
 
 ```bash

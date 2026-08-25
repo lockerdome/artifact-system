@@ -92,7 +92,7 @@ target_link_libraries(artifact_layer_proto PUBLIC ${_GRPC_GRPCPP} ${_PROTOBUF_LI
 
 # ── ID Allocator client library ──────────────────────────────────────────
 add_subdirectory(
-  "${CMAKE_CURRENT_SOURCE_DIR}/../../id-allocator/id-allocator-client-cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../id-allocator/id-allocator-client-cpp"
   "${CMAKE_CURRENT_BINARY_DIR}/id-allocator-client-cpp"
   EXCLUDE_FROM_ALL
 )

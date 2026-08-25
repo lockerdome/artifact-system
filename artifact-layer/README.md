@@ -2,7 +2,7 @@
 
 The artifact layer is the C++ backend of the artifact system. It implements storage, indexing, type registration, transactions, and referential integrity, exposed over four gRPC services.
 
-For the user-facing API and JS client documentation, see the parent [artifact-system README](../README.md).
+For the user-facing API and JS client documentation, see the [top-level README](../README.md).
 
 ## Subsystems
 
@@ -161,9 +161,8 @@ Note: each `make` invocation starts a fresh container, so it re-runs configure e
 
 ```bash
 docker run -it --rm \
-  --mount type=bind,source=$(pwd)/..,target=/code/artifact-system \
-  --mount type=bind,source=$(pwd)/../../id-allocator,target=/code/id-allocator \
-  -w /code/artifact-system/artifact-layer \
+  --mount type=bind,source=$(pwd)/..,target=/code \
+  -w /code/artifact-layer \
   cpp23-toolchain
 ```
 

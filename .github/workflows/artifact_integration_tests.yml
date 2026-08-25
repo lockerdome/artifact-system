@@ -3,13 +3,13 @@ on:
   push:
     branches: [master]
     paths:
-      - 'artifact-system/artifact-layer/**'
-      - 'artifact-system/artifact-client-js/**'
+      - 'artifact-layer/**'
+      - 'artifact-client-js/**'
       - '.github/workflows/artifact_integration_tests.yml'
   pull_request:
     paths:
-      - 'artifact-system/artifact-layer/**'
-      - 'artifact-system/artifact-client-js/**'
+      - 'artifact-layer/**'
+      - 'artifact-client-js/**'
       - '.github/workflows/artifact_integration_tests.yml'
 
 jobs:
@@ -42,7 +42,7 @@ jobs:
           save-always: true
 
       - name: Build artifact-layer server
-        working-directory: artifact-system/artifact-layer
+        working-directory: artifact-layer
         run: |
           cmake --preset release -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           cmake --build --preset release
@@ -54,11 +54,11 @@ jobs:
           node-version: '24'
 
       - name: Install node modules
-        working-directory: artifact-system/artifact-client-js
+        working-directory: artifact-client-js
         run: npm install
 
       - name: Run integration tests
-        working-directory: artifact-system/artifact-client-js
+        working-directory: artifact-client-js
         env:
-          ARTIFACT_LAYER_BINARY_PATH: ${{ github.workspace }}/artifact-system/artifact-layer/build/release/artifact_layer_service
+          ARTIFACT_LAYER_BINARY_PATH: ${{ github.workspace }}/artifact-layer/build/release/artifact_layer_service
         run: npm run test:integration

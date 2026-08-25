@@ -1,13 +1,11 @@
 CPP23_TOOLCHAIN_IMAGE ?= cpp23-toolchain
 PRESET ?= release
 
-ARTIFACT_SYSTEM_ROOT := $(abspath ..)
-REPO_ROOT := $(abspath ../..)
+REPO_ROOT := $(abspath ..)
 
 DOCKER_RUN := docker run -it --rm \
-	--mount type=bind,source=$(ARTIFACT_SYSTEM_ROOT),target=/code/artifact-system \
-	--mount type=bind,source=$(REPO_ROOT)/id-allocator,target=/code/id-allocator \
-	-w /code/artifact-system/artifact-layer \
+	--mount type=bind,source=$(REPO_ROOT),target=/code \
+	-w /code/artifact-layer \
 	$(CPP23_TOOLCHAIN_IMAGE)
 
 LAKEFS_LOCAL_DIR := dev/lakefs-local

@@ -3,11 +3,11 @@ on:
   push:
     branches: [master]
     paths:
-      - 'artifact-system/artifact-layer/**'
+      - 'artifact-layer/**'
       - '.github/workflows/artifact_layer_tests.yml'
   pull_request:
     paths:
-      - 'artifact-system/artifact-layer/**'
+      - 'artifact-layer/**'
       - '.github/workflows/artifact_layer_tests.yml'
 
 jobs:
@@ -21,7 +21,7 @@ jobs:
       CCACHE_COMPRESS: 'true'
     defaults:
       run:
-        working-directory: artifact-system/artifact-layer
+        working-directory: artifact-layer
     steps:
       - uses: actions/checkout@v6
 
