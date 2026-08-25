@@ -1,0 +1,21 @@
+name: Lint
+on:
+  pull_request:
+    paths:
+      - 'artifact-client-js/**/*.js'
+      - 'id-allocator/id-allocator-client/**/*.js'
+      - 'eslint.config.mjs'
+      - '.github/workflows/lint.yml'
+
+jobs:
+  eslint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Install lint dependencies
+        run: npm install
+      - name: Run ESLint
+        run: npm run lint
