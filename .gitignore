@@ -1,2 +1,11 @@
 node_modules/
 /package-lock.json
+
+build/
+CMakeFiles/
+CMakeCache.txt
+CMakeUserPresets.json
+CTestTestfile.cmake
+Testing/
+cmake_install.cmake
+compile_commands.json
