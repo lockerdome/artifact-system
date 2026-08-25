@@ -2,7 +2,7 @@
 
 const { describe, it, before, after, beforeEach } = require('node:test');
 const assert = require('node:assert');
-const { ArtifactClient, TypeDecodeError } = require('../lib/index');
+const { ArtifactClient } = require('../lib/index');
 const { MockArtifactServer } = require('./mock_server');
 
 describe('TypeRegistryCache (decode/encode pipeline)', () => {
@@ -203,7 +203,6 @@ describe('TypeRegistryCache (decode/encode pipeline)', () => {
       // verify non-oneof fields are independent.
       const protobuf = require('protobufjs');
       const descriptor = require('protobufjs/ext/descriptor');
-      const { TypeRegistryCache } = require('../lib/type_registry');
 
       const mixed_proto = `
         syntax = "proto3";

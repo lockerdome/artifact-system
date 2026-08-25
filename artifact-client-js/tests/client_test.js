@@ -2,7 +2,7 @@
 
 const { describe, it, before, after } = require('node:test');
 const assert = require('node:assert');
-const { ArtifactClient, TransactionSettledError } = require('../lib/index');
+const { ArtifactClient } = require('../lib/index');
 const { MockArtifactServer } = require('./mock_server');
 
 describe('ArtifactClient', () => {

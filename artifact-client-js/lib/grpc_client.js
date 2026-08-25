@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const grpc = require('@grpc/grpc-js');
 const protoLoader = require('@grpc/proto-loader');
-const { retry_with_backoff, is_retryable, DEFAULT_RETRY_OPTIONS } = require('./retry');
+const { retry_with_backoff, DEFAULT_RETRY_OPTIONS } = require('./retry');
 const { parse_grpc_error, _error_root } = require('./errors');
 
 const DEFAULT_CALL_TIMEOUT_MS = 30000;
