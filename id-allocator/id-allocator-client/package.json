@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "description": "Node.js client library for the ID Allocator gRPC service",
+  "license": "MIT",
   "main": "lib/index.js",
   "scripts": {
     "test": "node --test tests/*.js"
